@@ -281,6 +281,7 @@ static void load_env(void)
     fclose(f);
 }
 
+#if !defined(NFSU2_VULKAN)
 /* ── Loading screen ──────────────────────────────────────────────
  *
  * From boot until the title first draws: the game's logo, centred, with a
@@ -649,6 +650,12 @@ int nv2a_gl_adopt_window(void **win, void **ctx)
     *ctx = s_ctx;
     return 1;
 }
+
+#else
+/* The Vulkan build has no GL context to draw a loading screen on: the
+ * renderer takes the display at its first present. */
+static void loader_start(void) { }
+#endif
 
 /* ── Sampling profiler (RECOMP_NX_PROFILE=1) ──────────────────────────
  *

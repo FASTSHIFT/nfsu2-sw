@@ -159,6 +159,12 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   profile at a crash had the main thread 48% in GIL waits, the EA mixer 50%
   on those locks. Fix: `mcpx_apu_lock_guest` counts waiters and the frame
   thread hands the lock over after every frame (apu_core.c / apu_state.h).
+  That handover then made the APU wait for the caller to be scheduled: race
+  profile 71.6% of the APU thread in that wait, APU 1124-1480 frames/s ->
+  audio stutter. voice_lock now sets its bits atomically, without d->lock
+  (the handover remains only for apu_mixer_play).
+- prof.bin sample times are 16 bits of 10 ms and wrap every 655 s;
+  prof_report.py unwraps them (--time on long runs was empty before).
 - **Files:** no `open()` on directories (`XBOX_DIR_FD` sentinel); FAT can't
   hold sparse files (partition images created empty, size reported).
 - **Save load/create froze the whole console** (log stops right after
@@ -196,6 +202,40 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   surface by GL_MAX_TEXTURE/RENDERBUFFER_SIZE.
 - Buttons map by label (Switch A = Xbox A); `RECOMP_PAD_LAYOUT=position`
   swaps to Xbox positions. Y opens the in-game Help box, closed with B.
+
+## Vulkan build (nfsu2x-vulkan.nro, started 2026-09-29)
+
+- Renderer `xboxrecomp/src/nv2a_vk/nv2a_vk.c` (CMake `NFSU2_VULKAN=ON` ->
+  `XBOXRECOMP_VULKAN`, replaces nv2a_gl): Vulkan 1.3, dynamic rendering,
+  push descriptors, dynamic vertex input, everything but blend/colour mask/
+  depth format/topology class as dynamic state; all images in GENERAL,
+  barriers between passes; 2 frames in flight with a 48 MB host ring each.
+  Shaders are gl_vsh.c/gl_psh.c with `nv2a_shader_vk = 1` (std140 blocks at
+  bindings 0/1, samplers 2..5, Vulkan 0..1 clip z), compiled by glslang on a
+  4 MB-stack thread. No threaded submission, loading screen or GL_SCALE yet.
+- Switch: `VULKAN=1 XBOXRECOMP_DIR=/root/nfsu2x/xboxrecomp-pr128 JOBS=6 bash
+  switch/build.sh` (build dir /root/nfsu2x/build-switch-vk). Links
+  mesa-switch's static NVK from `/root/nfsu2x/mesa-sdk/usr/local` (commit
+  1a8c1a66d6f + StevensND/nfsmw-nx `mesa/mesa-switch-nfsmw.patch`, built in
+  /root/nfsu2x/ref/mesa-switch: `. /root/nfsu2x/mesa-extra/env.sh; ninja -C
+  builddir-switch src/nouveau/vulkan/libvulkan.a; meson install -C
+  builddir-switch --destdir /root/nfsu2x/mesa-sdk` -- the cross/native files
+  and rustc/bindgen wrappers are in /root/nfsu2x/mesa-extra) and glslang
+  15.4 built for the Switch in /root/nfsu2x/glslang-switch. switch-sdl2's
+  EGL/glapi/drm_nouveau are filtered out of SDL2::SDL2 (a second Mesa);
+  SDL's unused EGL calls are stubbed (switch_egl_stubs.c), libelf too.
+- Linux: `-DNFSU2_VULKAN=ON` build in /root/nfsu2x/build-vk-linux; headless on
+  lavapipe: `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
+  RECOMP_VK_HEADLESS=1` (+ `RECOMP_VK_VALIDATION=1`), frames via
+  RECOMP_GL_DUMP. Quick Race renders like GL there.
+- /root/nfsu2x/vktest/ (vktest.nro): minimal NVK clear-screen check.
+- nfsmw-nx is GPLv3: take ideas, not files.
+- **Eden cannot run NVK** (2026-09-29): instance, device, swapchain (only
+  IMMEDIATE; FIFO creation hangs) and command recording work, but no GPU
+  submission ever completes -- vktest's first fence times out (also with
+  NVK_SWITCH_MAPPED_COMPLETION=false) and present then blocks. The game
+  stops at its first flip. Test the Vulkan build on hardware.
+  `RECOMP_VK_TRACE=<n>` + `NFSU2_LOG_SYNC=1` log each renderer step.
 
 ## Audio (host output)
 

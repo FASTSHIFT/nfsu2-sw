@@ -147,20 +147,29 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     set_notify_status(d, v, notifier, NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
 }
 
+/* One bit per voice, read atomically by the frame thread (is_voice_locked).
+ * Set without d->lock: DirectSound issues this for every voice it touches,
+ * and waiting for the frame thread's lock -- or making the frame thread
+ * wait for the caller to be scheduled (Horizon's 10 ms slices) -- cost the
+ * APU up to a quarter of real time in races (audio stutter). The signal
+ * only wakes an idle frame thread; a missed one is picked up at its next
+ * timed wait. */
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    mcpx_apu_lock_guest(d);
-
     uint64_t mask = 1ULL << (v % 64);
-    if (lock) {
-        d->vp.voice_locked[v / 64] |= mask;
-    } else {
-        d->vp.voice_locked[v / 64] &= ~mask;
-    }
-
+#ifdef _MSC_VER
+    if (lock)
+        _InterlockedOr64((volatile long long *)&d->vp.voice_locked[v / 64], (long long)mask);
+    else
+        _InterlockedAnd64((volatile long long *)&d->vp.voice_locked[v / 64], (long long)~mask);
+#else
+    if (lock)
+        __atomic_fetch_or(&d->vp.voice_locked[v / 64], mask, __ATOMIC_SEQ_CST);
+    else
+        __atomic_fetch_and(&d->vp.voice_locked[v / 64], ~mask, __ATOMIC_SEQ_CST);
+#endif
     qemu_cond_signal(&d->cond);
-    qemu_mutex_unlock(&d->lock);
 }
 
 static bool is_voice_locked(MCPXAPUState *d, uint16_t v)

@@ -392,8 +392,13 @@ static int game_main(void)
     {
         const char *gl = getenv("NFSU2_GL");
         if (!gl || strcmp(gl, "0") != 0) {
+#if defined(NFSU2_VULKAN)
+            extern void nv2a_vk_install(void);
+            nv2a_vk_install();
+#else
             extern void nv2a_gl_install(void);
             nv2a_gl_install();
+#endif
         }
     }
 #endif

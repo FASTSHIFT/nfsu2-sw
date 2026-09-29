@@ -30,6 +30,11 @@ if(NOT EXISTS "${NFSU2_GEN_DIR}/recomp_funcs.h")
                         "with --gen-dir, or pass -DNFSU2_GEN_DIR=<dir>.")
 endif()
 
+# The Vulkan renderer (xboxrecomp nv2a_vk) instead of OpenGL. On the Switch it
+# links mesa-switch's static NVK (NVK_SDK) and builds nfsu2x-vulkan.nro.
+option(NFSU2_VULKAN "Render with Vulkan instead of OpenGL" OFF)
+set(XBOXRECOMP_VULKAN ${NFSU2_VULKAN} CACHE BOOL "" FORCE)
+
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 
 file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "${NFSU2_GEN_DIR}/*.c")
@@ -47,6 +52,9 @@ else()
 endif()
 
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
+if(NFSU2_VULKAN)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_VULKAN=1)
+endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -88,8 +96,13 @@ if(NINTENDO_SWITCH)
     set(NFSU2_SWITCH_ICON "${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.jpg" CACHE FILEPATH
         "256x256 JPEG icon (libnx default when empty)")
 
-    # switch-sdl2's GL path is EGL on switch-mesa.
-    target_link_libraries(${PROJECT_NAME} PRIVATE EGL glapi drm_nouveau nx m)
+    if(NFSU2_VULKAN)
+        # No GL: SDL is only the audio output; NVK comes with nv2a_vk.
+        target_link_libraries(${PROJECT_NAME} PRIVATE nx m)
+    else()
+        # switch-sdl2's GL path is EGL on switch-mesa.
+        target_link_libraries(${PROJECT_NAME} PRIVATE EGL glapi drm_nouveau nx m)
+    endif()
     # switch_nx.c's loading screen asks EGL for the on-screen size.
     target_include_directories(${PROJECT_NAME} PRIVATE "$ENV{DEVKITPRO}/portlibs/switch/include")
 
