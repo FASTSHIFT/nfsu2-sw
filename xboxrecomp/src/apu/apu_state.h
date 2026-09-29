@@ -471,6 +471,7 @@ struct MCPXAPUState {
     QemuCond idle_cond;
     bool pause_requested;
     bool is_idle;
+    volatile LONG lock_waiters;   /* guest-side threads in mcpx_apu_lock_guest */
 
     MemoryRegion *ram;
     uint8_t *ram_ptr;
@@ -509,6 +510,21 @@ struct MCPXAPUState {
         int queued_bytes_low, queued_bytes_high;
     } monitor;
 };
+/* The frame thread holds d->lock except between frames. A guest thread
+ * (DirectSound's voice commands, reached with the guest lock and often the
+ * dispatch lock held) waiting for it stalled the whole game: while the APU
+ * ran behind -- many voices at once, e.g. crash sounds -- the frame thread
+ * never released it (throttle() lets go only when ahead, one frame in 8)
+ * and Horizon's mutexes are not fair. Guest-side takers announce
+ * themselves here; the frame thread hands the lock over after its frame. */
+static inline void mcpx_apu_lock_guest(MCPXAPUState *d)
+{
+    InterlockedIncrement(&d->lock_waiters);
+    qemu_mutex_lock(&d->lock);
+    if (InterlockedDecrement(&d->lock_waiters) == 0)
+        qemu_cond_signal(&d->cond);
+}
+
 
 /* ============================================================
  * Forward declarations for APU sub-module functions

@@ -145,6 +145,20 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   per colour surface, so flares tested against empty depth. Depth is now
   per zeta address and stored size (`depth_get`, `RECOMP_GL_SHARED_Z=0` old
   behaviour). Linux race frames confirmed.
+- **Slow-motion races** (below 20 fps): sub_001890C0 caps game time per
+  frame at 3.0 (.data float 0x3A4C64, read only there) x 1/60 s = 50 ms and
+  drops the rest -> at 14 fps the game ran at ~70% speed. main.c raises the
+  cap at boot: `NFSU2_SIM_STEPS` (1/60 s units, default 6 = 100 ms; 3 =
+  original). Linux race pinned to one core (~10 fps): race clock 50% -> 90%
+  of wall time.
+- **FPS drops on crashes** (player/AI hitting traffic or walls): crash
+  sounds start many voices, the APU runs behind, and its frame thread held
+  `d->lock` without a break (throttle() releases it only when ahead, 1 frame
+  in 8; Horizon mutexes are unfair). DirectSound voice commands (fe_method ->
+  voice_lock) waited for it holding the GIL and the dispatch lock: console
+  profile at a crash had the main thread 48% in GIL waits, the EA mixer 50%
+  on those locks. Fix: `mcpx_apu_lock_guest` counts waiters and the frame
+  thread hands the lock over after every frame (apu_core.c / apu_state.h).
 - **Files:** no `open()` on directories (`XBOX_DIR_FD` sentinel); FAT can't
   hold sparse files (partition images created empty, size reported).
 - **Save load/create froze the whole console** (log stops right after

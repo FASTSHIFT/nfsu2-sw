@@ -341,6 +341,24 @@ static int game_main(void)
     printf("Xbox memory mapped at host offset 0x%llX\n",
            (unsigned long long)g_xbox_mem_offset);
 
+    /* Game time per frame is capped: sub_001890C0 takes the real elapsed
+     * time but at most 3.0 (the .data float at 0x3A4C64, read nowhere else)
+     * x 1/60 s = 50 ms, and drops the rest. Below 20 fps the game ran slower
+     * than real time (races looked slow-motion on the Switch at 13-19 fps).
+     * NFSU2_SIM_STEPS sets the cap in 1/60 s units: default 6 = 100 ms, real
+     * speed down to 10 fps; 3 = the original. */
+    {
+        const char *e = getenv("NFSU2_SIM_STEPS");
+        float steps = e ? (float)atof(e) : 6.0f;
+        if (steps >= 1.0f && steps <= 30.0f) {
+            float *cap = (float *)((uint8_t *)xbox_GetMemoryBase() + 0x3A4C64);
+            if (*cap == 3.0f) {
+                *cap = steps;
+                printf("[BOOT] game time cap %.0f ms per frame\n", steps * 1000.0f / 60.0f);
+            }
+        }
+    }
+
     /* The emulated APU. DirectSound's accesses reach it through the MMIO
      * accessors the DSOUND section is lifted with (regen.sh passes
      * --mmio-sections DSOUND), so the APU registers stay plain memory and no

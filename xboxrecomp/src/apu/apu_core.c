@@ -548,6 +548,10 @@ static void *mcpx_apu_frame_thread(void *arg)
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }
+
+        /* Hand the lock to a waiting guest thread (mcpx_apu_lock_guest). */
+        while (d->lock_waiters && !qatomic_read(&d->exiting))
+            qemu_cond_timedwait(&d->cond, &d->lock, 1);
     }
 
     qemu_mutex_unlock(&d->lock);
@@ -874,7 +878,7 @@ void apu_mixer_play(int slot, int looping)
     /* The frame thread takes the APU lock before the mixer lock. */
     extern MCPXAPUState *g_state;
     if (g_state) {
-        qemu_mutex_lock(&g_state->lock);
+        mcpx_apu_lock_guest(g_state);
         g_state->pause_requested = false;
         qemu_cond_signal(&g_state->cond);
         qemu_mutex_unlock(&g_state->lock);
