@@ -64,7 +64,10 @@ def test_fallthrough_emits_tail_call():
     db = _func_db([(BASE, len(MOV_CL)), (BASE + len(MOV_CL), len(POP_RET))])
     c = _translate(image, db, BASE)
     nxt = BASE + len(MOV_CL)
-    assert f"sub_{nxt:08X}(); return;" in c, c
+    # The tail call and its return, on one line; register locals
+    # (_localize_registers) may reload between them.
+    import re
+    assert re.search(rf"sub_{nxt:08X}\(\);[^\n]*\breturn;", c), c
     assert "fallthrough" in c, c
     print("ok  fallthrough_emits_tail_call")
 

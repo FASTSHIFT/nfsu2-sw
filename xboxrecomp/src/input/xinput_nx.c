@@ -21,7 +21,9 @@
  *   sticks, clicks, D-pad as they are
  *
  * Handheld mode and the first player's controller (Joy-Con pair or Pro
- * Controller) both drive port 0.
+ * Controller) both drive port 0, and both get the title's rumble
+ * (xbox_nx_pad_rumble): the Xbox's left, heavy motor as the low band, its
+ * right, light motor as the high band, on both sides of the pad.
  */
 #ifdef __SWITCH__
 #include <switch.h>
@@ -97,5 +99,90 @@ int xbox_nx_pad_read(unsigned port, uint16_t *digital, uint8_t analog[8],
     thumbs[2] = (int16_t)r.x;
     thumbs[3] = (int16_t)r.y;
     return 1;
+}
+
+/* Vibration handles for one input source, re-fetched when its style changes
+ * (Joy-Con pair swapped for a Pro Controller, say). */
+typedef struct {
+    HidNpadIdType            id;
+    u32                      style;     /* HidNpadStyleTag, 0 = none */
+    s32                      count;
+    HidVibrationDeviceHandle handles[2];
+} NxRumbleTarget;
+
+static int nx_rumble_refresh(NxRumbleTarget *t, int active)
+{
+    u32 styles = active ? hidGetNpadStyleSet(t->id) : 0;
+    u32 style = 0;
+    s32 count = 2;
+
+    if (t->id == HidNpadIdType_Handheld) {
+        if (styles & HidNpadStyleTag_NpadHandheld) style = HidNpadStyleTag_NpadHandheld;
+    } else if (styles & HidNpadStyleTag_NpadFullKey) {
+        style = HidNpadStyleTag_NpadFullKey;
+    } else if (styles & HidNpadStyleTag_NpadJoyDual) {
+        style = HidNpadStyleTag_NpadJoyDual;
+    } else if (styles & HidNpadStyleTag_NpadJoyLeft) {
+        style = HidNpadStyleTag_NpadJoyLeft;  count = 1;
+    } else if (styles & HidNpadStyleTag_NpadJoyRight) {
+        style = HidNpadStyleTag_NpadJoyRight; count = 1;
+    }
+    if (style != t->style) {
+        t->style = style;
+        t->count = 0;
+        if (style && R_SUCCEEDED(hidInitializeVibrationDevices(t->handles,
+                                        count, t->id, (HidNpadStyleTag)style)))
+            t->count = count;
+    }
+    return t->count;
+}
+
+void xbox_nx_pad_rumble(unsigned port, uint16_t left, uint16_t right)
+{
+    static NxRumbleTarget targets[2] = {
+        { HidNpadIdType_Handheld, 0, 0, {{0}} },
+        { HidNpadIdType_No1,      0, 0, {{0}} },
+    };
+    static int disabled = -1;
+    HidVibrationDeviceHandle handles[4];
+    HidVibrationValue values[4];
+    HidVibrationValue v;
+    int active[2];
+    s32 n = 0;
+    int i, k;
+
+    if (port != 0)
+        return;
+    if (disabled < 0) {
+        const char *e = getenv("RECOMP_RUMBLE");
+        disabled = e && strcmp(e, "0") == 0;
+    }
+    if (disabled)
+        return;
+
+    mutexLock(&s_lock);
+    if (!s_ready) {                       /* no pad read yet: nothing to shake */
+        mutexUnlock(&s_lock);
+        return;
+    }
+    active[0] = padIsHandheld(&s_pad);
+    active[1] = padIsNpadActive(&s_pad, HidNpadIdType_No1);
+
+    /* Standard HD rumble resonances: 160 Hz low band, 320 Hz high band. */
+    v.amp_low   = (float)left  / 65535.0f;
+    v.freq_low  = 160.0f;
+    v.amp_high  = (float)right / 65535.0f;
+    v.freq_high = 320.0f;
+    for (i = 0; i < 2; i++) {
+        int c = nx_rumble_refresh(&targets[i], active[i]);
+        for (k = 0; k < c; k++) {
+            handles[n] = targets[i].handles[k];
+            values[n] = v;
+            n++;
+        }
+    }
+    if (n)
+        hidSendVibrationValues(handles, values, n);
+    mutexUnlock(&s_lock);
 }
 #endif

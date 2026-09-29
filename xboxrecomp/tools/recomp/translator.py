@@ -200,6 +200,156 @@ def _localize_leaf_registers(lines, instructions, start, end):
     return out
 
 
+def _wrap_calls(line, call_re, spill, reload):
+    """Put `spill` right before every call in `line` and `reload` right after
+    the call's own statement, so pushes on the same line (arguments, the
+    return address) happen before the spill and statements after the call
+    see the reloaded state. Returns in the line spill first."""
+    import re
+    if spill:
+        line = re.sub(r"\breturn;", f"{{ {spill} return; }}", line)
+    hits = list(call_re.finditer(line))
+    for m in reversed(hits):
+        start = m.start()
+        # End of the call's statement: the ';' after its balanced (...).
+        i = line.find("(", start)
+        depth, j = 0, i
+        while j < len(line):
+            if line[j] == "(":
+                depth += 1
+            elif line[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        k = line.find(";", j)
+        if i < 0 or k < 0:
+            continue
+        line = line[:k + 1] + f" {reload}" + line[k + 1:]
+        line = line[:start] + f"{spill} " + line[start:]
+    return line
+
+
+# A line that can run other lifted code: a direct, ABI-wrapped or indirect
+# call, or an indirect tail call. Whatever runs there may use the x87 stack.
+_X87_CALL_RE = None
+
+
+def _localize_x87_stack(lines):
+    """Keep a function's x87 stack in C locals.
+
+    g_fp_stack[8] and g_fp_top are thread-local globals, so every fld, fstp
+    and fmul the lifter emits is a read-modify-write of memory -- on the
+    Switch through a __aarch64_read_tp call each time -- and, the lifted code
+    being built -fno-strict-aliasing, any guest store may alias them, so no
+    value ever stays in a host register. NFSU2's hot render and physics code
+    is x87 (sub_0009A330, sub_000A3CA0, sub_002A68EC), and that was most of
+    its main thread on the console.
+
+    Instead the function declares locals that shadow the globals (the fp_*
+    macros and the lifter's g_fp_stack[...] expressions then name them): the
+    top index as an int, loaded after the pre-emption point, and the stack as
+    a pointer to this thread's array, taken once. Every line that can run
+    other lifted code stores the index back first and reloads it after, and
+    every return stores it, so callers and callees see the stack exactly as
+    before. (Copying all eight slots at each call instead was slower than
+    the globals: 2985 functions use the x87 stack, at a median of nine x87
+    operations per call.) RECOMP_X87_LOCALS=0 at regen turns it off.
+    """
+    import re
+    global _X87_CALL_RE
+    if _X87_CALL_RE is None:
+        _X87_CALL_RE = re.compile(
+            r"RECOMP_ABI_CALL\(|RECOMP_ICALL|RECOMP_ITAIL|"
+            r"\bsub_[0-9A-Fa-f]{8}(?:_gen)?\s*\(\s*\)")
+    try:
+        at = next(i for i, l in enumerate(lines)
+                  if l.strip() == "RECOMP_PREEMPT();")
+    except StopIteration:
+        return lines
+    body = lines[at + 1:]
+    text = "\n".join(body)
+    nfp = len(re.findall(r"\bfp_(?:push|pop|top|st1?)\b|\bg_fp_stack\b", text))
+    if not nfp:
+        return lines
+    # Anything that reaches the stack behind the macros' back, or can leave
+    # the function other than by a call or a return, keeps the globals.
+    if re.search(r"setjmp|longjmp|RECOMP_SEH|recomp_fsave|recomp_frstor|"
+                 r"recomp_fxsave|recomp_fxrstor|recomp_fldenv|recomp_fstenv", text):
+        return lines
+    spill = "recomp_fp_top_st(g_fp_top);"
+    reload = "g_fp_top = recomp_fp_top_ld();"
+    out = lines[:at + 1]
+    out.append("    double *const g_fp_stack = recomp_fp_base(); "
+               "int g_fp_top = recomp_fp_top_ld(); /* x87 top in a local */")
+    for l in body:
+        out.append(_wrap_calls(l, _X87_CALL_RE, spill, reload))
+    # Control that runs off the end returns too (steps after this one add
+    # the closing brace).
+    out.append(f"    {spill} /* x87 top back at the end */")
+    return out
+
+
+# Lines that can run other lifted code or read and write the registers
+# behind a function's back: calls of every kind, the kernel (through ICALL),
+# the unimplemented-instruction logger, the debug service, and the spin
+# hint, which may hand the guest lock to another thread.
+_REG_CALL_RE = None
+_REG_NAMES = ("eax", "ecx", "edx", "ebx", "esi", "edi", "esp")
+
+
+def _localize_registers(lines):
+    """Keep a function's integer registers in C locals.
+
+    The guest registers are thread-local globals (RECOMP_TLS): on the Switch
+    each access goes through a __aarch64_read_tp call (4.6% of NFSU2's main
+    thread on its own), and since the lifted code is built
+    -fno-strict-aliasing, every guest store may alias every register, so
+    none stays in a host register across a store. The whole game's integer
+    code pays that, not only its x87 code.
+
+    The function declares locals that shadow g_eax .. g_esp by name (the
+    eax .. esp macros then reach them), loaded after the pre-emption point.
+    Every line that can run other code or look at the registers -- a call,
+    an indirect call or tail call, a kernel call, the spin hint's yield --
+    stores all of them back first and reloads them after; every return
+    stores them. Callers, callees, the kernel bridges and interrupt delivery
+    therefore see the registers exactly where they used to. Functions with
+    their own register locals (MMX leaves) or with setjmp/SEH are left alone.
+    RECOMP_REG_LOCALS=0 at regen turns it off.
+    """
+    import re
+    global _REG_CALL_RE
+    if _REG_CALL_RE is None:
+        _REG_CALL_RE = re.compile(
+            r"RECOMP_ABI_CALL\(|RECOMP_ICALL|RECOMP_ITAIL|RECOMP_UNIMPL\(|"
+            r"RECOMP_SPIN_HINT|recomp_debug_service\(|xbe_entry_point\(|"
+            r"\bsub_[0-9A-Fa-f]{8}(?:_gen)?\s*\(\s*\)")
+    try:
+        at = next(i for i, l in enumerate(lines)
+                  if l.strip() == "RECOMP_PREEMPT();")
+    except StopIteration:
+        return lines
+    body = lines[at + 1:]
+    text = "\n".join(body)
+    if ("leaf: register in a local" in text
+            or re.search(r"setjmp|longjmp|RECOMP_SEH", text)):
+        return lines
+    used = [r for r in _REG_NAMES if re.search(rf"\b{r}\b", text)]
+    if not used:
+        return lines
+
+    spill = " ".join(f"recomp_leaf_st_{r}(g_{r});" for r in used)
+    reload = " ".join(f"g_{r} = recomp_leaf_ld_{r}();" for r in used)
+    out = lines[:at + 1]
+    out.append("    " + " ".join(f"uint32_t g_{r} = recomp_leaf_ld_{r}();" for r in used)
+               + " /* registers in locals */")
+    for l in body:
+        out.append(_wrap_calls(l, _REG_CALL_RE, spill, reload))
+    out.append(f"    {spill} /* registers back at the end */")
+    return out
+
+
 def _fixup_icall_esp_save(lines):
     """
     Post-process generated C lines to insert _icall_esp save points.
@@ -2410,6 +2560,10 @@ class FunctionTranslator:
 
         if os.environ.get("RECOMP_LEAF_LOCALS", "1") != "0":
             lines = _localize_leaf_registers(lines, instructions, start, end)
+        if os.environ.get("RECOMP_X87_LOCALS", "1") != "0":
+            lines = _localize_x87_stack(lines)
+        if os.environ.get("RECOMP_REG_LOCALS", "1") != "0":
+            lines = _localize_registers(lines)
 
         # Validate: comment out goto targets that reference missing labels
         # (dead code after unconditional jumps may reference non-existent labels)

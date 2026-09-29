@@ -32,6 +32,7 @@ typedef ptrdiff_t     GLsizeiptr;
 typedef ptrdiff_t     GLintptr;
 
 #define GL_FALSE                          0
+#define GL_NO_ERROR                       0
 #define GL_MAP_WRITE_BIT                  0x0002
 #define GL_MAP_INVALIDATE_RANGE_BIT       0x0004
 #define GL_MAP_UNSYNCHRONIZED_BIT         0x0020
@@ -58,7 +59,9 @@ typedef ptrdiff_t     GLintptr;
 #define GL_PACK_ALIGNMENT                 0x0D05
 #define GL_TEXTURE_2D                     0x0DE1
 #define GL_UNSIGNED_BYTE                  0x1401
+#define GL_UNSIGNED_SHORT                 0x1403
 #define GL_UNSIGNED_INT                   0x1405
+#define GL_SHORT                          0x1402
 #define GL_FLOAT                          0x1406
 #define GL_RGBA                           0x1908
 #define GL_KEEP                           0x1E00
@@ -140,6 +143,7 @@ typedef ptrdiff_t     GLintptr;
     X(void, glActiveTexture, (GLenum)) \
     X(void, glTexImage2D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *)) \
     X(void, glTexSubImage2D, (GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *)) \
+    X(void, glCompressedTexImage2D, (GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, const void *)) \
     X(void, glTexParameteri, (GLenum, GLenum, GLint)) \
     X(void, glGenFramebuffers, (GLsizei, GLuint *)) \
     X(void, glDeleteFramebuffers, (GLsizei, const GLuint *)) \
@@ -228,6 +232,10 @@ int nv2a_gl_load(void *(*getproc)(const char *name));
 #define glBindTexture            p_glBindTexture
 #define glActiveTexture          p_glActiveTexture
 #define glTexImage2D             p_glTexImage2D
+#define glCompressedTexImage2D   p_glCompressedTexImage2D
+#define GL_COMPRESSED_RGBA_S3TC_DXT1_EXT 0x83F1
+#define GL_COMPRESSED_RGBA_S3TC_DXT3_EXT 0x83F2
+#define GL_COMPRESSED_RGBA_S3TC_DXT5_EXT 0x83F3
 #define glTexSubImage2D          p_glTexSubImage2D
 #define glTexParameteri          p_glTexParameteri
 #define glGenFramebuffers        p_glGenFramebuffers

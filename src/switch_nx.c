@@ -193,6 +193,20 @@ static void perf_report(void)
     fprintf(stderr, "[perf] APU %d frames/s (1500 = real time), frame thread %.0f%% busy\n",
             mcpx_apu_frames_per_second(), mcpx_apu_utilization() * 100.0f);
     last_frames = f;
+    {
+        /* RECOMP_GL_THREAD: is the GL thread starved, or the executor held
+         * back by it? */
+        void nv2a_gl_queue_stats(double secs, int *gl_idle_pct, int *exec_wait_pct);
+        int idle, held;
+        nv2a_gl_queue_stats(10.0, &idle, &held);
+        if (idle >= 0)
+            fprintf(stderr, "[perf] GL thread idle %d%% (queue empty), executor held back %d%% "
+                    "(queue full / two frames queued)\n", idle, held);
+    }
+    {
+        void xbox_main_wait_report(double secs);
+        xbox_main_wait_report(10.0);
+    }
     xbox_perf_sample();
     xbox_nx_thread_report(10.0);
     {
@@ -636,6 +650,143 @@ int nv2a_gl_adopt_window(void **win, void **ctx)
     return 1;
 }
 
+/* ── Sampling profiler (RECOMP_NX_PROFILE=1) ──────────────────────────
+ *
+ * The console has no profiler and Eden's costs are not the console's. So:
+ * a thread above everything else in the game wakes every millisecond,
+ * pauses each busy thread (svcSetThreadActivity), reads its pc, lr and the
+ * return address one frame up (x29 chain) with svcGetThreadContext3, and
+ * lets it run again. "Busy" is re-decided every 100 ms from the thread tick
+ * counts: over 10% of a core. Samples go to sdmc:/switch/nfsu2x/prof.bin
+ * every 10 s as 32-byte records (thread slot, pc, lr, 5 return addresses, as offsets
+ * into the NRO), and the log names the slots; tools/prof_report.py turns
+ * the file into per-function tables with the ELF. Nothing is resolved on
+ * the console. Costs a few percent of one core while on. */
+int xbox_nx_thread_at(int i, Handle *h, uintptr_t *entry);
+/* The NRO load address: _start, the first instruction (ELF address 0).
+ * Not __start__, which is an absolute 0 and is not relocated. */
+extern void _start(void);
+
+typedef struct { u16 slot, pad; u32 pc, lr, ret[5]; } ProfSample;   /* 32 bytes */
+#define PROF_MAX 120000
+#define PROF_FRAMES 5
+static ProfSample s_prof[PROF_MAX];
+static unsigned s_prof_n;
+
+static u32 prof_off(u64 a)
+{
+    u64 b = (u64)(uintptr_t)&_start;
+    return a >= b && a - b < 0xFFFFFFFFull ? (u32)(a - b) : 0xFFFFFFFFu;
+}
+
+static void prof_flush(void)
+{
+    FILE *f;
+    if (!s_prof_n)
+        return;
+    f = fopen("sdmc:/switch/nfsu2x/prof.bin", "ab");
+    if (f) {
+        fwrite(s_prof, sizeof s_prof[0], s_prof_n, f);
+        fclose(f);
+    }
+    fprintf(stderr, "[prof] %u samples written\n", s_prof_n);
+    s_prof_n = 0;
+}
+
+static void prof_thread(void *arg)
+{
+    enum { MAXT = 64 };
+    Handle h[MAXT];
+    u64 last_ticks[MAXT] = {0};
+    int busy[MAXT] = {0}, n = 0, i;
+    u64 t_list = 0, t_flush = armGetSystemTick(), freq = armGetSystemTickFreq();
+    (void)arg;
+    remove("sdmc:/switch/nfsu2x/prof.bin");
+    for (;;) {
+        u64 now;
+        svcSleepThread(1000000ull);
+        now = armGetSystemTick();
+        if (now - t_list > freq / 10) {             /* who is busy */
+            u64 span = now - t_list;
+            uintptr_t entry;
+            int counted = 0;
+            for (n = 0; n < MAXT && xbox_nx_thread_at(n, &h[n], &entry); n++) {
+                u64 t = 0;
+                if (R_FAILED(svcGetInfo(&t, InfoType_ThreadTickCount, h[n], (u64)-1)))
+                    t = 0;
+                counted |= t != 0;
+                /* thread ticks count at 19.2 MHz, like the system tick */
+                busy[n] = t_list && (t - last_ticks[n]) * 10 > span;
+                last_ticks[n] = t;
+            }
+            if (!counted)                           /* Eden: no tick counts */
+                for (i = 0; i < n; i++)
+                    busy[i] = i == 0;       /* the game's main thread only: pausing
+                                             * every thread each ms hung Eden's boot */
+            t_list = now;
+        }
+        for (i = 0; i < n && s_prof_n < PROF_MAX; i++) {
+            ThreadContext ctx;
+            if (!busy[i] || R_FAILED(svcSetThreadActivity(h[i], ThreadActivity_Paused)))
+                continue;
+            if (R_SUCCEEDED(svcGetThreadContext3(&ctx, h[i]))) {
+                ProfSample *o = &s_prof[s_prof_n++];
+                MemoryInfo mi;
+                u32 pi;
+                o->slot = (u16)i;
+                /* when: 10 ms units since boot (wraps after 655 s) */
+                o->pad = (u16)((armGetSystemTick() - s_t0) / 192000u);
+                o->pc = prof_off(ctx.pc.x);
+                o->lr = prof_off(ctx.lr);
+                memset(o->ret, 0xFF, sizeof o->ret);
+                /* The x29 chain, within the stack's own mapping: the thread
+                 * is paused, and its stack is our memory. */
+                if ((ctx.fp & 7) == 0 && R_SUCCEEDED(svcQueryMemory(&mi, &pi, ctx.fp))
+                    && (mi.perm & Perm_R)) {
+                    u64 fp = ctx.fp, lo = mi.addr, hi = mi.addr + mi.size;
+                    int k;
+                    for (k = 0; k < PROF_FRAMES && fp >= lo && fp + 16 <= hi && !(fp & 7); k++) {
+                        const u64 *fr = (const u64 *)(uintptr_t)fp;
+                        o->ret[k] = prof_off(fr[1]);
+                        if (fr[0] <= fp)
+                            break;
+                        fp = fr[0];
+                    }
+                }
+            }
+            svcSetThreadActivity(h[i], ThreadActivity_Runnable);
+        }
+        if (now - t_flush > freq * 10) {
+            uintptr_t entry;
+            Handle hh;
+            char line[1024];
+            int len = snprintf(line, sizeof line, "[prof] slots:");
+            for (i = 0; i < MAXT && xbox_nx_thread_at(i, &hh, &entry) && len < 1000; i++)
+                len += snprintf(line + len, sizeof line - len, " %d=%x", i,
+                                entry ? prof_off(entry) : 0u);
+            fprintf(stderr, "%s\n", line);
+            prof_flush();
+            t_flush = armGetSystemTick();
+        }
+    }
+}
+
+static void prof_start(void)
+{
+    static Thread t;
+    const char *e = getenv("RECOMP_NX_PROFILE");
+    if (!e || *e != '1')
+        return;
+    /* 0x2A: above every game and host thread, so it runs on time. */
+    if (R_FAILED(threadCreate(&t, prof_thread, NULL, NULL, 0x4000, 0x2A, -2))
+        || R_FAILED(threadStart(&t))) {
+        fprintf(stderr, "[prof] could not start the profiler thread\n");
+        return;
+    }
+    fprintf(stderr, "[prof] sampling busy threads at 1 kHz into prof.bin (NRO base %p)\n",
+            (void *)&_start);
+}
+
 void switch_boot(void)
 {
     s_t0 = armGetSystemTick();
@@ -657,6 +808,7 @@ void switch_boot(void)
                (unsigned long)(total >> 20), (unsigned long)(used >> 20));
     }
     loader_start();
+    prof_start();
 }
 
 void switch_shutdown(void)

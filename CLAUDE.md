@@ -16,7 +16,11 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
 - Don't launch or kill Eden unless the user asked for an Eden check; check
   `tasklist.exe | grep -i eden` first. Eden's `sdmc\switch` is a junction to
   `nfsu2-xbox\switch_sd\switch`, so an Eden run overwrites the log
-  there — back up a hardware log before running Eden. The user drops real
+  there — back up a hardware log before running Eden. Use
+  `run_eden.sh` (never a bare `taskkill /F`): it closes Eden politely,
+  force-kills only after 15 s, and restores eden.exe/qt-config.ini from
+  `/root/nfsu2x/eden_backup/` if a hard kill damaged them. `NRO=x.nro` runs
+  another NRO from `switch/nfsu2x/`. The user drops real
   console logs in `switch_sd/switch/logs/`.
 - One test at a time on Linux (runs share `fb/`, `gfb/`).
 - Never `pkill -f` a pattern that also matches your own command line (it
@@ -125,6 +129,22 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   the final combiner's C0/C1 are SPECULAR_FOG_FACTOR0/1, not stage 0's. The
   loading screen's quads sit at z = 1.0 and GL clipped them: GL_DEPTH_CLAMP.
   Headless Linux tests: `SDL_VIDEODRIVER=offscreen` (no Xvfb) works.
+- **Grey squares in rain** (lens drops, `sub_000A6530` "Rain Drop"): per
+  drop it copies 32x32 of the back buffer into a 32x32 target (0x2BEE080)
+  and draws RAINDROPTEST with DEPENDENT_GB into that copy. The copy pass's
+  final combiner is FOG.a*C0 + (1-FOG.a)*R0 with fog from specular alpha;
+  its FVF has no specular, and D3D sets `SET_VERTEX_DATA4UB(4)=0` for it.
+  The renderer fed absent attributes (0,0,0,1) -> fog 1 -> copy = C0.
+  Fixed: executor tracks SET_VERTEX_DATA* per attribute
+  (`Nv2aRawBatch.attr_const`). Repro on Linux: Career, idle in the open
+  world; rain starts after 4-10 min (random). `RECOMP_GL_WATCH=<va>` dumps
+  draws into/sampling a VA with pixel readbacks.
+- **Lights through walls** (car lights, neon, street lamps): the light
+  flare pass (`sub_000AC560`, "eRenderLightFlares") switches colour target
+  (0x3E9E0C) but keeps the scene's Z buffer; nv2a_gl kept one depth buffer
+  per colour surface, so flares tested against empty depth. Depth is now
+  per zeta address and stored size (`depth_get`, `RECOMP_GL_SHARED_Z=0` old
+  behaviour). Linux race frames confirmed.
 - **Files:** no `open()` on directories (`XBOX_DIR_FD` sentinel); FAT can't
   hold sparse files (partition images created empty, size reported).
 - **Save load/create froze the whole console** (log stops right after
@@ -149,6 +169,17 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   without it (boot stalls, no window). The presenter then stretches to 16:9.
 - **Launch:** title override (hold R on a game) for full memory; applet mode
   has ~400 MB.
+- **Rumble:** XAPI sends the 6-byte XID output report (00 06, left/right
+  motor LE16) on interrupt OUT ep 2 (or class SET_REPORT); ohci.c hands it to
+  `usb_gamepad_output` → `xbox_InputSetState` → libnx HD rumble on Switch
+  (`xbox_nx_pad_rumble`: left = low band 160 Hz, right = high band 320 Hz,
+  handheld + player 1), SDL rumble on Linux. Only changes are sent.
+  `RECOMP_RUMBLE=0` off, `RECOMP_RUMBLE_TRACE=1` logs each change.
+- **Render scale:** `RECOMP_GL_SCALE=1|2|4` (nv2a_gl.c) stores every
+  surface at that multiple (`GlSurf.pw/ph`; `w/h` stay the title's pixels
+  for shaders, clips and lookups); viewport, clear scissor, read-backs,
+  `RECOMP_GL_DUMP` and the present blit use the stored size. Capped per
+  surface by GL_MAX_TEXTURE/RENDERBUFFER_SIZE.
 - Buttons map by label (Switch A = Xbox A); `RECOMP_PAD_LAYOUT=position`
   swaps to Xbox positions. Y opens the in-game Help box, closed with B.
 
@@ -178,6 +209,9 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   first when the writer stores zeros.
 
 ## Performance findings (Switch focus)
+
+- **Start here for performance work: `PERF_NOTES.md`** (state, uncommitted
+  patches in `/root/nfsu2x/perf-wip/`, how to apply, measure, next steps).
 
 - Profile on Linux: `/usr/lib/linux-tools-6.8.0-142/perf record -e cpu-clock -F 499 -p $(pgrep -n -x nfsu2_recomp)`
   (the `/usr/bin/perf` wrapper doesn't work on this WSL kernel; `-e cpu-clock` is required).
@@ -230,6 +264,176 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   Next candidates: merge consecutive draws with identical state, cheaper
   vertex fetch in the executor. Measure fps from memory: D3D flips at
   device block (+0x2F7798 -> +0x1C28) +0x1CC; read /proc/<pid>/mem unbuffered.
+- **Vulkan? (2026-09-29, Eden measurement):** devkitPro ships only Mesa
+  GL/GLES (nouveau) and deko3d (its shader compiler `uam` is an x86 host
+  tool; our shaders are generated at run time), but Mesa's NVK has been
+  ported outside devkitPro: mesa-switch (danfromtico, used by nfsmw-nx) and
+  NXVK (PalindromicBreadLoaf). Race on Eden: 8-18 fps, ~22k draws/s, GL backend
+  = ~44% of the executor thread (19 us/draw), game waits on D3D fences
+  (BlockOnTime) ~45% of the time. With every GL draw skipped
+  (instrumented build, `RECOMP_GL_NODRAW`) the race only reaches 17-23 fps
+  and fence waits drop to 13-25%: the lifted game code + executor decode are
+  the next limit. So any graphics API is worth at most ~2x, not 30 fps.
+  Done since: texture and program lookups are hash chains (`tex_get`,
+  `prog_get`, last-program fast path), texture binds and enabled attribute
+  arrays cached, the vertex program hash and the 3 KB constants memcmp
+  skipped via executor generation counters (`vp_prog_gen`/`vp_const_gen`),
+  16-bit indices, and vertices uploaded as stored
+  (`NV2A_BACKEND_RAW_DIRECT`, `Nv2aRawBatch.attr_direct`; only CMP normals
+  still go through float4; `RECOMP_GL_DIRECT=0` for the old path). Eden,
+  heaviest race stretch: ~31k -> ~36k draws/s, GL 18 -> 14-15 us/draw
+  (Eden noise is +-15%). Executor then busy ~75-85% (GL ~50%, decode ~30%);
+  trap and FLIP_STALL waits are only 1-3%.
+- **Hardware race (2026-09-29, handheld, perf build):** 6-12 fps, 12-16k
+  draws/s, GL 32-37 us/draw (Mesa 20.1 nouveau, 2x Eden). Executor
+  (`nv2a_ack_thread`) wall busy = its CPU ticks (66-87%): CPU-bound, not
+  waiting on the GPU, so an apm GPU clock bump is not the fix yet. Thread
+  entries in `% of a core` are absolute addresses (`__start__` is 0 in the
+  ELF): solve the load base from their spacing against `nm`.
+- **Frame serialisation (fixed, opt-in `RECOMP_FRAME_LAG=1`):** the main
+  loop `sub_000AEA90` calls BlockOnFence (0x2E9530, return 0x000AEDDB) on
+  the fence of the frame it just built, before Present (0x2EB7F0), so game
+  and executor took turns. The wrapper in recomp_manual.c waits on the
+  previous frame's fence instead. Eden race 9-18 -> 21-24 fps, executor
+  then 99% busy; remaining game waits are pushbuffer ring space (0x2E9184).
+  Linux race frames unchanged. Hardware test pending.
+- **Hardware with RECOMP_FRAME_LAG=1:** race 7-16 fps, executor 90-97%
+  CPU (GL ~35 us + decode ~18 us per draw), ~17k draws/s; fps = draws/frame
+  / 17k. 30 fps at ~2000 draws/frame needs ~16 us/draw.
+- **RECOMP_GL_THREAD=1** (nv2a_gl.c, "Threaded submission"): the executor
+  queues draws/clears/flips (shadow, program, constants as diffs against the
+  last record; vertex ranges, indices copied) and a GL thread replays them;
+  at most 2 flips queued. Needs everything a back end reads to be private or
+  pre-resolved: `Nv2aRawBatch.tex_va/pal_va`, and `sample_texture` takes its
+  Texture (nv2a_backend_decode_texture used to borrow `s_gpu.tex`; racing
+  it gave magenta textures). Linux race frames correct; Eden 21-24 fps
+  (same as frame lag alone). Hardware test pending.
+- **Hardware with GL thread (15:42/15:59 runs):** race 11-20 fps. Executor
+  30-50%, GL thread 56-89% but idle 9-42% (queue empty), executor almost
+  never held back: the game main thread paces. Its race time: 61% game code,
+  23% waiting for the guest lock (GIL), ~12% in D3D KickOff (sub_002E8D40)
+  spinning on the PFB write-combine flush bit (+0x100410 bit 16) until the
+  flag thread cleared it, then waiting for the GIL after the spin yield.
+  Fixed: recomp_spin_wake clears that bit on the polling thread. The EA
+  mixer worker (sub_0021C8E6, code at 0x27xxxx) does ~7% work but ~12% GIL
+  contention. q_reg_diff (8 KB compare twice per draw, 14% of the executor)
+  replaced by executor dirty blocks (`nv2a_pb_reg_dirty`).
+- **16:14 run (flush fix):** race steady 15.6-19.5 fps; KickOff wait 12% ->
+  6%, GIL wait still 24%, game code 63%, `__aarch64_read_tp` 3.8% self
+  (guest registers are RECOMP_TLS; -mtp=soft makes every TLS access a call;
+  138k call sites, ~10 per hot function). Opt-in `RECOMP_GIL_EAGER=1`: the
+  main guest thread (xbox_gil_mark_main in main.c) gets the lock at once --
+  the holder yields at its next function entry -- and clears the flag on
+  taking it, so the pre-empted thread waits its 1 ms again (no ping-pong).
+- **16:28 run (RECOMP_GIL_EAGER=1):** race 16.6-22.3 fps (~19.5 avg, was
+  ~17). Main thread: game code 72.5%, GIL wait 24% -> 10%, NtWait 11%
+  (handle 0x48000008 via XAPI WaitForSingleObject 0x21B475, callers include
+  the EA audio code 0x27Exxx: likely the main thread blocking on a guest lock
+  the mixer holds; `[perf] main thread waits by caller` in the log). The APU
+  fell to 1283-1475 frames/s: SetThreadPriority is only tracked in
+  win32_compat, so its HIGHEST request never reached Horizon; now
+  `xbox_nx_raise_host_thread` puts the APU frame thread at 0x2C
+  (`RECOMP_NX_AUDIO_PRIO=0` off).
+- **Audio uneven with the first RECOMP_GIL_EAGER** (main thread pre-empted
+  everyone): the EA mixer (thread entry 0x00274CA0) runs at base priority
+  +16 = TIME_CRITICAL and must pre-empt the main thread. RECOMP_GIL_EAGER
+  now hands the lock over by guest priority (GetThreadPriority of the
+  waiter vs. the holder; per-priority waiter counts; the flag stays up while
+  a higher-priority thread waits). Priorities seen: main 0, stream workers
+  +1/+2/-2, mixer +15. Linux race audio (SDL disk capture): no dropouts.
+- **16:52 run (priority handover for everyone):** audio better, race 12-17.7
+  fps: stream workers (+1/+2) now pre-empted the main thread too (GIL wait
+  31%). Narrowed: only time-critical waiters (the mixer) and the main thread
+  pre-empt at once (GIL_CRITICAL). APU 83% asleep / 12% working, so its
+  1350-1495 frames/s is its wall-clock pacing, not CPU.
+- **Game code is the limit now** (60-72% of the main thread). The hottest
+  functions (sub_0009A330, sub_000A3CA0, sub_002A68EC) are x87 math, and the
+  lifter emits every fld/fstp as a read-modify-write of RECOMP_TLS
+  g_fp_stack[8]/g_fp_top (lifter.py ~3375): TLS call on Horizon, and guest
+  MEM stores may alias it, so nothing stays in registers. Candidate: map the
+  x87 stack to C locals where the depth is static (like
+  _localize_leaf_registers), spilling at calls; plus RECOMP_TLS registers ->
+  globals swapped at GIL handover.
+- **x87 top in a local (translator `_localize_x87_stack`, RECOMP_X87_LOCALS=0
+  off):** every function using the x87 stack (2985) shadows g_fp_top with a
+  local int and g_fp_stack with a pointer to this thread's array
+  (recomp_fp_base/top_ld/top_st in recomp_types.h), storing the index
+  before every call/ICALL/ITAIL/return and reloading after calls. Copying
+  all 8 slots at each call instead was slower (x86 menu 1.18-1.74 vs 0.97
+  ms/frame); the index-only version is 0.92 (-5%) on x86, where TLS is
+  cheap. Linux race and Eden fine. So far regenerated only into a private
+  gen (scratch gen2 + toolkit copy), not /root/nfsu2x/gen.
+- **Registers in locals (translator `_localize_registers`,
+  RECOMP_REG_LOCALS=0 off):** eax..edi and esp shadowed by locals in 19394
+  functions (accessors recomp_leaf_ld/st_*, esp added), stored right before
+  every call/ICALL/ITAIL/UNIMPL/SPIN_HINT (`_wrap_calls`: after the
+  argument and return-address pushes on the same line) and reloaded right
+  after the call's statement; stored at every return and at the end. Needed
+  header changes: RECOMP_ABI_CALL's check reads the real registers
+  (recomp_leaf_ld_*), and the ICALL failure paths store esp/eax through
+  (RECOMP_ICALL_FAIL_SYNC). Registers as plain globals instead is NOT
+  possible: kernel_thunk_dispatch releases the GIL before the bridges read
+  g_esp and write g_eax. x86 menu: slightly slower (1.06 vs 0.94 ms/frame,
+  TLS is cheap there); Eden main menu (ARM code): 38-40 vs 29-32 fps. NRO
+  4.6% smaller.
+- **Native culling (src/recomp_manual.c in the scratch repo copy so far):**
+  sub_0009A330 (box vs 6 frustum planes, returns 0 out / 1 straddle / 2 in)
+  and sub_0009A250 (box by matrix, Arvo) in C with the lifted code's exact
+  arithmetic (doubles, float rounding where it stores to memory, NaN takes
+  the jp branch). RECOMP_NATIVE=0 off, RECOMP_NATIVE_CHECK=1 runs both:
+  0 mismatches in 8.4M + 3.1M calls over a Linux race. ~40% of the
+  culling calls carry a matrix.
+- **Race hitches (Eden, `[hitch]` lines: frames > 50 ms with programs
+  compiled / textures uploaded and their time):**
+  - race start: ~40 programs compiled in two frames (~40 ms each in Mesa,
+    1.5 s). Fixed by a program cache: every compile appends its inputs
+    (xform, program slots, combiner key) to sdmc:/switch/nfsu2x/progcache.bin
+    (`RECOMP_PROG_CACHE=<path>|0`); ready() precompiles the file (66 programs,
+    2.7 s in Eden, at boot). What is left is the first race frame (12.8 MB of
+    first-time textures).
+  - mid-race 0.5-1.5 s frames with nothing compiled or uploaded: the EA mixer
+    (time critical) polled DirectSound positions, which call
+    KeQuerySystemTime, ~400k kernel calls/s, each a guest-lock handover it
+    won against the main thread. Fixed: KeQuery*Time/PerformanceCounter
+    (ordinals 125-128) keep the GIL (`kernel_call_keeps_gil`,
+    RECOMP_KERNEL_FAST=0 off). Worst mid-race frame 1540 -> 77 ms.
+- **Console 22:36 run (registers/x87/native culling + kernel-fast):** race
+  19.5-22.7 fps (was 11-20). GL thread now the limit (87-93%, idle 1-6%);
+  shader compiles cost 90-150 ms each on the console (52 at race load =
+  4.5 s: progcache.bin was not on the card); new textures ~70 ms/MB.
+  GL thread profile: constants re-sent whole (memcmp/_mesa_uniform/
+  nvc0_constbufs_validate ~7%), nouveau_bo_new per ring map (~3%).
+  Fixed: DXT1/3/5 (0x0C/0x0E/0x0F, nearly all race textures) uploaded
+  compressed (glCompressedTexImage2D, RECOMP_GL_DXT=0 off), swizzled
+  A8R8G8B8 unswizzled in a loop, only changed constant rows sent (runs,
+  when c[191]'s location is u_c+191), ring maps without
+  GL_MAP_INVALIDATE_RANGE_BIT. Eden after 90 s: hitches 133 -> 33, worst
+  153 -> 61 ms, textures 6.6 MB/151 ms -> 0.2 MB/9 ms.
+- Profiler: samples carry a 10 ms timestamp (`prof_report.py --time A-B`);
+  in Eden it samples only the main thread (pausing every thread each ms
+  hung Eden's boot once the buffer was larger).
+- **Eden race fps is not a measure of game code**: ~22 fps for every build
+  since the frame-lag fix; menus do move (+25-30% with register locals).
+- **RECOMP_MEM_VOLATILE** (recomp_types.h): `-DRECOMP_MEM_VOLATILE=` builds
+  guest memory accesses non-volatile; on x86 no measurable gain (menu 1.0
+  vs 0.97 ms/frame). Default unchanged. Linux A/B: races are not
+  repeatable (15.0 vs 10.9 ms/frame for the same build), nor is a paused
+  race; the main menu idle is (`RECOMP_FPS_LOG=1` + /proc main-thread utime).
+- **Profiler (RECOMP_NX_PROFILE=1, switch_nx.c):** 1 kHz samples of busy
+  threads (svcSetThreadActivity + svcGetThreadContext3) into
+  sdmc:/switch/nfsu2x/prof.bin; `tools/prof_report.py prof.bin
+  build-switch/nfsu2_recomp.elf nfsu2x_log.txt`. Base is `&_start`
+  (`__start__` is an unrelocated absolute 0). Eden has no thread tick
+  counts, so there every tracked thread is sampled (buffer fills in ~2 s).
+- **StevensND/nfsmw-nx** (NFS Most Wanted 360 port, 32-35 fps on Switch at
+  stock clocks) is the reference for what works: native Vulkan renderer on
+  NVK (mesa-switch + their patch), ~16 us/draw at first on the console,
+  then caches/uploads without duplicates, LTO + PGO + direct calls +
+  function ordering (~+12%), native rewrites of the game's hottest renderer
+  functions, `apm` performance configuration 0x92220008 (GPU 460.8 MHz
+  handheld). Docs: docs/performance-history.md, measuring.md,
+  platform-notes.md (thread priorities: only 0x3B time-slices; A57 atomics
+  are slow).
 - Regen from the worktree needs `tools/{disasm,func_id,abi_analysis}/output`
   — symlinked from the main checkout (don't commit the links).
 

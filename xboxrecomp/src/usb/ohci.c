@@ -596,10 +596,18 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             moved = n;
         }
     } else {
-        /* OUT: the status stage of an IN control transfer, or rumble. Both
-         * are accepted and discarded. */
+        /* OUT: the status stage of an IN control transfer, the data stage
+         * of a SET_REPORT, or the rumble report on interrupt endpoint 2. */
+        const uint8_t *p = (len > 0) ? guest_ptr(cbp, (uint32_t)len) : NULL;
+
+        if (p && (endpoint != 0
+                  || (g_setup_pending && !(g_setup.bmRequestType & 0x80u)
+                      && (g_setup.bmRequestType & 0x60u) == 0x20u
+                      && g_setup.bRequest == 0x09u)))
+            usb_gamepad_output(p, len);
         moved = len;
-        g_setup_pending = 0;
+        if (endpoint == 0)
+            g_setup_pending = 0;
     }
 
     /* CBP is zero when everything asked for moved, and otherwise points past

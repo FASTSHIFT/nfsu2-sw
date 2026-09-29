@@ -13,4 +13,8 @@ enum { NX_XBOX_A, NX_XBOX_B, NX_XBOX_X, NX_XBOX_Y,
 int xbox_nx_pad_read(unsigned port, uint16_t *digital, uint8_t analog[8],
                      int16_t thumbs[4]);
 
+/* Rumble on `port`'s controller: Xbox motor speeds, 0..65535 (left is the
+ * heavy low-frequency motor). RECOMP_RUMBLE=0 turns it off. */
+void xbox_nx_pad_rumble(unsigned port, uint16_t left, uint16_t right);
+
 #endif

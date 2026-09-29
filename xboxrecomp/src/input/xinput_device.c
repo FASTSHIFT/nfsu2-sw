@@ -373,6 +373,12 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
         return ERROR_DEVICE_NOT_CONNECTED;
 
+#if defined(__SWITCH__)
+    /* The console's own controllers (xinput_nx.c), not SDL's. */
+    xbox_nx_pad_rumble(dwPort, pVibration->wLeftMotorSpeed,
+                       pVibration->wRightMotorSpeed);
+    return ERROR_SUCCESS;
+#else
     SDL_GameController *c = g_pads[dwPort];
     if (!c) return ERROR_DEVICE_NOT_CONNECTED;
 
@@ -381,6 +387,7 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
     SDL_GameControllerRumble(c, pVibration->wLeftMotorSpeed,
                              pVibration->wRightMotorSpeed, 1000);
     return ERROR_SUCCESS;
+#endif
 }
 
 BOOL xbox_InputIsConnected(DWORD dwPort)

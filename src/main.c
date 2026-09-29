@@ -236,6 +236,7 @@ static int game_main(void);
 void xbox_guest_pin(int interrupt);   /* win32_compat.c: the Xbox's one CPU */
 void xbox_gil_enter(void);             /* kernel_bridge.c: the guest lock */
 void xbox_gil_leave(void);
+void xbox_gil_mark_main(void);
 
 #ifdef __SWITCH__
 #include <pthread.h>
@@ -392,6 +393,7 @@ static int game_main(void)
     xbox_WatchdogStart();
 
     printf("Starting guest at 0x%08X (esp=0x%08X)\n", NFSU2_ENTRY_POINT, g_esp);
+    xbox_gil_mark_main();      /* the frame-rate thread (RECOMP_GIL_EAGER) */
     xbox_gil_enter();          /* guest code from here on (kernel_bridge.c) */
     xbe_entry_point();
     xbox_gil_leave();

@@ -64,6 +64,7 @@ int xbox_log_quiet(void)
  * reads as every register being zero. */
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+extern RECOMP_TLS uint32_t g_ebp;          /* the guest frame chain (wait report) */
 extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
 extern RECOMP_TLS uint32_t g_seh_ebp;
 extern ptrdiff_t g_xbox_mem_offset;
@@ -604,16 +605,92 @@ static int gil_enabled(void)
 volatile int g_gil_contended;
 static RECOMP_TLS int t_gil_nopreempt;      /* inside an ISR or DPC */
 
+/* RECOMP_GIL_EAGER=1: hand the lock over by guest priority, the way the
+ * Xbox's scheduler would, instead of FIFO with a 1 ms grace.
+ *
+ * On the console NFSU2's main thread spent ~24% of a race waiting for the
+ * lock, often behind lower-priority workers that only noticed a waiter at
+ * the 1 ms mark. But the EA mixer thread runs at base priority +16 (time
+ * critical) and must pre-empt the main thread, not the reverse -- letting
+ * the main thread push it aside made the audio uneven. So:
+ *   - a time-critical waiter (the mixer) asks the holder to yield at once
+ *     (lifted code checks at every function entry: microseconds), and the
+ *     request stays up while one is waiting, so it is never kept behind;
+ *   - the main thread (xbox_gil_mark_main) does so for any holder of equal
+ *     or lower priority;
+ *   - everyone else, higher-priority stream workers included, keeps the
+ *     1 ms rule: handing them the lock at once too cost the main thread 31%
+ *     of a race in waits (12-18 fps, was 17-22 with main-only), and their
+ *     work is not audible.
+ * ISRs and DPCs are never pre-empted (t_gil_nopreempt), as before. */
+static RECOMP_TLS int t_gil_main;
+void xbox_gil_mark_main(void) { t_gil_main = 1; }
+
+static int gil_eager(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GIL_EAGER");
+        on = e && *e == '1';
+        if (on)
+            fprintf(stderr, "  [THREAD] guest lock handed over by priority (RECOMP_GIL_EAGER)\n");
+    }
+    return on;
+}
+
+#define GIL_PRIOS 32                        /* Win32 priorities -15..15, +16 */
+static int s_gil_holder_prio;               /* under s_gil_cs */
+static int s_gil_waiting[GIL_PRIOS];        /* waiters per priority, under s_gil_cs */
+
+static int gil_prio_now(void)
+{
+    int p = GetThreadPriority(GetCurrentThread()) + 16;
+    return p < 0 ? 0 : p >= GIL_PRIOS ? GIL_PRIOS - 1 : p;
+}
+
+/* Is a time-critical thread above priority `p` waiting? Under s_gil_cs. */
+#define GIL_CRITICAL (THREAD_PRIORITY_TIME_CRITICAL + 16)
+static int gil_higher_waiting(int p)
+{
+    int k;
+    for (k = p + 1 > GIL_CRITICAL ? p + 1 : GIL_CRITICAL; k < GIL_PRIOS; k++)
+        if (s_gil_waiting[k])
+            return 1;
+    return 0;
+}
+
 static void gil_lock(void)
 {
     uint64_t me;
+    int eager = gil_eager(), prio = eager ? gil_prio_now() : 0, counted = 0;
     EnterCriticalSection(&s_gil_cs);
     me = s_gil_next++;
+    if (me != s_gil_serving && eager) {
+        s_gil_waiting[prio]++;
+        counted = 1;
+        if ((prio >= GIL_CRITICAL && prio > s_gil_holder_prio)
+            || (t_gil_main && prio >= s_gil_holder_prio))
+            g_gil_contended = 1;
+    }
     while (me != s_gil_serving)
         if (!SleepConditionVariableCS(&s_gil_cv, &s_gil_cs, 1))
             g_gil_contended = 1;           /* 1 ms and still waiting */
-    if (s_gil_next - s_gil_serving <= 1)
+    if (eager) {
+        if (counted)
+            s_gil_waiting[prio]--;
+        s_gil_holder_prio = prio;
+        {
+            static int seen[GIL_PRIOS];
+            if (!seen[prio]++)
+                fprintf(stderr, "  [THREAD] guest lock: first holder at priority %d%s\n",
+                        prio - 16, t_gil_main ? " (main thread)" : "");
+        }
+        /* Keep asking while someone above us waits; lower waiters raise it
+         * again when their millisecond runs out. */
+        g_gil_contended = gil_higher_waiting(prio);
+    } else if (s_gil_next - s_gil_serving <= 1) {
         g_gil_contended = 0;               /* nobody behind us */
+    }
     LeaveCriticalSection(&s_gil_cs);
 }
 
@@ -2109,6 +2186,8 @@ static void bridge_NtPulseEvent(void)
  */
 static HANDLE bridge_resolve_handle(uint32_t token);
 
+static struct { uint32_t r1, r2, token, n; uint64_t us; } s_mw[16];
+
 static void bridge_NtWaitForSingleObjectEx(void)
 {
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
@@ -2124,9 +2203,49 @@ static void bridge_NtWaitForSingleObjectEx(void)
         fflush(stderr);
     }
 
+    if (t_gil_main) {
+        /* Which of the main thread's waits cost it time: keyed by the guest
+         * code up the ebp chain (the XAPI wrapper, then its caller). */
+        uint32_t r1 = g_ebp ? BRIDGE_MEM32(g_ebp + 4) : 0;
+        uint32_t f1 = g_ebp ? BRIDGE_MEM32(g_ebp) : 0;
+        uint32_t r2 = f1 ? BRIDGE_MEM32(f1 + 4) : 0;
+        LARGE_INTEGER a, b, f;
+        int k;
+        QueryPerformanceCounter(&a);
+        g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
+            handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
+            XBOX_TO_NATIVE(timeout_ptr));
+        QueryPerformanceCounter(&b);
+        QueryPerformanceFrequency(&f);
+        for (k = 0; k < 16; k++)
+            if (!s_mw[k].n || (s_mw[k].r1 == r1 && s_mw[k].r2 == r2)) {
+                s_mw[k].r1 = r1;
+                s_mw[k].r2 = r2;
+                s_mw[k].token = STACK_ARG(0);
+                s_mw[k].n++;
+                s_mw[k].us += (uint64_t)((b.QuadPart - a.QuadPart) * 1000000.0 / f.QuadPart);
+                break;
+            }
+        return;
+    }
     g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
         handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(timeout_ptr));
+}
+
+/* The main thread's NtWaitForSingleObjectEx time by caller, since the last
+ * call (Switch perf report). */
+void xbox_main_wait_report(double secs)
+{
+    char line[600];
+    int k, len = snprintf(line, sizeof line, "[perf] main thread waits by caller:");
+    for (k = 0; k < 16 && s_mw[k].n && len < (int)sizeof line - 60; k++)
+        if (s_mw[k].us > secs * 5000.0)          /* over 0.5% */
+            len += snprintf(line + len, sizeof line - len, " %08X<%08X h%X=%.0f%%/%u",
+                            s_mw[k].r1, s_mw[k].r2, s_mw[k].token,
+                            s_mw[k].us / (secs * 1e4), s_mw[k].n);
+    fprintf(stderr, "%s\n", line);
+    memset(s_mw, 0, sizeof s_mw);
 }
 
 /* ── MmQueryAddressProtect (ordinal 179) ─────────────────── */
@@ -9896,8 +10015,33 @@ static void kernel_thunk_dispatch_body(void);
 /* Every kernel call is marked busy for its whole length (bridge locks, the CRT
  * lock behind fprintf, the host heap), except while it blocks in a host wait;
  * NtSuspendThread does not leave a thread suspended while it is busy. */
+/* Kernel calls that only read a clock: they never block and take
+ * microseconds, so they keep the guest lock. Releasing it made every such
+ * call a lock handover -- and NFSU2's EA mixer, a time-critical thread,
+ * polls DirectSound positions that read KeQuerySystemTime in a loop: 400k
+ * calls a second in a race, each one taking the lock back from the main
+ * thread (race frames of 0.5-1.5 s in Eden). RECOMP_KERNEL_FAST=0 releases
+ * it for these too. */
+static int kernel_call_keeps_gil(int slot)
+{
+    static int on = -1;
+    ULONG ord;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_KERNEL_FAST");
+        on = !(e && *e == '0');
+    }
+    if (!on || slot < 0 || slot >= XBOX_KERNEL_THUNK_TABLE_SIZE)
+        return 0;
+    ord = g_slot_ordinals[slot];
+    return ord == 125 || ord == 126 || ord == 127 || ord == 128;   /* KeQuery* time */
+}
+
 static void kernel_thunk_dispatch(void)
 {
+    if (kernel_call_keeps_gil(g_kernel_dispatch_slot)) {
+        kernel_thunk_dispatch_body();
+        return;
+    }
     int gil = xbox_gil_suspend();                /* the kernel is not guest code */
     pending_start_flush(GetCurrentThreadId());   /* threads this one created */
     xbox_kernel_busy(1);

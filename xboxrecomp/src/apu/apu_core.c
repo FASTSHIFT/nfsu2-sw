@@ -513,6 +513,10 @@ static void *mcpx_apu_frame_thread(void *arg)
     /* Audio misses are audible, a late game frame is not: stay ahead of the
      * game's busy threads for the few microseconds a block takes. */
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    {
+        extern void xbox_nx_raise_host_thread(void);   /* win32_compat.c */
+        xbox_nx_raise_host_thread();                    /* the above, on Horizon */
+    }
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {

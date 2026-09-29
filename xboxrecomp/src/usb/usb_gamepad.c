@@ -157,6 +157,13 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
         return copy_out(out, max, report, n, setup->wLength);
     }
 
+    /* SET_REPORT is the control-pipe way to send the rumble report. The
+     * report itself arrives in the OUT data stage (usb_gamepad_output);
+     * this only answers the status stage. */
+    if ((setup->bmRequestType & 0x60u) == 0x20u
+        && setup->bRequest == 0x09u && !is_in)
+        return 0;
+
     /* Vendor requests on the interface -- the XID protocol.
      *
      * This is how XAPI tells a controller from any other USB device. The
@@ -437,4 +444,32 @@ int usb_gamepad_report(uint8_t *out, int max)
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
     pad_script(&out[2], &out[4]);
     return 20;
+}
+
+/* ---- the output report ------------------------------------------------- */
+
+void usb_gamepad_output(const uint8_t *data, int len)
+{
+    static int trace = -1;
+    static uint16_t last_l = 0xFFFF, last_r = 0xFFFF;
+    XBOX_VIBRATION vib;
+
+    if (len < 6 || data[0] != 0x00 || data[1] < 6)
+        return;
+    vib.wLeftMotorSpeed  = (uint16_t)(data[2] | (data[3] << 8));
+    vib.wRightMotorSpeed = (uint16_t)(data[4] | (data[5] << 8));
+    /* The title resends the same speeds every frame or so; the host call
+     * can be an IPC (Switch hid), so only changes go out. */
+    if (vib.wLeftMotorSpeed == last_l && vib.wRightMotorSpeed == last_r)
+        return;
+    last_l = vib.wLeftMotorSpeed;
+    last_r = vib.wRightMotorSpeed;
+    if (trace < 0)
+        trace = getenv("RECOMP_RUMBLE_TRACE") != NULL;
+    if (trace) {
+        fprintf(stderr, "  PAD: rumble %04X %04X\n",
+                vib.wLeftMotorSpeed, vib.wRightMotorSpeed);
+        fflush(stderr);
+    }
+    xbox_InputSetState(0, &vib);
 }

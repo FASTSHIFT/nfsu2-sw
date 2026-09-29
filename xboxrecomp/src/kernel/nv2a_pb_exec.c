@@ -212,6 +212,8 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_VERTEX_DATA2F_M         0x1880   /* + attr*8,  2 floats */
 #define NV097_SET_VERTEX_DATA4F_M         0x1A00   /* + attr*16, 4 floats */
 #define NV097_SET_VERTEX_DATA4UB          0x1940   /* + attr*4,  D3DCOLOR */
+#define NV097_SET_VERTEX_DATA2S           0x1900   /* + attr*4,  2 shorts */
+#define NV097_SET_VERTEX_DATA4S_M         0x1980   /* + attr*8,  4 shorts */
 
 /* One immediate vertex, as this file packs it for the shared draw path:
  * position float4, diffuse D3DCOLOR, texcoord0 float2. */
@@ -261,6 +263,10 @@ static struct {
      * vertices they have produced in this batch. */
     float      imm_pos[4];
     uint32_t   imm_diffuse;
+    /* Each attribute's SET_VERTEX_DATA* value (what it reads without an
+     * array); attr_const_gen 0 = not initialised yet. */
+    float      attr_const[16][4];
+    uint32_t   attr_const_gen;
     float      imm_tex[2];
     uint32_t   imm_count;
     int        inline_active;
@@ -418,6 +424,10 @@ static void note_texture_use(void)
  * would hold it. State the executor does not model explicitly (lights,
  * combiners, material colours) is read from here. */
 static uint32_t s_reg[0x2000 / 4];
+/* 64-byte blocks of s_reg changed since a queueing back end last looked
+ * (nv2a_pb_reg_dirty); starts all set. */
+static uint8_t s_reg_dirty[0x2000 / 64] = { [0 ... 0x2000 / 64 - 1] = 1 };
+uint8_t *nv2a_pb_reg_dirty(void) { return s_reg_dirty; }
 static float reg_f(uint32_t method) { float f; memcpy(&f, &s_reg[method / 4], 4); return f; }
 
 static uint32_t s_sem_va;
@@ -578,7 +588,8 @@ static struct {
     uint32_t prog_load, prog_start, const_load;
     int      off;                       /* RECOMP_VP=0 */
     uint32_t gen;                       /* per-batch cache stamp */
-} s_vp;
+    uint32_t prog_gen, const_gen;       /* content versions for back ends */
+} s_vp = { .prog_gen = 1, .const_gen = 1 };
 
 typedef struct { float pos[4], d0[4], t0[4]; int ok; } VpOut;
 
@@ -599,6 +610,7 @@ static int vp_method(uint32_t method, uint32_t param)
         if (slot % 4 == 3)
             s_vp.prog_load++;
         s_vp.gen++;
+        s_vp.prog_gen++;
         return 1;
     }
     if (method >= NV097_SET_TRANSFORM_CONSTANT && method < NV097_SET_TRANSFORM_CONSTANT + 0x80) {
@@ -608,11 +620,12 @@ static int vp_method(uint32_t method, uint32_t param)
         if (slot % 4 == 3)
             s_vp.const_load++;
         s_vp.gen++;
+        s_vp.const_gen++;
         return 1;
     }
     switch (method) {
     case NV097_SET_TRANSFORM_PROGRAM_LOAD:  s_vp.prog_load = param;  return 1;
-    case NV097_SET_TRANSFORM_PROGRAM_START: s_vp.prog_start = param; s_vp.gen++; return 1;
+    case NV097_SET_TRANSFORM_PROGRAM_START: s_vp.prog_start = param; s_vp.gen++; s_vp.prog_gen++; return 1;
     case NV097_SET_TRANSFORM_CONSTANT_LOAD: s_vp.const_load = param; return 1;
     }
     return 0;
@@ -775,8 +788,10 @@ static void vp_run(float v[16][4], VpOut *o)
                     vp_write(out[addr], omask, src);
             } else {                                      /* constant write */
                 int ci = (int)addr + (vpf(t, 3, 1, 1) ? a0 : 0);
-                if (ci >= 0 && ci < VP_CONSTS)
+                if (ci >= 0 && ci < VP_CONSTS) {
                     vp_write(s_vp.c[ci], omask, src);
+                    s_vp.const_gen++;
+                }
             }
         }
         if (vpf(t, 3, 0, 1))                                              /* FINAL */
@@ -986,11 +1001,11 @@ static void current_surface(Nv2aSurface *out)
     out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
 }
 
-static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
+static int sample_texture(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb);
 
 int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
 {
-    Texture saved = s_gpu.tex;
+    Texture t;
     uint32_t x, y;
     int ok = 1;
 
@@ -1023,21 +1038,21 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
         }
         return 1;
     }
-    s_gpu.tex.offset = tex->offset;
-    s_gpu.tex.width  = tex->width;
-    s_gpu.tex.height = tex->height;
-    s_gpu.tex.pitch  = tex->pitch;
-    s_gpu.tex.color  = tex->color;
-    s_gpu.tex.addr_u = 3;
-    s_gpu.tex.addr_v = 3;
-    s_gpu.tex.valid  = 1;
+    memset(&t, 0, sizeof t);
+    t.offset = tex->offset;
+    t.width  = tex->width;
+    t.height = tex->height;
+    t.pitch  = tex->pitch;
+    t.color  = tex->color;
+    t.addr_u = 3;
+    t.addr_v = 3;
+    t.valid  = 1;
     for (y = 0; y < tex->height && ok; y++)
         for (x = 0; x < tex->width; x++)
-            if (!sample_texture(x, y, &argb_out[(size_t)y * tex->width + x])) {
+            if (!sample_texture(&t, x, y, &argb_out[(size_t)y * tex->width + x])) {
                 ok = 0;
                 break;
             }
-    s_gpu.tex = saved;
     return ok;
 }
 
@@ -1248,31 +1263,33 @@ static uint32_t linear_twin(uint32_t fmt)
     }
 }
 
-static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
+/* Texel (u, v) of `t` -- a parameter, not s_gpu.tex, so a back end's thread
+ * can decode while the executor goes on changing texture state. */
+static int sample_texture(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     const uint8_t *p;
     uint32_t fmt;
 
-    if (!s_gpu.tex.valid)
+    if (!t->valid)
         return 0;
-    u = wrap_coord(u, s_gpu.tex.width,  s_gpu.tex.addr_u);
-    v = wrap_coord(v, s_gpu.tex.height, s_gpu.tex.addr_v);
+    u = wrap_coord(u, t->width,  t->addr_u);
+    v = wrap_coord(v, t->height, t->addr_v);
 
-    fmt = s_gpu.tex.color;
+    fmt = t->color;
     if (d3d8_format_dxt_block_bytes(fmt))
-        return d3d8_dxt_decode_texel(mem + s_gpu.tex.offset, fmt, u, v,
-                                     s_gpu.tex.width, argb);
+        return d3d8_dxt_decode_texel(mem + t->offset, fmt, u, v,
+                                     t->width, argb);
     if (d3d8_format_is_swizzled(fmt)) {
         /* Morton order: a texel's index is interleaved from x and y instead of
          * v*pitch + u, so index from the base of the image. The switch below
          * casts to each format's own width, which makes that index a texel
          * index for every one of them. */
         fmt = linear_twin(fmt);
-        p = mem + s_gpu.tex.offset;
-        u = swizzle_offset(u, v, s_gpu.tex.width, s_gpu.tex.height);
+        p = mem + t->offset;
+        u = swizzle_offset(u, v, t->width, t->height);
     } else {
-        p = mem + s_gpu.tex.offset + (size_t)v * s_gpu.tex.pitch;
+        p = mem + t->offset + (size_t)v * t->pitch;
     }
 
     switch (fmt) {
@@ -1432,7 +1449,7 @@ static void dump_texture_bmp(uint32_t seq)
         for (x = 0; x < w; x++) {
             uint32_t argb = 0, a;
             uint8_t px[3];
-            if (!sample_texture(x, h - 1 - y, &argb))
+            if (!sample_texture(&s_gpu.tex, x, h - 1 - y, &argb))
                 argb = 0;
             a = (argb >> 24) & 0xFFu;
             /* over mid-grey, so an alpha-only page is visible either way */
@@ -1596,7 +1613,7 @@ static void raster_triangle(const float a[2], const float b[2],
                 float sv = (w1 * uv[0][1] + w2 * uv[1][1] + w0 * uv[2][1]) / area;
                 if (su < 0.0f) su = 0.0f;
                 if (sv < 0.0f) sv = 0.0f;
-                if (sample_texture((uint32_t)su, (uint32_t)sv, &texel)) {
+                if (sample_texture(&s_gpu.tex, (uint32_t)su, (uint32_t)sv, &texel)) {
                     put_pixel(mem, bpp, x, y, texel);
                     continue;
                 }
@@ -2213,11 +2230,72 @@ static float    *s_raw_attrs;
 static uint32_t *s_raw_idx;
 static uint32_t  s_raw_cap_v, s_raw_cap_i;
 
+static int raw_direct_on(void)
+{
+    static int on = -1;
+    if (!(s_backend->flags & NV2A_BACKEND_RAW_DIRECT))
+        return 0;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GL_DIRECT");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+/* Fill rb->direct for every present attribute whose stored format the back
+ * end can read as it is, over gathered vertices lo .. lo+nv-1; returns the
+ * attr_direct mask. What fetch_attr would turn into zeros (no array, a CMP
+ * normal, an inline array that runs short) stays with the converter. */
+static uint16_t raw_direct_attrs(Nv2aRawBatch *rb, uint16_t present,
+                                 uint32_t lo, uint32_t nv)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint16_t mask = 0;
+    uint32_t a;
+
+    for (a = 0; a < NV2A_RAW_ATTRS; a++) {
+        const VertexAttr *va = &s_gpu.attr[a];
+        uint32_t elem;
+        size_t first, end;
+
+        if (!(present & (1u << a)) || va->size > 4)
+            continue;
+        switch (va->type) {
+        case 0: if (va->size != 4) continue; elem = 4; break;
+        case 2: elem = 4 * va->size; break;
+        case 4: elem = va->size; break;
+        case 1: case 5: elem = 2 * va->size; break;
+        default: continue;
+        }
+        first = (size_t)va->offset + (size_t)lo * va->stride;
+        end = first + (size_t)(nv - 1) * va->stride + elem;
+        if (s_gpu.inline_active) {
+            if (end > (size_t)s_gpu.inline_count * 4)
+                continue;
+            rb->direct[a].ptr = (const uint8_t *)s_gpu.inline_buf + first;
+        } else {
+            if (!va->offset)
+                continue;
+            rb->direct[a].ptr = mem + first;
+        }
+        rb->direct[a].type = va->type;
+        rb->direct[a].size = va->size;
+        rb->direct[a].stride = va->stride;
+        mask |= (uint16_t)(1u << a);
+    }
+    rb->attr_direct = mask;
+    return mask;
+}
+
+static void attr_const_init(void);
+
 static void raw_batch(void)
 {
     Nv2aRawBatch rb;
     uint32_t lo = 0xFFFFFFFFu, hi = 0, i, a, nv;
-    uint16_t present = 0;
+    uint16_t present = 0, direct = 0;
+
+    attr_const_init();
 
     for (i = 0; i < s_gpu.idx_count; i++) {
         if (s_gpu.idx[i] < lo) lo = s_gpu.idx[i];
@@ -2242,20 +2320,34 @@ static void raw_batch(void)
     for (a = 0; a < NV2A_RAW_ATTRS && a < NV_VERTEX_ATTRS; a++)
         if (s_gpu.attr[a].size && s_gpu.attr[a].stride)
             present |= (uint16_t)(1u << a);
-    for (i = 0; i < nv; i++) {
-        float *v = s_raw_attrs + (size_t)i * NV2A_RAW_ATTRS * 4;
-        for (a = 0; a < NV2A_RAW_ATTRS; a++) {
-            float *o = v + a * 4;
-            if (!(present & (1u << a)) || !fetch_attr(&s_gpu.attr[a], lo + i, o)) {
-                o[0] = o[1] = o[2] = 0.0f;
-                o[3] = 1.0f;
+    memset(&rb, 0, sizeof rb);
+    if (raw_direct_on())
+        direct = raw_direct_attrs(&rb, present, lo, nv);
+    if (direct) {
+        /* Convert only what the back end cannot take as stored (CMP
+         * normals, arrays that run off their buffer). Most batches have
+         * nothing left here. */
+        uint16_t conv = present & (uint16_t)~direct;
+        for (a = 0; conv && a < NV2A_RAW_ATTRS; a++) {
+            if (!(conv & (1u << a)))
+                continue;
+            for (i = 0; i < nv; i++)
+                fetch_attr(&s_gpu.attr[a], lo + i,
+                           s_raw_attrs + ((size_t)i * NV2A_RAW_ATTRS + a) * 4);
+        }
+    } else {
+        for (i = 0; i < nv; i++) {
+            float *v = s_raw_attrs + (size_t)i * NV2A_RAW_ATTRS * 4;
+            for (a = 0; a < NV2A_RAW_ATTRS; a++) {
+                float *o = v + a * 4;
+                if (!(present & (1u << a)) || !fetch_attr(&s_gpu.attr[a], lo + i, o))
+                    memcpy(o, s_gpu.attr_const[a], sizeof s_gpu.attr_const[a]);
             }
         }
     }
     for (i = 0; i < s_gpu.idx_count; i++)
         s_raw_idx[i] = s_gpu.idx[i] - lo;
 
-    memset(&rb, 0, sizeof rb);
     rb.prim = s_gpu.prim;
     rb.vertex_count = nv;
     rb.attr_present = present;
@@ -2276,6 +2368,15 @@ static void raw_batch(void)
     rb.aa_sx = s_gpu.aa_sx;
     rb.aa_sy = s_gpu.aa_sy;
     rb.vp_start = s_vp.prog_start;
+    for (i = 0; i < 4; i++) {
+        uint32_t base = (0x1B00u + i * 0x40u) / 4;
+        rb.tex_va[i] = s_reg[base] ? dma_resolve(s_reg[base]) : 0;
+        rb.pal_va[i] = (s_reg[base + 8] & ~0x3Fu) ? dma_resolve(s_reg[base + 8] & ~0x3Fu) : 0;
+    }
+    memcpy(rb.attr_const, s_gpu.attr_const, sizeof rb.attr_const);
+    rb.attr_const_gen = s_gpu.attr_const_gen;
+    rb.vp_prog_gen = s_vp.prog_gen ? s_vp.prog_gen : 1;
+    rb.vp_const_gen = s_vp.const_gen ? s_vp.const_gen : 1;
     s_backend->draw_raw(&rb);
     s_gpu.tris_drawn += s_gpu.idx_count / 3;
     s_gpu.drawn_offset = s_gpu.color_offset;
@@ -2728,6 +2829,63 @@ static void imm_emit_vertex(void)
     s_gpu.imm_count++;
 }
 
+static void attr_const_init(void)
+{
+    uint32_t a;
+
+    if (s_gpu.attr_const_gen)
+        return;
+    for (a = 0; a < NV_VERTEX_ATTRS; a++) {
+        s_gpu.attr_const[a][0] = s_gpu.attr_const[a][1] = s_gpu.attr_const[a][2] = 0.0f;
+        s_gpu.attr_const[a][3] = 1.0f;
+    }
+    /* Diffuse starts white, as the back ends used to assume for it. */
+    s_gpu.attr_const[3][0] = s_gpu.attr_const[3][1] = s_gpu.attr_const[3][2] = 1.0f;
+    s_gpu.attr_const_gen = 1;
+}
+
+/* SET_VERTEX_DATA{2F,4F,2S,4UB,4S}: the attribute's current value, the one
+ * it reads when it has no array (xemu's inline_value, same conversions). */
+static void attr_const_write(uint32_t method, uint32_t param)
+{
+    union { uint32_t u; float f; } v;
+    float *c;
+    uint32_t off;
+
+    v.u = param;
+    attr_const_init();
+    if (method >= NV097_SET_VERTEX_DATA4F_M) {
+        off = method - NV097_SET_VERTEX_DATA4F_M;
+        c = s_gpu.attr_const[off / 16];
+        c[(off % 16) / 4] = v.f;
+    } else if (method >= NV097_SET_VERTEX_DATA4S_M) {
+        off = method - NV097_SET_VERTEX_DATA4S_M;
+        c = s_gpu.attr_const[off / 8];
+        c[(off % 8) / 2]     = (float)(int16_t)(param & 0xFFFF);
+        c[(off % 8) / 2 + 1] = (float)(int16_t)(param >> 16);
+    } else if (method >= NV097_SET_VERTEX_DATA4UB) {
+        c = s_gpu.attr_const[(method - NV097_SET_VERTEX_DATA4UB) / 4];
+        c[0] = (float)( param        & 0xFF) / 255.0f;
+        c[1] = (float)((param >>  8) & 0xFF) / 255.0f;
+        c[2] = (float)((param >> 16) & 0xFF) / 255.0f;
+        c[3] = (float)( param >> 24        ) / 255.0f;
+    } else if (method >= NV097_SET_VERTEX_DATA2S) {
+        c = s_gpu.attr_const[(method - NV097_SET_VERTEX_DATA2S) / 4];
+        c[0] = (float)(int16_t)(param & 0xFFFF);
+        c[1] = (float)(int16_t)(param >> 16);
+        c[2] = 0.0f;
+        c[3] = 1.0f;
+    } else {
+        off = method - NV097_SET_VERTEX_DATA2F_M;
+        c = s_gpu.attr_const[off / 8];
+        c[(off % 8) / 4] = v.f;
+        c[2] = 0.0f;
+        c[3] = 1.0f;
+    }
+    if (++s_gpu.attr_const_gen == 0)
+        s_gpu.attr_const_gen = 1;
+}
+
 /* The immediate-mode writes. Returns 1 if `method` was one of them.
  *
  * Split out because it is a range test against five separate bases, and that
@@ -2737,6 +2895,16 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
 {
     union { uint32_t u; float f; } v;
     v.u = param;
+
+    if (method >= NV097_SET_VERTEX_DATA2F_M
+            && method < NV097_SET_VERTEX_DATA4F_M + NV_VERTEX_ATTRS * 16)
+        attr_const_write(method, param);
+    if (method >= NV097_SET_VERTEX_DATA2S
+            && method < NV097_SET_VERTEX_DATA2S + NV_VERTEX_ATTRS * 4)
+        return 1;
+    if (method >= NV097_SET_VERTEX_DATA4S_M
+            && method < NV097_SET_VERTEX_DATA4S_M + NV_VERTEX_ATTRS * 8)
+        return 1;
 
     if (method >= NV097_SET_VERTEX4F && method < NV097_SET_VERTEX4F + 16) {
         uint32_t c = (method - NV097_SET_VERTEX4F) / 4;
@@ -2941,7 +3109,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
 
-    s_reg[(method & 0x1FFCu) / 4] = param;
+    {
+        uint32_t w = (method & 0x1FFCu) / 4;
+        if (s_reg[w] != param) {
+            s_reg[w] = param;
+            s_reg_dirty[w >> 4] = 1;
+        }
+    }
     if (pb_verbose() && (method == 0x17C4 || (method >= 0x0C00 && method < 0x0C24))) {
         static int shown;
         if (shown++ < 20)

@@ -114,6 +114,35 @@ typedef struct {
     float           vp_offset[4];
     float           aa_sx, aa_sy;       /* logical -> real pixels */
     uint32_t        vp_start;           /* first program slot */
+    /* Only for a back end registered with NV2A_BACKEND_RAW_DIRECT: the
+     * attributes in attr_direct are not converted into attrs[] (their
+     * entries hold garbage) but described as the title stored them, for the
+     * back end to upload as they are. direct[a].ptr is attribute a of
+     * gathered vertex 0; vertex i is at ptr + i * stride, for vertex_count
+     * vertices. type is the NV097 code: 0 D3DCOLOR (size 4, bytes B,G,R,A),
+     * 1 S1 (normalised short), 2 float, 4 normalised unsigned byte, 5 S32K
+     * (short as-is). With the flag, attrs[] entries of absent attributes are
+     * not filled either. */
+    /* Bumped whenever the transform program (slots or start) / constants
+     * change; equal values mean identical contents. Never 0. */
+    uint32_t        vp_prog_gen, vp_const_gen;
+    /* Texture stage i's image and palette as guest VAs (0: none), resolved
+     * by the executor so a back end never reads the executor's DMA state
+     * (a threaded one runs behind it). */
+    uint32_t        tex_va[4], pal_va[4];
+    uint16_t        attr_direct;
+    struct {
+        const uint8_t *ptr;
+        uint32_t       type, size, stride;
+    } direct[NV2A_RAW_ATTRS];
+    /* What an attribute without an array reads: the last SET_VERTEX_DATA*
+     * value the title gave it, as the hardware does. D3D sets them for the
+     * FVF components a draw leaves out -- NFSU2's lens drops have no
+     * specular, and their fog comes from its alpha, which D3D sets to 0.
+     * Held by value so a queued copy of the batch keeps them. attr_const_gen
+     * changes whenever any of them does (never 0). */
+    float           attr_const[NV2A_RAW_ATTRS][4];
+    uint32_t        attr_const_gen;
 } Nv2aRawBatch;
 
 /* Resolve a DMA offset the title programmed (texture, surface) to a guest VA. */
@@ -129,7 +158,13 @@ typedef struct {
     /* Optional. When set, every batch goes here instead of draw(), before
      * any CPU transform, clipping or screen-space test. */
     void (*draw_raw)(const Nv2aRawBatch *b);
+    /* NV2A_BACKEND_* bits. */
+    uint32_t flags;
 } Nv2aBackend;
+
+/* draw_raw takes attributes in their stored format (Nv2aRawBatch.attr_direct).
+ * RECOMP_GL_DIRECT=0 turns it off at run time. */
+#define NV2A_BACKEND_RAW_DIRECT 0x1u
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts
  * submitting work; the executor must also be enabled (RECOMP_PB_EXEC). */

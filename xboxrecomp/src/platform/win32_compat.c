@@ -887,6 +887,23 @@ void xbox_guest_pin(int interrupt)
 #endif
 }
 
+/* A runtime thread whose deadlines are audible (the APU frame thread): above
+ * the guest threads on Horizon (0x2C < 59). Priority 59 is the only one that
+ * time-slices, so there it waited behind whatever shared its core, in 10 ms
+ * slices -- the APU fell to 1283 of 1500 frames/s in a race once the game
+ * kept all three cores busy. It sleeps between blocks, so a higher,
+ * non-sliced priority costs the others only the microseconds a block takes.
+ * RECOMP_NX_AUDIO_PRIO=0 leaves it at 59. No-op elsewhere. */
+void xbox_nx_raise_host_thread(void)
+{
+#if defined(__SWITCH__)
+    const char *e = getenv("RECOMP_NX_AUDIO_PRIO");
+    if (e && *e == '0')
+        return;
+    svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2C);
+#endif
+}
+
 #if defined(__SWITCH__)
 void xbox_nx_spread_thread(void)
 {
@@ -941,6 +958,19 @@ static int nx_thread_ticks(Handle h, u64 *out)
 {
     return R_SUCCEEDED(svcGetInfo(out, InfoType_ThreadTickCount, h, (u64)-1))
         || R_SUCCEEDED(svcGetInfo(out, InfoType_ThreadTickCountDeprecated, h, (u64)-1));
+}
+
+/* Tracked thread i for a sampling profiler (switch_nx.c): its handle and
+ * the entry it is named by (0 for the game's main thread). Returns 0 past
+ * the end of the table. */
+int xbox_nx_thread_at(int i, Handle *h, uintptr_t *entry)
+{
+    int n = s_nx_nthreads < NX_MAX_TRACKED ? s_nx_nthreads : NX_MAX_TRACKED;
+    if (i < 0 || i >= n || !s_nx_threads[i].h)
+        return 0;
+    *h = s_nx_threads[i].h;
+    *entry = s_nx_threads[i].entry;
+    return 1;
 }
 
 /* Guest threads all start in the bridge's trampoline; name them by the

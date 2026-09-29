@@ -36,6 +36,12 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max);
 /* Fill in the 20-byte input report. Returns the byte count written. */
 int usb_gamepad_report(uint8_t *out, int max);
 
+/* An output report from the host: the 6-byte rumble report
+ * (id 0, length 6, left and right motor speeds as little-endian words),
+ * from interrupt endpoint 2 or a class SET_REPORT. Forwarded to the host
+ * pad; anything else is ignored. */
+void usb_gamepad_output(const uint8_t *data, int len);
+
 /* The address the host assigned with SET_ADDRESS, 0 until it does. */
 uint8_t usb_gamepad_address(void);
 

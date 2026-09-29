@@ -23,6 +23,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 /* The generated register model (g_eax/g_esp are thread-local there) and the
  * XBOX_PTR/MEM32 accessors; the register names below are its macros. */
@@ -82,6 +83,173 @@ static void crt_memmove(void)
 }
 
 void sub_002A7EE0(void) { crt_memmove(); }
+
+/* ── Bounding box against the view frustum, sub_0009A330 ─────────────
+ *
+ * thiscall (this, const float min[3], const float max[3], matrix), ret 12.
+ * The box's centre c = (max + min) * K and half-size e = max - c (both
+ * stored as floats, as the original does), then for each of six planes
+ * (n, d) at [this] + 0x140 + 16k: r = |n|.e, dist = n.c + d; below K2 on
+ * dist + r means outside (return 0); below K2 on dist - r means the box
+ * straddles that plane. Returns 2 when inside all six, 1 when straddling.
+ * With a matrix the box is first transformed by it (sub_0009A250, below).
+ *
+ * It is the hottest function of NFSU2's main thread in a race (~5% on the
+ * console): every object, every view, every frame. Written in C it keeps
+ * everything in registers. The arithmetic is the lifted code's -- doubles,
+ * in the same order -- so results match it exactly; RECOMP_NATIVE_CHECK=1
+ * runs both and reports any difference. RECOMP_NATIVE=0 turns it off. */
+extern void sub_0009A330_gen(void);
+extern void sub_0009A250_gen(void);
+
+/* sub_0009A250: cdecl (matrix, float min[3], float max[3]) -- the box's
+ * corners transformed by a 4x4 row-major matrix, as a box again (Arvo): both
+ * start at the translation row, and for each row i and column j the larger
+ * of min[i]*M[i][j] and max[i]*M[i][j] goes to max[j], the smaller to min[j].
+ * As the original: the max product is rounded to float before the compare
+ * (it goes through memory), the sums are kept in extended (here double)
+ * precision and stored as floats at the end, and an unordered compare adds
+ * the min product to max. */
+static void box_transform(uint32_t m, float mn[3], float mx[3])
+{
+    double hi[3], lo[3];
+    int i, j;
+    for (j = 0; j < 3; j++)
+        hi[j] = lo[j] = (double)MEMF(m + 0x30u + 4u * j);
+    for (i = 0; i < 3; i++)
+        for (j = 0; j < 3; j++) {
+            double mm = (double)MEMF(m + 16u * i + 4u * j);
+            double e = (double)mn[i] * mm;
+            double f = (double)(float)((double)mx[i] * mm);
+            if (e < f) { hi[j] += f; lo[j] += e; }
+            else       { hi[j] += e; lo[j] += f; }
+        }
+    for (j = 0; j < 3; j++) {
+        mn[j] = (float)lo[j];
+        mx[j] = (float)hi[j];
+    }
+}
+
+static uint32_t frustum_box_native(uint32_t self, uint32_t pmin, uint32_t pmax,
+                                   uint32_t matrix, uint32_t *out_ecx, uint32_t *out_edx)
+{
+    const double K = (double)MEMF(0x003408BCu), K2 = (double)MEMF(0x0033FA8Cu);
+    float mn[3] = { MEMF(pmin), MEMF(pmin + 4), MEMF(pmin + 8) };
+    float mx[3] = { MEMF(pmax), MEMF(pmax + 4), MEMF(pmax + 8) };
+    float ax, ay, az, bx, by, bz;
+    if (matrix)
+        box_transform(matrix, mn, mx);
+    ax = mn[0]; ay = mn[1]; az = mn[2];
+    bx = mx[0]; by = mx[1]; bz = mx[2];
+    float cx = (float)(((double)bx + (double)ax) * K);
+    float cy = (float)(((double)by + (double)ay) * K);
+    float cz = (float)(((double)bz + (double)az) * K);
+    float ex = (float)((double)bx - (double)cx);
+    float ey = (float)((double)by - (double)cy);
+    float ez = (float)((double)bz - (double)cz);
+    uint32_t planes = MEM32(self) + 0x144u, k;
+    int straddle = 0;
+
+    for (k = 0; k < 6; k++) {
+        uint32_t p = planes + 16u * k;
+        double nx = MEMF(p - 4), ny = MEMF(p), nz = MEMF(p + 4), d = MEMF(p + 8);
+        double r = (fabs(ny) * ey + fabs(nz) * ez) + fabs(nx) * ex;
+        double dist = ((cy * ny + cz * nz) + cx * nx) + d;
+        if (dist + r < K2) {
+            *out_ecx = p;
+            *out_edx = k + 1;
+            return 0;
+        }
+        if (dist - r < K2)
+            straddle = 1;
+    }
+    *out_ecx = planes + 96u;
+    *out_edx = 7;
+    return straddle ? 1u : 2u;
+}
+
+void sub_0009A330(void)
+{
+    static int mode = -1;               /* 0 lifted, 1 native, 2 native + check */
+    static unsigned long calls, with_matrix, mismatches;
+    uint32_t self = ecx, pmin = MEM32(esp + 4), pmax = MEM32(esp + 8);
+    uint32_t matrix = MEM32(esp + 12), r, rc, rd;
+
+    if (mode < 0) {
+        const char *e = getenv("RECOMP_NATIVE"), *c = getenv("RECOMP_NATIVE_CHECK");
+        mode = (e && *e == '0') ? 0 : (c && *c == '1') ? 2 : 1;
+    }
+    calls++;
+    with_matrix += matrix != 0;
+    if (mode == 0) {
+        sub_0009A330_gen();
+        return;
+    }
+    r = frustum_box_native(self, pmin, pmax, matrix, &rc, &rd);
+    if (mode == 2) {
+        sub_0009A330_gen();             /* pops its own arguments */
+        if (eax != r && mismatches++ < 20)
+            fprintf(stderr, "[native] sub_0009A330 mismatch: lifted %u native %u "
+                    "(box %08X-%08X this %08X)\n", eax, r, pmin, pmax, self);
+        if ((calls & 0xFFFFF) == 0)
+            fprintf(stderr, "[native] sub_0009A330: %lu calls, %lu with a matrix, "
+                    "%lu mismatches\n", calls, with_matrix, mismatches);
+        return;
+    }
+    eax = r;
+    ecx = rc;
+    edx = rd;
+    esp += 16;                          /* return address + three arguments */
+}
+
+/* sub_0009A250 on its own (it has other callers): box_transform on guest
+ * memory. Returns max (eax), as the original leaves it; cdecl. */
+void sub_0009A250(void)
+{
+    static int mode = -1;
+    uint32_t m = MEM32(esp + 4), pmin = MEM32(esp + 8), pmax = MEM32(esp + 12);
+    float mn[3], mx[3];
+    int j;
+
+    if (mode < 0) {
+        const char *e = getenv("RECOMP_NATIVE"), *c = getenv("RECOMP_NATIVE_CHECK");
+        mode = (e && *e == '0') ? 0 : (c && *c == '1') ? 2 : 1;
+    }
+    if (!mode) {
+        sub_0009A250_gen();
+        return;
+    }
+    for (j = 0; j < 3; j++) {
+        mn[j] = MEMF(pmin + 4u * j);
+        mx[j] = MEMF(pmax + 4u * j);
+    }
+    box_transform(m, mn, mx);
+    if (mode == 2) {
+        static unsigned long calls, bad;
+        sub_0009A250_gen();             /* writes the guest's boxes itself */
+        calls++;
+        for (j = 0; j < 3; j++)
+            if (memcmp(&mn[j], (const void *)XBOX_PTR(pmin + 4u * j), 4)
+                || memcmp(&mx[j], (const void *)XBOX_PTR(pmax + 4u * j), 4)) {
+                if (bad++ < 20)
+                    fprintf(stderr, "[native] sub_0009A250 mismatch at %u: native %g %g,"
+                            " lifted %g %g\n", j, mn[j], mx[j],
+                            MEMF(pmin + 4u * j), MEMF(pmax + 4u * j));
+                break;
+            }
+        if ((calls & 0xFFFFF) == 0)
+            fprintf(stderr, "[native] sub_0009A250: %lu calls, %lu mismatches\n", calls, bad);
+        return;
+    }
+    for (j = 0; j < 3; j++) {
+        MEMF(pmin + 4u * j) = mn[j];
+        MEMF(pmax + 4u * j) = mx[j];
+    }
+    eax = pmax;
+    ecx = pmin + 12u;
+    edx = m + 8u + 48u;
+    esp += 4;                           /* cdecl: the caller pops the arguments */
+}
 void sub_002A9450(void) { crt_memmove(); }
 
 /* ── D3D fence wait, D3D_BlockOnTime (0x002E8F20) ────────────
@@ -115,6 +283,30 @@ void sub_002E8F20(void)
             nv2a_pb_set_semaphore_target(sem);
             fprintf(stderr, "[D3D] GPU semaphore at 0x%08X\n", sem);
             registered = sem;
+        }
+        if (MEM32(esp) == 0x002E953Cu && MEM32(esp + 12) == 0x000AEDDBu) {
+            /* The main loop (sub_000AEA90) calls BlockOnFence on the fence
+             * of the frame it just built, right before Present: the whole
+             * frame has to be through the GPU before the next one starts,
+             * so the game and the pushbuffer executor take turns instead
+             * of overlapping (Eden race: game waited ~50% of the time,
+             * executor ~20% idle). RECOMP_FRAME_LAG=1 waits for the
+             * previous frame's fence instead: one frame in flight, as on a
+             * PC. Race frames checked on Linux, no corruption. */
+            static int lag = -1;
+            static uint32_t prev;
+            if (lag < 0) {
+                const char *e = getenv("RECOMP_FRAME_LAG");
+                lag = e && *e == '1';
+                fprintf(stderr, "[D3D] frame fence: %s\n",
+                        lag ? "previous frame (RECOMP_FRAME_LAG=1)" : "this frame");
+            }
+            if (lag) {
+                uint32_t mine = MEM32(esp + 4);
+                if (prev)
+                    MEM32(esp + 4) = prev;
+                prev = mine;
+            }
         }
         sub_002E8F20_gen();
         return;

@@ -1132,8 +1132,25 @@ static pthread_cond_t  s_hw_cond = PTHREAD_COND_INITIALIZER;
 static volatile int    s_hw_sleepers;
 static volatile unsigned s_hw_wakes;
 
+/* The kickoff's write-combine flush (NV2A_ACK's first entry) is answered
+ * here as well, on the thread that polls for it. Waking the flag thread and
+ * waiting for Horizon to schedule it made every kickoff spin up to its
+ * yield, give up the guest lock and wait to get it back: ~12% of NFSU2's
+ * main thread in a race on the console. Only the title sets the bit, so
+ * clearing it here cannot lose a request. */
+static void spin_ack_flush(void)
+{
+    volatile uint32_t *pfb = (volatile uint32_t *)
+        ((uint8_t *)xbox_GetMemoryOffset() + 0xFD000000u + 0x100410u);
+    if (*pfb & 0x00010000u) {
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);  /* its pushbuffer writes first */
+        *pfb &= ~0x00010000u;
+    }
+}
+
 void recomp_spin_wake(void)
 {
+    spin_ack_flush();
     if (!__atomic_load_n(&s_hw_sleepers, __ATOMIC_RELAXED))
         return;
     pthread_mutex_lock(&s_hw_lock);
@@ -1142,7 +1159,13 @@ void recomp_spin_wake(void)
     pthread_mutex_unlock(&s_hw_lock);
 }
 #else
-void recomp_spin_wake(void) { }
+void recomp_spin_wake(void)
+{
+    volatile uint32_t *pfb = (volatile uint32_t *)
+        ((uint8_t *)xbox_GetMemoryOffset() + 0xFD000000u + 0x100410u);
+    if (*pfb & 0x00010000u)
+        *pfb &= ~0x00010000u;
+}
 #endif
 
 static void nv2a_thread_pause(int busy)
