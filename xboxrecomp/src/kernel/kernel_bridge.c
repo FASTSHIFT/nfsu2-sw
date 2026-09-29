@@ -1223,7 +1223,10 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
 static void bridge_MmFreeContiguousMemory(void)
 {
     uint32_t addr = STACK_ARG(0);
-    xbox_HeapFree(addr);
+    /* Contiguous blocks come from their own arena; xbox_HeapFree does not
+     * know them (it used to be called here, and nothing was ever freed). */
+    if (!xbox_ContiguousFree(addr))
+        xbox_HeapFree(addr);
     g_eax = 0;
 }
 
@@ -3336,7 +3339,9 @@ static void bridge_ExQueryPoolBlockSize(void)
      * answer. It used to return a literal 0 on the theory that this is only
      * ever used for stats -- which is a guess about the caller, and a title
      * that sizes a copy from it copies nothing. */
-    g_eax = xbox_HeapBlockSize(STACK_ARG(0));
+    uint32_t va = STACK_ARG(0);
+    uint32_t n = xbox_ContiguousBlockSize(va);
+    g_eax = n ? n : xbox_HeapBlockSize(va);
 }
 
 /* ── RtlNtStatusToDosError (ordinal 301) ─────────────────
