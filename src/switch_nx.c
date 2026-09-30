@@ -192,6 +192,12 @@ static void perf_report(void)
      * play cursor) run slow. */
     fprintf(stderr, "[perf] APU %d frames/s (1500 = real time), frame thread %.0f%% busy\n",
             mcpx_apu_frames_per_second(), mcpx_apu_utilization() * 100.0f);
+    {
+        int mcpx_apu_pacing_stats(char *buf, int cap);
+        char pb[256];
+        mcpx_apu_pacing_stats(pb, sizeof pb);
+        fprintf(stderr, "[perf] APU pacing: %s\n", pb);
+    }
     last_frames = f;
     {
         /* RECOMP_GL_THREAD: is the GL thread starved, or the executor held
@@ -657,6 +663,8 @@ int nv2a_gl_adopt_window(void **win, void **ctx)
 static void loader_start(void) { }
 #endif
 
+static int s_prof_all;          /* RECOMP_NX_PROFILE=2 */
+
 /* ── Sampling profiler (RECOMP_NX_PROFILE=1) ──────────────────────────
  *
  * The console has no profiler and Eden's costs are not the console's. So:
@@ -723,7 +731,10 @@ static void prof_thread(void *arg)
                     t = 0;
                 counted |= t != 0;
                 /* thread ticks count at 19.2 MHz, like the system tick */
-                busy[n] = t_list && (t - last_ticks[n]) * 10 > span;
+                /* over 10% of a core; RECOMP_NX_PROFILE=2: over 2% (the DPC
+                 * and interrupt threads, which are rarely busy but hold the
+                 * dispatch lock and the guest lock when they run) */
+                busy[n] = t_list && (t - last_ticks[n]) * (s_prof_all ? 50 : 10) > span;
                 last_ticks[n] = t;
             }
             if (!counted)                           /* Eden: no tick counts */
@@ -782,8 +793,9 @@ static void prof_start(void)
 {
     static Thread t;
     const char *e = getenv("RECOMP_NX_PROFILE");
-    if (!e || *e != '1')
+    if (!e || (*e != '1' && *e != '2'))
         return;
+    s_prof_all = *e == '2';
     /* 0x2A: above every game and host thread, so it runs on time. */
     if (R_FAILED(threadCreate(&t, prof_thread, NULL, NULL, 0x4000, 0x2A, -2))
         || R_FAILED(threadStart(&t))) {

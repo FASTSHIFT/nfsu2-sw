@@ -28,7 +28,8 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
 - Clean up every Linux test run. `pkill -x nfsu2_recomp` does NOT match (the
   process renames itself), and `timeout`/`xvfb-run` leave orphans that keep
   burning CPU; kill by PID:
-  `ps -eo pid,args | awk '$2 ~ /nfsu2_recomp$/ || $2 ~ /^Xvfb$/ {print $1}' | xargs -r kill`
+  `ps -eo pid,args | awk '$2 ~ /nfsu2_recomp$/ || $2 ~ /^Xvfb$/ {print $1}' | xargs -r kill -9`
+  (it ignores SIGTERM; `rtk ps` output hides it -- use `rtk proxy ps`)
 
 ## Layout and builds
 
@@ -195,11 +196,13 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   (`xbox_nx_pad_rumble`: left = low band 160 Hz, right = high band 320 Hz,
   handheld + player 1), SDL rumble on Linux. Only changes are sent.
   `RECOMP_RUMBLE=0` off, `RECOMP_RUMBLE_TRACE=1` logs each change.
-- **Render scale:** `RECOMP_GL_SCALE=1|2|4` (nv2a_gl.c) stores every
-  surface at that multiple (`GlSurf.pw/ph`; `w/h` stay the title's pixels
+- **Render scale:** `RECOMP_GL_SCALE=<k>` (0.5..4, fractions like 1.5 ok;
+  nv2a_gl.c and nv2a_vk.c) stores every surface at that multiple, rounded
+  (`GlSurf/VkSurf.pw/ph`; `w/h` stay the title's pixels
   for shaders, clips and lookups); viewport, clear scissor, read-backs,
   `RECOMP_GL_DUMP` and the present blit use the stored size. Capped per
-  surface by GL_MAX_TEXTURE/RENDERBUFFER_SIZE.
+  surface by GL_MAX_TEXTURE/RENDERBUFFER_SIZE (Vulkan: maxImageDimension2D/
+  maxFramebuffer*).
 - Buttons map by label (Switch A = Xbox A); `RECOMP_PAD_LAYOUT=position`
   swaps to Xbox positions. Y opens the in-game Help box, closed with B.
 
@@ -212,7 +215,7 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   barriers between passes; 2 frames in flight with a 48 MB host ring each.
   Shaders are gl_vsh.c/gl_psh.c with `nv2a_shader_vk = 1` (std140 blocks at
   bindings 0/1, samplers 2..5, Vulkan 0..1 clip z), compiled by glslang on a
-  4 MB-stack thread. No threaded submission, loading screen or GL_SCALE yet.
+  4 MB-stack thread. No threaded submission or loading screen yet.
 - Switch: `VULKAN=1 XBOXRECOMP_DIR=/root/nfsu2x/xboxrecomp-pr128 JOBS=6 bash
   switch/build.sh` (build dir /root/nfsu2x/build-switch-vk). Links
   mesa-switch's static NVK from `/root/nfsu2x/mesa-sdk/usr/local` (commit
@@ -229,6 +232,38 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   RECOMP_VK_HEADLESS=1` (+ `RECOMP_VK_VALIDATION=1`), frames via
   RECOMP_GL_DUMP. Quick Race renders like GL there.
 - /root/nfsu2x/vktest/ (vktest.nro): minimal NVK clear-screen check.
+- Caches (like GL's progcache.bin): progcache.bin records are shared with
+  GL; vkspirv.bin (glslang output by GLSL hash), vkpipes.bin (pipeline
+  variants), vkpipecache.bin (VkPipelineCache, saved at most every 20 s when
+  pipelines were added). All built at boot; RECOMP_PROG_CACHE=0 disables.
+- Audio still behind in races after the voice_lock change (console
+  2026-09-29: APU 1304-1467 frames/s, frame thread 81% in a cond wait, only
+  ~14% working). `[perf] APU pacing:` (switch_nx.c, apu_core.c throttle
+  counters) shows waits asked vs slept, clock restarts and lost ms.
+  Cause found (2026-09-30 log: 0 clock restarts, ~1950 blocks/10 s = 1560
+  frames/s of clock, but only ~1250-1300 real frames): while the front end
+  was TRAPPED/HALTED the loop ran silent monitor frames and advanced the
+  clock -- ~17% silence in races. Now time stops while trapped (xemu does
+  the same) and throttle() catches up; the pacing line counts traps.
+- **FPS drop on traffic collisions, part 2** (2026-09-30, Vulkan, APU fixed):
+  crash frames ~100 ms vs ~45. Main thread per frame: game code ~59 ms vs
+  20 (the crash physics chain sub_001F1260 > sub_001C1510 > sub_001B4CD0 >
+  sub_001BAA90 > sub_001BAB00/001B2FF0/001B6700: 2% -> 15-19% inclusive,
+  self time spread thin, no single hot leaf) and GIL wait ~32 ms vs 7; the
+  EA mixer 37% blocked on the dispatch lock (KfRaiseIrql, GIL released) --
+  someone at DISPATCH holds both, probably DirectSound's trap ISR/DPC (382
+  traps/10 s). `RECOMP_NX_PROFILE=2` samples threads over 2% to catch it.
+  NFSU2_SIM_STEPS=3 A/B: no difference (worst 102 vs 98 ms) -- not the cap.
+  Profile with RECOMP_NX_PROFILE=2: kernel_timer_thread ~40% waiting for the
+  GIL inside DirectSound's DPC (sub_0032BFF0/0032C012: KfRaise/LowerIrql
+  around every voice-list update), holding the dispatch lock meanwhile (the
+  mixer's 37%). Two bugs: (1) every IRQL call was a GIL handover; (2)
+  recomp_preempt read the *global* IRQL, which the timer thread raises
+  before queueing for the GIL, so the holder never yielded to the DPC.
+  Fixed: IRQL ordinals 103/129/130/160/161 keep the GIL (irql_transition
+  try-locks the dispatch lock, suspends the GIL only if contended);
+  per-thread `xbox_thread_holds_dispatch()` for pre-emption; a GIL waiter at
+  DISPATCH sets g_gil_contended at once.
 - nfsmw-nx is GPLv3: take ideas, not files.
 - **Eden cannot run NVK** (2026-09-29): instance, device, swapchain (only
   IMMEDIATE; FIFO creation hangs) and command recording work, but no GPU

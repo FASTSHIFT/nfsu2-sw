@@ -41,7 +41,9 @@
    sampled; sampled -> written) and barrier only those; do texture uploads
    before the pass that needs them (collect in a pre-pass command buffer
    submitted first) instead of splitting the pass.
-5. **Shader and pipeline caching.** Save `VkPipelineCache` to
+5. **Shader and pipeline caching.** DONE (2026-09-29): progcache.bin (shared with GL),
+   vkspirv.bin, vkpipes.bin, vkpipecache.bin next to the NRO; prewarm at boot
+   (`[VK] prewarm:` line). Linux: race-start compiles 46 -> 1. Original plan: Save `VkPipelineCache` to
    `sdmc:/switch/nfsu2x/vkpipe.bin` at exit and every few minutes, and
    precompile at boot from the program records like `progcache.bin` (the
    GL `prog_cache_*` code), including the pipeline variants seen. Cache the
@@ -60,7 +62,7 @@
    textures, uniforms): one indexed draw with concatenated vertex ranges.
 8. **Present:** check the pacing on the console (immediate vs FIFO; 2 vs 3
    frames in flight); the swapchain is 1280x720 -- use 1920x1080 when docked.
-9. **Missing features** (not performance): loading screen, `RECOMP_GL_SCALE`,
+9. **Missing features** (not performance): loading screen,
    clears with a partial colour mask, RECOMP_GL_WATCH.
 10. **Build:** LTO and PGO for the lifted code (PERF_NOTES.md items 3-4) apply
     to both builds.

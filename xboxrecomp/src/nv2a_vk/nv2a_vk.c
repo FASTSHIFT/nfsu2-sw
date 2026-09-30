@@ -27,6 +27,9 @@
  * Runtime switches (the GL renderer's names where they mean the same):
  *   RECOMP_GL_DUMP=<prefix>[,every]  write presented frames as BMP
  *   RECOMP_GL_TRACE=1                shader sources on compile errors
+ *   RECOMP_GL_SCALE=<k>              render surfaces at k times the title's
+ *                                    resolution, fractions allowed (1.5;
+ *                                    0.5..4, default 1)
  *   RECOMP_VK_VALIDATION=1           (Linux) enable the Khronos validation layer
  *   RECOMP_VK_HEADLESS=1             (Linux) no window, no present
  */
@@ -246,6 +249,9 @@ static VkDeviceSize ring_alloc(VkDeviceSize size, VkDeviceSize align, void **ptr
 
 /* ── Rendering passes and barriers ────────────────────────────────── */
 
+/* w, h are the surface in the title's pixels (anti-aliasing included) --
+ * what the shaders, clip rectangles and texture lookups work in. pw, ph are
+ * the image: w, h times the render scale. */
 typedef struct {
     uint32_t va, w, h, pw, ph;
     VkImage image; VkImageView view; VkDeviceMemory mem;
@@ -262,6 +268,18 @@ typedef struct {
 
 #define VK_MAX_SURF 32
 #define VK_MAX_DEPTH 16
+
+/* RECOMP_GL_SCALE, as in nv2a_gl: only the pixels behind a surface grow, so
+ * the viewport, clear rectangles, read-backs and the present blit scale and
+ * nothing else does. Capped per surface by the device's image limits. */
+static double   s_scale = 1.0;
+static uint32_t s_max_size = 4096;
+
+/* v title pixels of a surface l wide, in the p stored pixels behind it. */
+static uint32_t to_stored(uint32_t v, uint32_t p, uint32_t l)
+{
+    return (uint32_t)(((uint64_t)v * p + l / 2) / l);
+}
 static VkSurf     s_surf[VK_MAX_SURF];
 static VkDepthBuf s_depth[VK_MAX_DEPTH];
 static VkSurf    *s_last;
@@ -442,9 +460,17 @@ static VkSurf *surf_get(uint32_t va, uint32_t w, uint32_t h, uint32_t aa_sx, uin
         garbage_add(s->image, s->view, s->mem);
     }
     memset(s, 0, sizeof *s);
-    s->va = va; s->w = w; s->h = h; s->pw = w; s->ph = h; s->used = s_frame;
+    s->va = va; s->w = w; s->h = h; s->used = s_frame;
     s->aa_sx = aa_sx; s->aa_sy = aa_sy;
-    if (!make_image(w, h, VK_FORMAT_B8G8R8A8_UNORM,
+    {
+        double k = s_scale, m = (double)(w > h ? w : h);
+        if (m * k > (double)s_max_size)
+            k = (double)s_max_size / m;
+        s->pw = (uint32_t)(w * k + 0.5); s->ph = (uint32_t)(h * k + 0.5);
+        if (!s->pw) s->pw = 1;
+        if (!s->ph) s->ph = 1;
+    }
+    if (!make_image(s->pw, s->ph, VK_FORMAT_B8G8R8A8_UNORM,
                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                     VK_IMAGE_ASPECT_COLOR_BIT, &s->image, &s->view, &s->mem)) {
@@ -454,7 +480,8 @@ static VkSurf *surf_get(uint32_t va, uint32_t w, uint32_t h, uint32_t aa_sx, uin
     }
     clear_image_color(s->image, 0, 0, 0, 1);
     if (s_trace)
-        LOGE("surface 0x%08X %ux%u (aa %ux%u)\n", va, w, h, aa_sx, aa_sy);
+        LOGE("surface 0x%08X %ux%u (aa %ux%u, stored %ux%u)\n", va, w, h, aa_sx, aa_sy,
+             s->pw, s->ph);
     return s;
 }
 
@@ -910,11 +937,11 @@ static uint32_t s_prog_made, s_prog_live;
 uint32_t nv2a_gl_program_count(void) { return s_prog_live; }
 /* The GL renderer's thread statistics; the Vulkan one records on the
  * executor's thread. */
-int nv2a_gl_queue_stats(uint32_t *idle_pct, uint32_t *full_pct)
+void nv2a_gl_queue_stats(double secs, int *gl_idle_pct, int *exec_wait_pct)
 {
-    if (idle_pct) *idle_pct = 0;
-    if (full_pct) *full_pct = 0;
-    return 0;
+    (void)secs;
+    if (gl_idle_pct) *gl_idle_pct = 0;
+    if (exec_wait_pct) *exec_wait_pct = 0;
 }
 
 typedef struct {
@@ -971,6 +998,125 @@ static void *compile_thread(void *arg)
     return NULL;
 }
 
+/* ── Caches across runs ───────────────────────────────────────────
+ *
+ * A program compiled at first use stalled a race start for ~1 s (glslang,
+ * then NIR and NAK inside NVK: ~50 ms each on the console). Three files, next
+ * to the NRO (the current directory on Linux); RECOMP_PROG_CACHE=0 disables
+ * them all, =<path> moves the program list:
+ *   progcache.bin    what each program was built from -- the GL renderer's
+ *                    records, shared (the format does not depend on the back end)
+ *   vkspirv.bin      glslang's output by hash of the GLSL source
+ *   vkpipes.bin      the pipeline variants seen (program + fixed state)
+ *   vkpipecache.bin  the driver's VkPipelineCache (NAK binaries), saved while
+ *                    running whenever pipelines were added
+ * At start-up every recorded program and pipeline is built before the title
+ * draws. */
+static int s_prewarming;
+static int s_cache_off = -1;
+
+static const char *cache_dir(void)
+{
+#if defined(__SWITCH__)
+    return "sdmc:/switch/nfsu2x/";
+#else
+    return "";
+#endif
+}
+
+static int cache_path(char *out, size_t cap, const char *name)
+{
+    if (s_cache_off < 0) {
+        const char *e = getenv("RECOMP_PROG_CACHE");
+        s_cache_off = e && e[0] == '0' && !e[1];
+    }
+    if (s_cache_off)
+        return 0;
+    if (!strcmp(name, "progcache.bin")) {
+        const char *e = getenv("RECOMP_PROG_CACHE");
+        if (e && *e) {
+            snprintf(out, cap, "%s", e);
+            return 1;
+        }
+    }
+    snprintf(out, cap, "%s%s", cache_dir(), name);
+    return 1;
+}
+
+#define SPV_MAGIC 0x31565053u                   /* "SPV1" */
+typedef struct { uint64_t hash; uint32_t stage, nwords; uint32_t *words; } SpvEnt;
+static SpvEnt *s_spv;
+static uint32_t s_nspv, s_spv_cap, s_spv_hits;
+
+static uint64_t text_hash(const char *t, uint32_t stage)
+{
+    uint64_t h = 1469598103934665603ull ^ stage;
+    while (*t)
+        h = (h ^ (uint8_t)*t++) * 1099511628211ull;
+    return h;
+}
+
+static void spv_add(uint64_t hash, uint32_t stage, const uint32_t *w, uint32_t n)
+{
+    if (s_nspv == s_spv_cap) {
+        s_spv_cap = s_spv_cap ? s_spv_cap * 2 : 256;
+        s_spv = (SpvEnt *)realloc(s_spv, s_spv_cap * sizeof *s_spv);
+    }
+    s_spv[s_nspv].hash = hash;
+    s_spv[s_nspv].stage = stage;
+    s_spv[s_nspv].nwords = n;
+    s_spv[s_nspv].words = (uint32_t *)malloc((size_t)n * 4);
+    memcpy(s_spv[s_nspv].words, w, (size_t)n * 4);
+    s_nspv++;
+}
+
+static const SpvEnt *spv_find(uint64_t hash, uint32_t stage)
+{
+    uint32_t i;
+    for (i = 0; i < s_nspv; i++)
+        if (s_spv[i].hash == hash && s_spv[i].stage == stage)
+            return &s_spv[i];
+    return NULL;
+}
+
+static void spv_load(void)
+{
+    char path[256];
+    FILE *f;
+    uint32_t hdr[4];
+    if (!cache_path(path, sizeof path, "vkspirv.bin") || !(f = fopen(path, "rb")))
+        return;
+    while (fread(hdr, sizeof hdr, 1, f) == 1) {
+        uint64_t hash;
+        uint32_t *w;
+        if (hdr[0] != SPV_MAGIC || hdr[3] > (1u << 22))
+            break;
+        memcpy(&hash, &hdr[1], 8);
+        w = (uint32_t *)malloc((size_t)hdr[3] * 8 + 8);
+        if (!w || fread(w, 4, hdr[3], f) != hdr[3]) { free(w); break; }
+        /* the stage is in the word after the header */
+        spv_add(hash, w[0], w + 1, hdr[3] - 1);
+        free(w);
+    }
+    fclose(f);
+}
+
+static void spv_append(uint64_t hash, uint32_t stage, const uint32_t *w, uint32_t n)
+{
+    char path[256];
+    FILE *f;
+    uint32_t hdr[4];
+    if (!cache_path(path, sizeof path, "vkspirv.bin") || !(f = fopen(path, "ab")))
+        return;
+    hdr[0] = SPV_MAGIC;
+    memcpy(&hdr[1], &hash, 8);
+    hdr[3] = n + 1;
+    fwrite(hdr, sizeof hdr, 1, f);
+    fwrite(&stage, 4, 1, f);
+    fwrite(w, 4, n, f);
+    fclose(f);
+}
+
 /* GLSL to a shader module. glslang's parser recurses deeply: it runs on a
  * thread with a 4 MB stack (the executor's is smaller). */
 static VkShaderModule compile(glslang_stage_t stage, const char *src)
@@ -981,6 +1127,16 @@ static VkShaderModule compile(glslang_stage_t stage, const char *src)
     VkShaderModuleCreateInfo ci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
     VkShaderModule m = VK_NULL_HANDLE;
 
+    uint64_t hash = text_hash(src, (uint32_t)stage);
+    const SpvEnt *hit = spv_find(hash, (uint32_t)stage);
+
+    if (hit) {
+        s_spv_hits++;
+        ci.codeSize = (size_t)hit->nwords * 4;
+        ci.pCode = hit->words;
+        vkCreateShaderModule(s_dev, &ci, NULL, &m);
+        return m;
+    }
     VT("compile %s (%u bytes of GLSL)\n", stage == GLSLANG_STAGE_VERTEX ? "vs" : "fs",
        (unsigned)strlen(src));
     pthread_attr_init(&at);
@@ -996,6 +1152,8 @@ static VkShaderModule compile(glslang_stage_t stage, const char *src)
     ci.pCode = j.words;
     VT("  SPIR-V %u words -> vkCreateShaderModule\n", (unsigned)j.nwords);
     vkCreateShaderModule(s_dev, &ci, NULL, &m);
+    spv_add(hash, (uint32_t)stage, j.words, (uint32_t)j.nwords);
+    spv_append(hash, (uint32_t)stage, j.words, (uint32_t)j.nwords);
     free(j.words);
     return m;
 }
@@ -1024,6 +1182,52 @@ static uint32_t prog_bucket(uint64_t vkey, const Nv2aPshKey *pk)
 }
 
 static void pipes_forget_prog(int prog);
+
+/* progcache.bin records: nv2a_gl.c's ProgRec, byte for byte. */
+#define PROG_REC_MAGIC 0x4350564Eu              /* "NVPC" */
+typedef struct {
+    uint32_t   magic, xform, vp_start, slots;
+    Nv2aPshKey pk;
+    uint32_t   prog[136][4];
+} ProgRec;
+
+static void prog_rec_fill(ProgRec *rec, const Nv2aRawBatch *b, const Nv2aPshKey *pk)
+{
+    memset(rec, 0, sizeof *rec);
+    rec->magic = PROG_REC_MAGIC;
+    rec->xform = b->xform == 2 ? 2 : 1;
+    rec->pk = *pk;
+    if (rec->xform == 2 && b->vp_program && b->vp_slots <= 136) {
+        rec->vp_start = b->vp_start;
+        rec->slots = b->vp_slots;
+        memcpy(rec->prog, b->vp_program, (size_t)b->vp_slots * 16);
+    }
+}
+
+static void prog_rec_append(const Nv2aRawBatch *b, const Nv2aPshKey *pk)
+{
+    char path[256];
+    ProgRec rec;
+    FILE *f;
+    if (s_prewarming || !cache_path(path, sizeof path, "progcache.bin"))
+        return;
+    prog_rec_fill(&rec, b, pk);
+    if ((f = fopen(path, "ab"))) {
+        fwrite(&rec, sizeof rec, 1, f);
+        fclose(f);
+    }
+}
+
+/* The batch a record describes (vertex program slots in rec). */
+static void prog_rec_batch(const ProgRec *rec, Nv2aRawBatch *bb, uint32_t n)
+{
+    memset(bb, 0, sizeof *bb);
+    bb->xform = rec->xform;
+    bb->vp_program = (const uint32_t (*)[4])rec->prog;
+    bb->vp_slots = rec->slots ? rec->slots : 136;
+    bb->vp_start = rec->vp_start;
+    bb->vp_prog_gen = 0x80000000u + n;          /* hash it: not an executor version */
+}
 
 static VkProg *prog_get(const Nv2aRawBatch *b, const Nv2aPshKey *pk)
 {
@@ -1107,6 +1311,7 @@ static VkProg *prog_get(const Nv2aRawBatch *b, const Nv2aPshKey *pk)
     p->next = s_prog_head[bucket];
     s_prog_head[bucket] = (int)(p - s_prog) + 1;
     last = p;
+    prog_rec_append(b, pk);
     return p;
 }
 
@@ -1176,6 +1381,36 @@ static VkBlendOp blend_op(uint32_t v)
     case 0x8007: return VK_BLEND_OP_MIN;
     case 0x8008: return VK_BLEND_OP_MAX;
     default: return VK_BLEND_OP_ADD;
+    }
+}
+
+/* vkpipes.bin: the program by what generated it, and the pipeline's own
+ * state. */
+#define PIPE_REC_MAGIC 0x4C504B56u              /* "VKPL" */
+typedef struct {
+    uint32_t   magic, pad;
+    uint64_t   vkey;
+    Nv2aPshKey pk;
+    uint32_t   blend, bsrc, bdst, beq, cmask, depth, topo;
+} PipeRec;
+static uint32_t s_pipes_unsaved;
+
+static void pipe_rec_append(const PipeKey *k)
+{
+    char path[256];
+    PipeRec rec;
+    FILE *f;
+    if (s_prewarming || !cache_path(path, sizeof path, "vkpipes.bin"))
+        return;
+    memset(&rec, 0, sizeof rec);
+    rec.magic = PIPE_REC_MAGIC;
+    rec.vkey = s_prog[k->prog].vkey;
+    rec.pk = s_prog[k->prog].pkey;
+    rec.blend = k->blend; rec.bsrc = k->bsrc; rec.bdst = k->bdst; rec.beq = k->beq;
+    rec.cmask = k->cmask; rec.depth = k->depth; rec.topo = k->topo;
+    if ((f = fopen(path, "ab"))) {
+        fwrite(&rec, sizeof rec, 1, f);
+        fclose(f);
     }
 }
 
@@ -1278,7 +1513,107 @@ static VkPipeline pipe_get(const PipeKey *k)
     pe->hash = h;
     pe->next = s_pipe_head[h];
     s_pipe_head[h] = ++s_npipes;
+    s_pipes_unsaved++;
+    pipe_rec_append(k);
     return pipe;
+}
+
+static VkProg *prog_find(uint64_t vkey, const Nv2aPshKey *pk)
+{
+    int i;
+    for (i = s_prog_head[prog_bucket(vkey, pk)]; i; i = s_prog[i - 1].next) {
+        VkProg *c = &s_prog[i - 1];
+        if (c->vs && c->vkey == vkey && !memcmp(&c->pkey, pk, sizeof *pk))
+            return c;
+    }
+    return NULL;
+}
+
+static void *read_file(const char *path, size_t *size)
+{
+    FILE *f = fopen(path, "rb");
+    void *d = NULL;
+    long n;
+    *size = 0;
+    if (!f)
+        return NULL;
+    if (fseek(f, 0, SEEK_END) == 0 && (n = ftell(f)) > 0 && fseek(f, 0, SEEK_SET) == 0) {
+        d = malloc((size_t)n);
+        if (d && fread(d, 1, (size_t)n, f) == (size_t)n)
+            *size = (size_t)n;
+        else { free(d); d = NULL; }
+    }
+    fclose(f);
+    return d;
+}
+
+static void pcache_save(void)
+{
+    char path[256], tmp[272];
+    size_t n = 0;
+    void *d;
+    FILE *f;
+    if (!s_pcache || !cache_path(path, sizeof path, "vkpipecache.bin"))
+        return;
+    if (vkGetPipelineCacheData(s_dev, s_pcache, &n, NULL) != VK_SUCCESS || !n)
+        return;
+    d = malloc(n);
+    if (!d || vkGetPipelineCacheData(s_dev, s_pcache, &n, d) != VK_SUCCESS) { free(d); return; }
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    if ((f = fopen(tmp, "wb"))) {
+        int ok = fwrite(d, 1, n, f) == n;
+        fclose(f);
+        if (ok) {
+            remove(path);                  /* FAT: rename does not replace */
+            rename(tmp, path);
+        }
+    }
+    free(d);
+    s_pipes_unsaved = 0;
+}
+
+static void prewarm(void)
+{
+    char path[256];
+    FILE *f;
+    uint64_t t0 = hz_now();
+    uint32_t nprog = 0, npipe = 0, bad = 0;
+    ProgRec rec;
+    PipeRec pr;
+
+    spv_load();
+    s_prewarming = 1;
+    if (cache_path(path, sizeof path, "progcache.bin") && (f = fopen(path, "rb"))) {
+        while (fread(&rec, sizeof rec, 1, f) == 1) {
+            Nv2aRawBatch bb;
+            if (rec.magic != PROG_REC_MAGIC || rec.slots > 136) { bad++; break; }
+            prog_rec_batch(&rec, &bb, nprog);
+            if (prog_get(&bb, &rec.pk))
+                nprog++;
+        }
+        fclose(f);
+    }
+    if (cache_path(path, sizeof path, "vkpipes.bin") && (f = fopen(path, "rb"))) {
+        while (fread(&pr, sizeof pr, 1, f) == 1) {
+            VkProg *p;
+            PipeKey k;
+            if (pr.magic != PIPE_REC_MAGIC) { bad++; break; }
+            if (!(p = prog_find(pr.vkey, &pr.pk)))
+                continue;
+            memset(&k, 0, sizeof k);
+            k.prog = (int)(p - s_prog);
+            k.blend = pr.blend; k.bsrc = pr.bsrc; k.bdst = pr.bdst; k.beq = pr.beq;
+            k.cmask = pr.cmask; k.depth = pr.depth; k.topo = pr.topo;
+            if (pipe_get(&k))
+                npipe++;
+        }
+        fclose(f);
+    }
+    s_prewarming = 0;
+    fprintf(stderr, "  [VK] prewarm: %u programs (%u SPIR-V from cache), %u pipelines in %.0f ms%s\n",
+            nprog, s_spv_hits, npipe, (hz_now() - t0) / 1e6, bad ? " (a file ends in a bad record)" : "");
+    if (s_pipes_unsaved)
+        pcache_save();
 }
 
 /* ── Context ──────────────────────────────────────────────────────── */
@@ -1435,6 +1770,19 @@ static int ready(void)
     fprintf(stderr, "  [VK] %s, Vulkan %u.%u.%u\n", pp.deviceName, VK_API_VERSION_MAJOR(pp.apiVersion),
             VK_API_VERSION_MINOR(pp.apiVersion), VK_API_VERSION_PATCH(pp.apiVersion));
     s_ubo_align = pp.limits.minUniformBufferOffsetAlignment;
+    {
+        const char *e = getenv("RECOMP_GL_SCALE");
+        double k = e ? strtod(e, NULL) : 1.0;
+        uint32_t m = pp.limits.maxImageDimension2D;
+        if (pp.limits.maxFramebufferWidth < m) m = pp.limits.maxFramebufferWidth;
+        if (pp.limits.maxFramebufferHeight < m) m = pp.limits.maxFramebufferHeight;
+        s_max_size = m ? m : 4096;
+        if (!(k > 0.0)) k = 1.0;                    /* unset, 0 or garbage */
+        s_scale = k < 0.5 ? 0.5 : k > 4.0 ? 4.0 : k;
+        if (s_scale != 1.0)
+            fprintf(stderr, "  [VK] rendering at %gx (RECOMP_GL_SCALE), surfaces up to %u\n",
+                    s_scale, s_max_size);
+    }
     if (s_ubo_align < 16) s_ubo_align = 16;
     vkGetPhysicalDeviceMemoryProperties(s_pd, &s_memprops);
     vkGetPhysicalDeviceFeatures(s_pd, &have);
@@ -1547,7 +1895,21 @@ static int ready(void)
         pli.pSetLayouts = &s_dsl;
         if (vkCreatePipelineLayout(s_dev, &pli, NULL, &s_layout) != VK_SUCCESS)
             return 0;
-        vkCreatePipelineCache(s_dev, &pci, NULL, &s_pcache);
+        {
+            char path[256];
+            size_t n = 0;
+            void *d = cache_path(path, sizeof path, "vkpipecache.bin") ? read_file(path, &n) : NULL;
+            pci.initialDataSize = n;
+            pci.pInitialData = d;
+            if (vkCreatePipelineCache(s_dev, &pci, NULL, &s_pcache) != VK_SUCCESS) {
+                pci.initialDataSize = 0;       /* another driver's or a damaged file */
+                pci.pInitialData = NULL;
+                vkCreatePipelineCache(s_dev, &pci, NULL, &s_pcache);
+            }
+            if (n)
+                fprintf(stderr, "  [VK] pipeline cache: %u KB from %s\n", (unsigned)(n >> 10), path);
+            free(d);
+        }
     }
 
     for (i = 0; i < VK_FRAMES; i++) {
@@ -1593,6 +1955,7 @@ static int ready(void)
             s_headless ? " (headless)" : "", s_have_bc ? "yes" : "no",
             s_depth_fmt == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32S8",
             s_have_depth_clamp ? "yes" : "no", (unsigned)s_ubo_align);
+    prewarm();
     return 1;
 }
 
@@ -2239,10 +2602,11 @@ static void vk_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         if (x1 > s->w) x1 = s->w;
         if (y1 > s->h) y1 = s->h;
         if (x1 > x0 && y1 > y0) {
-            rect.rect.offset.x = (int32_t)x0;
-            rect.rect.offset.y = (int32_t)y0;
-            rect.rect.extent.width = x1 - x0;
-            rect.rect.extent.height = y1 - y0;
+            uint32_t px0 = to_stored(x0, s->pw, s->w), py0 = to_stored(y0, s->ph, s->h);
+            rect.rect.offset.x = (int32_t)px0;
+            rect.rect.offset.y = (int32_t)py0;
+            rect.rect.extent.width = to_stored(x1, s->pw, s->w) - px0;
+            rect.rect.extent.height = to_stored(y1, s->ph, s->h) - py0;
         }
     }
     if (d && rect.rect.extent.width > d->pw - (uint32_t)rect.rect.offset.x)
@@ -2502,6 +2866,14 @@ static void vk_flip(void)
         if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
             vkDeviceWaitIdle(s_dev);
             create_swapchain();
+        }
+    }
+    {
+        static uint64_t last_save;
+        uint64_t now = hz_now();
+        if (s_pipes_unsaved && now - last_save > 20000000000ull) {
+            last_save = now;
+            pcache_save();
         }
     }
     VT("flip %u: presented, waiting for frame slot\n", s_frame);

@@ -472,6 +472,7 @@ struct MCPXAPUState {
     bool pause_requested;
     bool is_idle;
     volatile LONG lock_waiters;   /* guest-side threads in mcpx_apu_lock_guest */
+    bool in_trap;                 /* front end trapped/halted: time stopped */
 
     MemoryRegion *ram;
     uint8_t *ram_ptr;
