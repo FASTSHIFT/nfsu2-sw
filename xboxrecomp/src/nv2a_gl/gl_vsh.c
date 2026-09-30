@@ -281,10 +281,14 @@ static const char s_vk_prelude[] =
     "    float lx = max(s.x, 0.0), ly = max(s.y, 0.0), w = clamp(s.w, -127.996, 127.996);\n"
     "    return vec4(1.0, lx, (lx > 0.0 && ly > 0.0) ? exp2(w * log2(ly)) : 0.0, 1.0);\n"
     "}\n"
+    /* z clamped only in front of the eye (w > 0). Behind it (w < 0) the
+     * vertex is clipped by x/y anyway and its true z is about w: clamping it
+     * to 0 skewed the interpolated depth of triangles crossing the eye plane
+     * (walls in hood view turned transparent, objects showed through them). */
     "vec4 nv2a_clip(vec3 sw, float w) {\n"
     "    float z = sw.z * u_surf.z;\n"
     "    return vec4(sw.x * u_surf.x - w, sw.y * u_surf.y - w,\n"
-    "                clamp(z, 0.0, abs(w)), w);\n"
+    "                w > 0.0 ? clamp(z, 0.0, w) : z, w);\n"
     "}\n";
 
 int nv2a_shader_vk;

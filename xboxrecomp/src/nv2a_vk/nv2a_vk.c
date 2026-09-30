@@ -2048,9 +2048,12 @@ static void apply_dynamic(const uint32_t *r, int has_depth, VkPrimitiveTopology 
         p_cull_mode(s_cb, cm);
     }
     if (!s_dyn_valid || d.front != s_dyn.front)
-        /* NV2A winding is in its own window space, rows top-first, as
-         * Vulkan's framebuffer: its CCW is Vulkan's CW (nv2a_gl flips too). */
-        p_front_face(s_cb, d.front == 0x901 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
+        /* NV2A winding is as seen on screen, rows top-first -- Vulkan's
+         * framebuffer orientation, so CW is CW. nv2a_gl swaps because its
+         * window y runs the other way. Swapped here too, every culled draw
+         * (29 a frame in the main menu: headlight glass, grille) lost its
+         * front faces and kept its back ones. */
+        p_front_face(s_cb, d.front == 0x901 ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE);
     if (!s_dyn_valid || d.topo != s_dyn.topo)
         p_topology(s_cb, topo);
     if (!s_dyn_valid || d.dtest != s_dyn.dtest) p_depth_test(s_cb, d.dtest);

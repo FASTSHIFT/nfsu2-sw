@@ -27,6 +27,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "apu_xaudio2.h"
+
 #define NFSU2_SWITCH_DIR "sdmc:/switch/nfsu2x"
 
 extern ptrdiff_t g_xbox_mem_offset;
@@ -57,6 +59,11 @@ static size_t s_log_len;
 static int    s_log_fd = -1;
 static int    s_log_bol = 1;
 static int    s_log_sync;       /* NFSU2_LOG_SYNC=1: every line to the card */
+/* NFSU2_NO_LOG=1 (or NFSU2_LOG=0): no log, no [perf] reports, no profiler --
+ * for playing rather than testing. Output is dropped at the log device;
+ * the settings file is read after the log opens, so the file keeps its
+ * first lines (the settings) and nothing after. */
+static volatile int s_log_off;
 
 static void log_drain_locked(void)
 {
@@ -86,6 +93,8 @@ static ssize_t log_write_r(struct _reent *r, void *fd, const char *ptr, size_t l
 {
     size_t i = 0;
     (void)r; (void)fd;
+    if (s_log_off)
+        return (ssize_t)len;
     mutexLock(&s_log_lock);
     while (i < len) {
         const char *nl;
@@ -169,6 +178,57 @@ static void log_flush(int locked_ok)
     }
 }
 
+/* ── SDL's audio thread ─────────────────────────────────────────
+ *
+ * switch-sdl2 plays through audren with two 1024-sample wave buffers
+ * (21 ms each): when one finishes, its thread must drain our queue and add
+ * the next before the other one runs out. It asks for
+ * SDL_THREAD_PRIORITY_TIME_CRITICAL, which SDL's Switch port maps to 59 --
+ * the time-sliced priority, where it waited behind busy game threads in
+ * 10 ms slices and the renderer played gaps (crackle / hiss on the console;
+ * Linux and Eden have idle cores). Wrapped at link time (--wrap, CMake):
+ * time critical becomes 0x2B, what SDL gives HIGH. The thread only copies
+ * 4 KB per buffer. RECOMP_NX_AUDIO_PRIO=0 leaves it at 59.
+ *
+ * The second wrapper counts gaps for [perf]: a wave buffer added when the
+ * one before it has already finished playing means the voice ran dry. */
+int __real_SDL_SYS_SetThreadPriority(int prio);
+int __wrap_SDL_SYS_SetThreadPriority(int prio)
+{
+    const char *e = getenv("RECOMP_NX_AUDIO_PRIO");
+    if (prio == 3 /* SDL_THREAD_PRIORITY_TIME_CRITICAL */ && !(e && *e == '0')) {
+        Result rc = svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2B);
+        fprintf(stderr, "  [AUDIO] SDL audio thread at priority 0x2B (rc 0x%X)\n", rc);
+        if (R_SUCCEEDED(rc))
+            return 0;
+    }
+    return __real_SDL_SYS_SetThreadPriority(prio);
+}
+
+static AudioDriverWaveBuf *s_aout_prev;
+static volatile uint32_t   s_aout_bufs, s_aout_gaps, s_aout_worst_us;
+static u64                 s_aout_last_tick;
+
+bool __real_audrvVoiceAddWaveBuf(AudioDriver *d, int id, AudioDriverWaveBuf *wb);
+bool __wrap_audrvVoiceAddWaveBuf(AudioDriver *d, int id, AudioDriverWaveBuf *wb)
+{
+    u64 now = armGetSystemTick();
+    if (s_aout_prev && s_aout_prev != wb) {
+        audrvUpdate(d);          /* fresh wave buffer states */
+        if (s_aout_prev->state == AudioDriverWaveBufState_Done)
+            s_aout_gaps++;
+    }
+    if (s_aout_last_tick) {
+        uint32_t us = (uint32_t)(armTicksToNs(now - s_aout_last_tick) / 1000);
+        if (us > s_aout_worst_us)
+            s_aout_worst_us = us;
+    }
+    s_aout_last_tick = now;
+    s_aout_prev = wb;
+    s_aout_bufs++;
+    return __real_audrvVoiceAddWaveBuf(d, id, wb);
+}
+
 /* Every 10 s: presented frames per second, texture memory, and how much of
  * a core each thread used -- the console has no profiler, and this is what
  * tells a slow movie decoder from a busy audio or GPU thread. The line's
@@ -197,6 +257,32 @@ static void perf_report(void)
         char pb[256];
         mcpx_apu_pacing_stats(pb, sizeof pb);
         fprintf(stderr, "[perf] APU pacing: %s\n", pb);
+    }
+    {
+        /* Output health: device gaps (audren ran dry: SDL's thread late),
+         * our queue running empty, blocks dropped on a full queue, and the
+         * largest time between wave buffers (21.3 ms each). */
+        static uint64_t last_under, last_drop;
+        Xa2Stats st;
+        xa2_get_stats(&st);
+        fprintf(stderr, "[perf] audio out: %u buffers, %u device gaps, worst %u.%u ms between"
+                        " buffers, %llu queue underruns, %llu dropped, peak %d\n",
+                s_aout_bufs, s_aout_gaps, s_aout_worst_us / 1000, s_aout_worst_us / 100 % 10,
+                (unsigned long long)(st.underruns - last_under),
+                (unsigned long long)(st.dropped - last_drop), st.peak);
+        last_under = st.underruns;
+        last_drop = st.dropped;
+        s_aout_bufs = s_aout_gaps = s_aout_worst_us = 0;
+    }
+    {
+        /* The game's mixer late: ring samples the VP read unchanged from
+         * one lap (50 ms) earlier. ~0.3% on Linux is music's own repeats. */
+        void mcpx_apu_ring_stats(uint32_t *stale, uint32_t *total);
+        uint32_t st, tot;
+        mcpx_apu_ring_stats(&st, &tot);
+        fprintf(stderr, "[perf] APU ring voices: %u of %u samples stale (%u.%02u%%)\n",
+                st, tot, tot ? (unsigned)(100ull * st / tot) : 0,
+                tot ? (unsigned)(10000ull * st / tot % 100) : 0);
     }
     last_frames = f;
     {
@@ -241,6 +327,8 @@ static void *log_flusher(void *arg)
     (void)arg;
     for (;;) {
         svcSleepThread(500000000ull);
+        if (s_log_off)
+            break;
         if (++n % 20 == 0)
             perf_report();
         log_flush(1);
@@ -815,6 +903,19 @@ void switch_boot(void)
         fprintf(stderr, "[switch] log device unavailable\n");
     load_env();
     s_log_sync = getenv("NFSU2_LOG_SYNC") && strcmp(getenv("NFSU2_LOG_SYNC"), "1") == 0;
+    {
+        const char *a = getenv("NFSU2_NO_LOG"), *b = getenv("NFSU2_LOG");
+        if ((a && *a == '1') || (b && *b == '0')) {
+            printf("[switch] logging off (NFSU2_NO_LOG): no log, [perf] or profiler\n");
+            setenv("RECOMP_NO_LOG", "1", 1);     /* the kernel's own log file */
+            setenv("RECOMP_QUIET", "1", 1);
+            unsetenv("RECOMP_NX_PROFILE");
+            unsetenv("NFSU2_LOG_SYNC");
+            s_log_sync = 0;
+            log_flush(1);
+            s_log_off = 1;
+        }
+    }
     {
         u64 total = 0, used = 0;
         AppletType at = appletGetAppletType();

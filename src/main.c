@@ -237,6 +237,7 @@ void xbox_guest_pin(int interrupt);   /* win32_compat.c: the Xbox's one CPU */
 void xbox_gil_enter(void);             /* kernel_bridge.c: the guest lock */
 void xbox_gil_leave(void);
 void xbox_gil_mark_main(void);
+void nfsu2_text_patch_init(void);    /* text_patch.c: Switch button names */
 
 #ifdef __SWITCH__
 #include <pthread.h>
@@ -404,6 +405,7 @@ static int game_main(void)
 #endif
 
     xbox_kernel_init();
+    nfsu2_text_patch_init();
     xbox_path_init(game_dir, NFSU2_DEFAULT_SAVE_DIR);
     xbox_kernel_bridge_init();
 
