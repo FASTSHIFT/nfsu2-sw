@@ -406,7 +406,12 @@ static int game_main(void)
 
     xbox_kernel_init();
     nfsu2_text_patch_init();
-    xbox_path_init(game_dir, NFSU2_DEFAULT_SAVE_DIR);
+    {
+        const char *save_dir = getenv("NFSU2_SAVE_DIR");
+        if (!save_dir || !save_dir[0])
+            save_dir = NFSU2_DEFAULT_SAVE_DIR;
+        xbox_path_init(game_dir, save_dir);
+    }
     xbox_kernel_bridge_init();
 
     g_esp = XBOX_STACK_TOP;

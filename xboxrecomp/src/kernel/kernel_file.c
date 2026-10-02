@@ -932,7 +932,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     return STATUS_SUCCESS;
 }
 
-void (*xbox_file_read_hook)(void *buf, size_t len, int64_t offset);
+/* xbox_file_read_hook is defined in the game (text_patch.c); declared in kernel.h */
 
 NTSTATUS __stdcall xbox_NtReadFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,

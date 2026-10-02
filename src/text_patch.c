@@ -21,7 +21,7 @@
 #include <string.h>
 
 /* kernel_file.c */
-extern void (*xbox_file_read_hook)(void *buf, size_t len, int64_t offset);
+void (*xbox_file_read_hook)(void *buf, size_t len, int64_t offset) = NULL;
 
 #define LANG_CHUNK_ID   0x00039000u
 #define LANG_ALIGN      0x800u      /* chunks start on pack sectors */

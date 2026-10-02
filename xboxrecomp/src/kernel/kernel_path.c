@@ -363,7 +363,12 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
                                        L"SystemData" };
         WCHAR image[MAX_PATH];
         WCHAR dir[MAX_PATH];
-        SHCreateDirectoryExW(NULL, s_save_dir, NULL);
+        {
+            int _rc = SHCreateDirectoryExW(NULL, s_save_dir, NULL);
+            if (_rc != 0 && _rc != 183)
+                fprintf(stderr, "  [PATH] SHCreateDirectoryExW failed: %ls rc=%d err=%lu\n",
+                        s_save_dir, _rc, GetLastError());
+        }
         for (int i = 0; i < (int)(sizeof(subs) / sizeof(subs[0])); i++) {
             swprintf_s(dir, MAX_PATH, L"%s\\%s", s_save_dir, subs[i]);
             SHCreateDirectoryExW(NULL, dir, NULL);
@@ -385,8 +390,11 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
                            s_save_dir, p);
                 h = CreateFileW(image, GENERIC_WRITE, FILE_SHARE_READ, NULL,
                                 OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                if (h == INVALID_HANDLE_VALUE)
+                if (h == INVALID_HANDLE_VALUE) {
+                    fprintf(stderr, "  [PATH] CreateFileW failed: %ls err=%lu\n",
+                            image, GetLastError());
                     continue;
+                }
                 DeviceIoControl(h, FSCTL_SET_SPARSE, NULL, 0, NULL, 0,
                                 &ret, NULL);
                 end.QuadPart = (LONGLONG)(s_part_sectors[p] * 512ull);

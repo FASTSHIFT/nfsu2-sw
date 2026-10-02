@@ -1399,7 +1399,7 @@ void xbox_OhciInit(void)
         for (i = 0; i < 2; i++) {
             DWORD old_protect;
             LPVOID at = (LPVOID)((uintptr_t)off + s_hc[i].base);
-            if (!VirtualProtect(at, XBOX_OHCI_SIZE, PAGE_NOACCESS,
+            if (!VirtualProtect(at, XBOX_OHCI_SIZE, PAGE_READWRITE,
                                 &old_protect)) {
                 s_enabled = 0;
                 fprintf(stderr, "  OHCI: cannot trap 0x%08X (error %lu); "

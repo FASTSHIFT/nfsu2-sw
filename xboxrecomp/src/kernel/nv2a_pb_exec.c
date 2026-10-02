@@ -426,8 +426,12 @@ static void note_texture_use(void)
 static uint32_t s_reg[0x2000 / 4];
 /* 64-byte blocks of s_reg changed since a queueing back end last looked
  * (nv2a_pb_reg_dirty); starts all set. */
-static uint8_t s_reg_dirty[0x2000 / 64] = { [0 ... 0x2000 / 64 - 1] = 1 };
-uint8_t *nv2a_pb_reg_dirty(void) { return s_reg_dirty; }
+static uint8_t s_reg_dirty[0x2000 / 64];
+uint8_t *nv2a_pb_reg_dirty(void) {
+    static int s_reg_dirty_init = 0;
+    if (!s_reg_dirty_init) { memset(s_reg_dirty, 1, sizeof(s_reg_dirty)); s_reg_dirty_init = 1; }
+    return s_reg_dirty;
+}
 static float reg_f(uint32_t method) { float f; memcpy(&f, &s_reg[method / 4], 4); return f; }
 
 static uint32_t s_sem_va;
