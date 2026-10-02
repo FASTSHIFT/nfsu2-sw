@@ -20,6 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/frame.h>
@@ -50,9 +53,13 @@ static double s_ms_sum, s_ms_worst;
 
 static double now_ms(void)
 {
+#ifdef _WIN32
+    return (double)GetTickCount64();
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+#endif
 }
 
 int nfsu2_vp6_mode(void)
