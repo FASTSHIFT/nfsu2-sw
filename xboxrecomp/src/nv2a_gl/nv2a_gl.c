@@ -39,6 +39,10 @@
 #include "gl_vsh.h"
 #include "../kernel/nv2a_backend.h"
 
+#ifdef _WIN32
+#include "gcc_compat.h"   /* __attribute__ / __atomic_* shims for MSVC */
+#endif
+
 #include <SDL.h>
 #include <stdio.h>
 #include <stdlib.h>

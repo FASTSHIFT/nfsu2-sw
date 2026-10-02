@@ -388,7 +388,6 @@ static int game_main(void)
         xbox_OhciInit();
     }
 
-#ifndef _WIN32
     /* The GPU renderer (NFSU2_GL=0 falls back to the executor's CPU one). */
     {
         const char *gl = getenv("NFSU2_GL");
@@ -402,7 +401,6 @@ static int game_main(void)
 #endif
         }
     }
-#endif
 
     xbox_kernel_init();
     nfsu2_text_patch_init();

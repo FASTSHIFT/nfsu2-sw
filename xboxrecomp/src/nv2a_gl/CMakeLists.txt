@@ -13,7 +13,16 @@ add_library(xbox_nv2a_gl STATIC
 )
 target_include_directories(xbox_nv2a_gl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
-if(NINTENDO_SWITCH)
+if(WIN32)
+    # Pre-built SDL2-devel-*-VC package (has cmake/sdl2-config.cmake), plus the
+    # pthread/clock_gettime shim the renderer's Linux-only helpers need.
+    set(SDL2_DIR "" CACHE PATH "SDL2-devel-VC cmake dir (contains sdl2-config.cmake)")
+    find_package(SDL2 CONFIG REQUIRED)
+    target_link_libraries(xbox_nv2a_gl PUBLIC SDL2::SDL2)
+    set(_shim "${CMAKE_CURRENT_SOURCE_DIR}/../platform/win32_shim")
+    target_include_directories(xbox_nv2a_gl PRIVATE "${_shim}")
+    target_sources(xbox_nv2a_gl PRIVATE "${_shim}/pthread.c")
+elseif(NINTENDO_SWITCH)
     find_package(SDL2 REQUIRED)
     target_link_libraries(xbox_nv2a_gl PUBLIC SDL2::SDL2)
 else()
