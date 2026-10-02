@@ -306,6 +306,7 @@ static int game_main(void)
     if (!getenv("RECOMP_VBLANK"))     _putenv("RECOMP_VBLANK=1");
     if (!getenv("RECOMP_AC97_READY")) _putenv("RECOMP_AC97_READY=plain");
     if (!getenv("RECOMP_USB"))        _putenv("RECOMP_USB=1");
+    if (!getenv("RECOMP_PB_EXEC"))    _putenv("RECOMP_PB_EXEC=1");
 #else
     setenv("RECOMP_VBLANK", "1", 0);
     setenv("RECOMP_AC97_READY", "plain", 0);
