@@ -91,33 +91,35 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
 
     memset(pState, 0, sizeof(*pState));
 
+    /* D-pad: menu navigation on the arrow keys. */
     if (key_down(VK_UP))     b |= XBOX_GAMEPAD_DPAD_UP;
     if (key_down(VK_DOWN))   b |= XBOX_GAMEPAD_DPAD_DOWN;
     if (key_down(VK_LEFT))   b |= XBOX_GAMEPAD_DPAD_LEFT;
     if (key_down(VK_RIGHT))  b |= XBOX_GAMEPAD_DPAD_RIGHT;
     if (key_down(VK_RETURN)) b |= XBOX_GAMEPAD_START;
-    if (key_down(VK_BACK))   b |= XBOX_GAMEPAD_BACK;
-    if (key_down(VK_SHIFT))  b |= XBOX_GAMEPAD_LEFT_THUMB;
-    if (key_down(VK_CONTROL))b |= XBOX_GAMEPAD_RIGHT_THUMB;
+    if (key_down(VK_ESCAPE)) b |= XBOX_GAMEPAD_BACK;
     pState->Gamepad.wButtons = b;
 
     /* Analog on the console, so a key is 255 rather than a flag -- a title
-     * that reads these as a pressure never sees a press if they are 1. */
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A]        = key_down('Z') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B]        = key_down('X') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X]        = key_down('A') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y]        = key_down('S') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE]    = key_down('Q') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK]    = key_down('E') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = key_down('1') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = key_down('3') ? 255 : 0;
+     * that reads these as a pressure never sees a press if they are 1.
+     *
+     * PC racing layout: RT throttle, LT brake, steering on A/D, Space
+     * handbrake, Shift nitrous, Ctrl shift down, Q spare. Enter doubles as A
+     * so the menus confirm on the same key that starts the title. */
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A]        = key_down(VK_RETURN) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B]        = key_down(VK_SPACE) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X]        = 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y]        = key_down(VK_CONTROL) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE]    = key_down(VK_SHIFT) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK]    = key_down('Q') ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = key_down('S') ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = key_down('W') ? 255 : 0;
 
-    /* W/A/S/D would collide with the face buttons above, so the left thumb
-     * shares the arrow keys' row on the numeric pad instead. */
-    pState->Gamepad.sThumbLX = axis_from_keys(VK_NUMPAD4, VK_NUMPAD6);
-    pState->Gamepad.sThumbLY = axis_from_keys(VK_NUMPAD2, VK_NUMPAD8);
-    pState->Gamepad.sThumbRX = axis_from_keys('J', 'L');
-    pState->Gamepad.sThumbRY = axis_from_keys('K', 'I');
+    /* Steering on A/D. */
+    pState->Gamepad.sThumbLX = axis_from_keys('A', 'D');
+    pState->Gamepad.sThumbLY = 0;
+    pState->Gamepad.sThumbRX = 0;
+    pState->Gamepad.sThumbRY = 0;
 
     /* The title's input layer looks for button edges, so the packet number
      * has to move whenever the state does or a press is never noticed. */

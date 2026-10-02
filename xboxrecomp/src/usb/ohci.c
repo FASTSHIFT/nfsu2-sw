@@ -1410,15 +1410,13 @@ void xbox_OhciInit(void)
     }
 #endif
 
-#if !defined(_WIN32)
-    /* No fault handling on this host: the registers stay plain memory and the
-     * title's XPP code, lifted with --mmio-sections XPP, reaches the model
-     * through the runtime's MMIO accessors instead. */
+    /* The title's XPP code, lifted with --mmio-sections XPP, reaches the model
+     * through the runtime's MMIO accessors. Registered on every host so the
+     * USB driver reads the controller's registers, not zeroed RAM. */
     xbox_MmioRegister(XBOX_OHCI0_BASE, XBOX_OHCI0_BASE + XBOX_OHCI_SIZE,
                       ohci_mmio_rd, ohci_mmio_wr, &s_hc[0]);
     xbox_MmioRegister(XBOX_OHCI1_BASE, XBOX_OHCI1_BASE + XBOX_OHCI_SIZE,
                       ohci_mmio_rd, ohci_mmio_wr, &s_hc[1]);
-#endif
 
     fprintf(stderr, "  OHCI: two controllers at 0x%08X and 0x%08X, "
                     "%u ports each, %u pad(s) on HC%d\n",

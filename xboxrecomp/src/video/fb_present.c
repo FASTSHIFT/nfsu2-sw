@@ -118,6 +118,14 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
+/* The SDL window (the OpenGL renderer) also records keys here, since on
+ * Windows the game runs in that window, not the GDI framebuffer one. */
+void xbox_FramebufferKeySet(int vk, int down)
+{
+    if ((unsigned)vk <= 255)
+        s_key_down[vk] = down ? 1 : 0;
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
@@ -366,4 +374,5 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (v
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
+void xbox_FramebufferKeySet(int vk, int down) { (void)vk; (void)down; }
 #endif

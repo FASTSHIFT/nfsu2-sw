@@ -51,6 +51,44 @@
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
+/* Feed the SDL window's keyboard to the pad stand-in (src/input reads the
+ * virtual-key table through xbox_FramebufferKeyDown). The Windows GDI
+ * framebuffer window normally records these, but with the GL renderer the
+ * SDL window is the one that has the focus, so it has to. */
+extern void xbox_FramebufferKeySet(int vk, int down);
+
+static void gl_key(SDL_Scancode sc, int down)
+{
+    int vk = 0;
+
+    switch (sc) {
+    case SDL_SCANCODE_UP:        vk = 0x26; break;   /* VK_UP */
+    case SDL_SCANCODE_DOWN:      vk = 0x28; break;   /* VK_DOWN */
+    case SDL_SCANCODE_LEFT:      vk = 0x25; break;   /* VK_LEFT */
+    case SDL_SCANCODE_RIGHT:     vk = 0x27; break;   /* VK_RIGHT */
+    case SDL_SCANCODE_RETURN:    vk = 0x0D; break;   /* VK_RETURN */
+    case SDL_SCANCODE_BACKSPACE: vk = 0x08; break;   /* VK_BACK */
+    case SDL_SCANCODE_LSHIFT:
+    case SDL_SCANCODE_RSHIFT:    vk = 0x10; break;   /* VK_SHIFT */
+    case SDL_SCANCODE_LCTRL:
+    case SDL_SCANCODE_RCTRL:     vk = 0x11; break;   /* VK_CONTROL */
+    case SDL_SCANCODE_KP_4:      vk = 0x64; break;   /* VK_NUMPAD4 */
+    case SDL_SCANCODE_KP_6:      vk = 0x66; break;   /* VK_NUMPAD6 */
+    case SDL_SCANCODE_KP_2:      vk = 0x62; break;   /* VK_NUMPAD2 */
+    case SDL_SCANCODE_KP_8:      vk = 0x68; break;   /* VK_NUMPAD8 */
+    case SDL_SCANCODE_SPACE:     vk = 0x20; break;   /* VK_SPACE */
+    case SDL_SCANCODE_ESCAPE:    vk = 0x1B; break;   /* VK_ESCAPE */
+    default:
+        if (sc >= SDL_SCANCODE_A && sc <= SDL_SCANCODE_Z)
+            vk = 'A' + (sc - SDL_SCANCODE_A);
+        else if (sc >= SDL_SCANCODE_1 && sc <= SDL_SCANCODE_9)
+            vk = '1' + (sc - SDL_SCANCODE_1);
+        break;
+    }
+    if (vk)
+        xbox_FramebufferKeySet(vk, down);
+}
+
 int nv2a_gl_adopt_window(void **win, void **ctx);
 int nv2a_gl_draw_placeholder(void);
 int nv2a_gl_screen_size(int *w, int *h);
@@ -2084,7 +2122,10 @@ swap:
     tex_bind_forget();
     {
         SDL_Event e;
-        while (SDL_PollEvent(&e)) { }
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP)
+                gl_key(e.key.keysym.scancode, e.type == SDL_KEYDOWN);
+        }
     }
 }
 
