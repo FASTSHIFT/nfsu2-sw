@@ -283,9 +283,20 @@ static inline uint32_t recomp_atomic_cas32(volatile void *p, uint32_t cmp, uint3
  * 16, a host yield every 64 -- which also hands the guest lock (kernel_bridge.c)
  * to whichever guest thread, ISR or DPC the loop is waiting for. */
 #if defined(_MSC_VER)
-#define RECOMP_SPIN_HINT() _mm_pause()
 extern volatile int g_gil_contended;
 void recomp_preempt(void);
+void recomp_spin_wake(void);        /* runtime: wake the hardware threads */
+void recomp_spin_yield(void);       /* runtime: yield, and the guest lock with it */
+static inline void recomp_spin_hint(void)
+{
+    static RECOMP_TLS unsigned turns;
+    _mm_pause();
+    if ((++turns & 15u) == 0)
+        recomp_spin_wake();         /* someone is waiting: answer now */
+    if ((turns & 63u) == 0)
+        recomp_spin_yield();        /* lets other guest threads and ISRs run */
+}
+#define RECOMP_SPIN_HINT() recomp_spin_hint()
 #define RECOMP_PREEMPT() do { if (g_gil_contended) recomp_preempt(); } while (0)
 #else
 #include <sched.h>

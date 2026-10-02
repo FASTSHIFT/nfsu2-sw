@@ -66,3 +66,9 @@ xboxrecomp/tools/*/output/
 
 # Runtime logs
 *.log
+
+# Runtime shader/pipeline caches
+progcache.bin
+vkspirv.bin
+vkpipes.bin
+vkpipecache.bin
