@@ -103,8 +103,49 @@ else()
     else()
         set(NFSU2_GEN_OPT "-O1" CACHE STRING "Optimisation for the lifted code")
     endif()
+    set(_gen_opts "${NFSU2_GEN_OPT};-w;-fno-strict-aliasing;-fwrapv")
+
+    # Guest memory accesses are volatile by default (recomp_types.h): a poll
+    # loop that re-reads a flag must not have its load hoisted. Loops the
+    # spin-hint pass marks call out every few turns and stay correct without
+    # it; an unmarked one would spin forever -- a hang, not corruption. On x86
+    # dropping it measured nothing; on an in-order A35, where 55-65 % of the
+    # lifted instructions are loads/stores, it is worth measuring.
+    option(NFSU2_GEN_NONVOLATILE "Lifted code: plain (non-volatile) guest memory accesses" OFF)
+    if(NFSU2_GEN_NONVOLATILE)
+        list(APPEND _gen_opts "-DRECOMP_MEM_VOLATILE=")
+    endif()
+
+    # LTO over the lifted code and the game sources: ~19.5k functions in 79
+    # files call each other, and without LTO none of those calls can be
+    # inlined. nfsmw-nx measured +12 % with LTO+PGO on a 144 MB recompiled
+    # game (docs/03). The runtime (xboxrecomp) stays out. -flto-partition and
+    # the job count keep the link inside a 10 GB build host.
+    option(NFSU2_LTO "LTO over the lifted code and src/" OFF)
+    set(NFSU2_LTO_JOBS "4" CACHE STRING "Parallel LTO link jobs")
+    if(NFSU2_LTO)
+        list(APPEND _gen_opts "-flto" "-fno-fat-lto-objects")
+        set_source_files_properties(${GAME_SOURCES} PROPERTIES
+            COMPILE_OPTIONS "-flto;-fno-fat-lto-objects")
+        target_link_options(${PROJECT_NAME} PRIVATE
+            "-flto=${NFSU2_LTO_JOBS}" "-flto-partition=balanced"
+            "${NFSU2_GEN_OPT}" "-fno-strict-aliasing" "-fwrapv")
+    endif()
+
+    # PGO: NFSU2_PGO=gen builds the instrumented binary (writes .gcda files to
+    # NFSU2_PGO_DIR on the device); =use builds with the profile read back.
+    set(NFSU2_PGO "" CACHE STRING "PGO stage: empty, gen or use")
+    set(NFSU2_PGO_DIR "" CACHE PATH "Profile directory (gen: on the device; use: here)")
+    if(NFSU2_PGO STREQUAL "gen")
+        list(APPEND _gen_opts "-fprofile-generate=${NFSU2_PGO_DIR}" "-fno-profile-values")
+        target_link_options(${PROJECT_NAME} PRIVATE "-fprofile-generate=${NFSU2_PGO_DIR}")
+    elseif(NFSU2_PGO STREQUAL "use")
+        list(APPEND _gen_opts "-fprofile-use=${NFSU2_PGO_DIR}" "-fprofile-partial-training"
+             "-fprofile-correction" "-Wno-missing-profile")
+    endif()
+
     set_source_files_properties(${RECOMP_GEN_SOURCES} PROPERTIES
-        COMPILE_OPTIONS "${NFSU2_GEN_OPT};-w;-fno-strict-aliasing;-fwrapv")
+        COMPILE_OPTIONS "${_gen_opts}")
     target_link_libraries(${PROJECT_NAME} PRIVATE m)
 endif()
 

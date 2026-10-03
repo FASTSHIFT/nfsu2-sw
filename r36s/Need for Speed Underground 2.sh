@@ -92,9 +92,12 @@ export RECOMP_WIDESCREEN=0
 export RECOMP_QUIET=1
 export RECOMP_FPS_LOG=1
 
+# Which binary to run (A/B builds side by side, docs/03): NFSU2_BIN in env.txt.
+BIN="${NFSU2_BIN:-nfsu2_recomp}"
+[ -f "$BIN" ] || BIN=nfsu2_recomp
 # gptokeyb only for the hotkey exit (the pad itself goes through SDL).
-$GPTOKEYB "nfsu2_recomp" &
-./nfsu2_recomp 2>&1 | tee log.txt
+$GPTOKEYB "$BIN" &
+{ echo "[launcher] binary $BIN md5 $(md5sum "$BIN" | cut -c1-12)"; ./"$BIN"; } 2>&1 | tee log.txt
 
 restore_thermal
 $ESUDO kill -9 $(pidof gptokeyb)

@@ -15,6 +15,10 @@
 #   JOBS           parallel jobs (default: nproc for cross, 8 under qemu; each
 #                  -O2 chunk takes ~0.4 GB)
 #   BUILD_DIR      default build-r36s (cross) / build-r36s-qemu
+#   EXTRA_CMAKE    extra -D options, e.g. A/B builds (docs/03):
+#                    "-DNFSU2_LTO=ON" "-DNFSU2_GEN_NONVOLATILE=ON"
+#                    "-DNFSU2_PGO=gen -DNFSU2_PGO_DIR=/roms/ports/nfs8/pgo"
+#                  use a BUILD_DIR per variant (CMake caches options).
 #
 # Output: $BUILD_DIR/nfsu2_recomp. FFmpeg: build-r36s/ffmpeg-vp6 (from
 # build/ffmpeg-7.1, the source the Linux build uses).
@@ -80,7 +84,7 @@ run "
         -DCMAKE_C_COMPILER_LAUNCHER=ccache \
         -DCMAKE_C_FLAGS='-mcpu=cortex-a35' \
         -DCMAKE_EXE_LINKER_FLAGS=-Wl,--as-needed \
-        -DXBOXRECOMP_EMBEDDED=ON -DNFSU2_GEN_DIR=/gen $FF >/dev/null
+        -DXBOXRECOMP_EMBEDDED=ON -DNFSU2_GEN_DIR=/gen $FF ${EXTRA_CMAKE:-} >/dev/null
     ninja -C $BUILD -j$JOBS
     file $BUILD/nfsu2_recomp
     echo -n 'max GLIBC: '; $OBJDUMP -T $BUILD/nfsu2_recomp | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
