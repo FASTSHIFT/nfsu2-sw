@@ -11,20 +11,19 @@
  */
 
 #include "xinput_xbox.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#if !defined(_WIN32)
+#include "platform/win32_compat.h"   /* VK_* codes */
+#endif
+
 /* ======================================================================== */
-#if defined(_WIN32)
-/* ====================  XInput backend  ================================== */
+/* ====  Keyboard as pad 1 (both backends)  =============================== */
 /* ======================================================================== */
 
-#include <xinput.h>
-#pragma comment(lib, "xinput.lib")
-
-static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
-static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
-
+#if !defined(__SWITCH__)
 /* ---- keyboard, when there is no pad --------------------------------------
  *
  * A title that waits on PRESS START is unreachable on a machine with no
@@ -126,6 +125,38 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
     pState->dwPacketNumber = ++packet;
 }
 
+
+/* Merge the keyboard on top of a pad state (port 0 only). */
+static void keyboard_merge(XBOX_INPUT_STATE *pState)
+{
+    XBOX_INPUT_STATE kb;
+    int i;
+    keyboard_state(&kb);
+    pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
+    for (i = 0; i < 8; i++)
+        if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
+            pState->Gamepad.bAnalogButtons[i] = kb.Gamepad.bAnalogButtons[i];
+    if (kb.Gamepad.sThumbLX) pState->Gamepad.sThumbLX = kb.Gamepad.sThumbLX;
+    if (kb.Gamepad.sThumbLY) pState->Gamepad.sThumbLY = kb.Gamepad.sThumbLY;
+    if (kb.Gamepad.sThumbRX) pState->Gamepad.sThumbRX = kb.Gamepad.sThumbRX;
+    if (kb.Gamepad.sThumbRY) pState->Gamepad.sThumbRY = kb.Gamepad.sThumbRY;
+    /* The input layer records edges, so an unchanged packet number is
+     * read as the same state and the press never happens. */
+    pState->dwPacketNumber = kb.dwPacketNumber;
+}
+#endif /* !__SWITCH__ */
+
+/* ======================================================================== */
+#if defined(_WIN32)
+/* ====================  XInput backend  ================================== */
+/* ======================================================================== */
+
+#include <xinput.h>
+#pragma comment(lib, "xinput.lib")
+
+static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
+static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
+
 void xbox_InputInit(void)
 {
     for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
@@ -192,22 +223,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
      * Merging is also the better rule. A real pad keeps working -- its
      * buttons are already in pState and the keyboard only adds to them --
      * and there is no special case left to get wrong. */
-    if (dwPort == 0 && keyboard_enabled()) {
-        XBOX_INPUT_STATE kb;
-        int i;
-        keyboard_state(&kb);
-        pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
-        for (i = 0; i < 8; i++)
-            if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
-                pState->Gamepad.bAnalogButtons[i] = kb.Gamepad.bAnalogButtons[i];
-        if (kb.Gamepad.sThumbLX) pState->Gamepad.sThumbLX = kb.Gamepad.sThumbLX;
-        if (kb.Gamepad.sThumbLY) pState->Gamepad.sThumbLY = kb.Gamepad.sThumbLY;
-        if (kb.Gamepad.sThumbRX) pState->Gamepad.sThumbRX = kb.Gamepad.sThumbRX;
-        if (kb.Gamepad.sThumbRY) pState->Gamepad.sThumbRY = kb.Gamepad.sThumbRY;
-        /* The input layer records edges, so an unchanged packet number is
-         * read as the same state and the press never happens. */
-        pState->dwPacketNumber = kb.dwPacketNumber;
-    }
+    if (dwPort == 0 && keyboard_enabled())
+        keyboard_merge(pState);
 
     return ERROR_SUCCESS;
 }
@@ -274,11 +291,45 @@ static void open_controllers(void)
     }
 }
 
+/* RECOMP_PAD_LAYOUT=position: map the face buttons by where they are, Xbox
+ * style (bottom = A, right = B, left = X, top = Y), instead of by SDL's
+ * labels. SNES / Nintendo-layout handhelds (R36S and the other RK3326 units:
+ * A on the right, B at the bottom) report their buttons by label through
+ * PortMaster's gamecontrollerdb, so by label the confirm button would be on
+ * the right -- as reVC's REVC_SNES_PAD swaps it. */
+static int s_positional = -1;
+
+static int pad_positional(void)
+{
+    if (s_positional < 0) {
+        const char *e = getenv("RECOMP_PAD_LAYOUT");
+        s_positional = e && strcmp(e, "position") == 0;
+    }
+    return s_positional;
+}
+
+static int s_input_ready;
+
 void xbox_InputInit(void)
 {
+    if (s_input_ready)
+        return;
+    s_input_ready = 1;
+    /* SDL_GAMECONTROLLERCONFIG (PortMaster's get_controls) is read here. */
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
     open_controllers();
+    {
+        int i;
+        for (i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+            if (g_pads[i])
+                fprintf(stderr, "[INPUT] pad %d: %s (%s layout)\n", i + 1,
+                        SDL_GameControllerName(g_pads[i]),
+                        pad_positional() ? "position" : "label");
+        if (!g_pads[0])
+            fprintf(stderr, "[INPUT] no game controller (%d joysticks)\n",
+                    SDL_NumJoysticks());
+    }
 }
 
 #if defined(__SWITCH__)
@@ -316,9 +367,18 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     }
 #endif
 
+    /* Nothing else in the runtime calls xbox_InputInit on POSIX: the first
+     * read (the USB pad thread) does. */
+    if (!s_input_ready)
+        xbox_InputInit();
     SDL_GameController *c = g_pads[dwPort];
     if (!c || !SDL_GameControllerGetAttached(c)) {
         g_controller_connected[dwPort] = FALSE;
+        /* No pad: the keyboard stands in for player 1 (as on Windows). */
+        if (dwPort == 0 && keyboard_enabled()) {
+            keyboard_state(pState);
+            return ERROR_SUCCESS;
+        }
         return ERROR_DEVICE_NOT_CONNECTED;
     }
 
@@ -339,14 +399,18 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_RIGHTSTICK)) btn |= XBOX_GAMEPAD_RIGHT_THUMB;
     pState->Gamepad.wButtons = btn;
 
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] =
-        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_A) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] =
-        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_B) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X] =
-        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_X) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
-        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_Y) ? 255 : 0;
+    {
+        /* By label, or (RECOMP_PAD_LAYOUT=position) A<->B, X<->Y. */
+        int pos = pad_positional();
+        SDL_GameControllerButton ba = pos ? SDL_CONTROLLER_BUTTON_B : SDL_CONTROLLER_BUTTON_A;
+        SDL_GameControllerButton bb = pos ? SDL_CONTROLLER_BUTTON_A : SDL_CONTROLLER_BUTTON_B;
+        SDL_GameControllerButton bx = pos ? SDL_CONTROLLER_BUTTON_Y : SDL_CONTROLLER_BUTTON_X;
+        SDL_GameControllerButton by = pos ? SDL_CONTROLLER_BUTTON_X : SDL_CONTROLLER_BUTTON_Y;
+        pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = SDL_GameControllerGetButton(c, ba) ? 255 : 0;
+        pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] = SDL_GameControllerGetButton(c, bb) ? 255 : 0;
+        pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X] = SDL_GameControllerGetButton(c, bx) ? 255 : 0;
+        pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] = SDL_GameControllerGetButton(c, by) ? 255 : 0;
+    }
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
         SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] =
@@ -367,6 +431,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbRY =
         (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
 
+    if (dwPort == 0 && keyboard_enabled())
+        keyboard_merge(pState);
     return ERROR_SUCCESS;
 }
 

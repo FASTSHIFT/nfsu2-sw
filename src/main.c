@@ -312,6 +312,12 @@ static int game_main(void)
     setenv("RECOMP_AC97_READY", "plain", 0);
     setenv("RECOMP_USB", "1", 0);       /* the pad is on the MCPX's OHCI */
     setenv("RECOMP_PB_EXEC", "1", 0);   /* the title draws through NV2A */
+#  if !defined(__SWITCH__)
+    /* Keyboard as player 1 (W/S throttle/brake, A/D steer, Enter, Esc...;
+     * src/input/xinput_device.c). It only adds to a real pad, so it is safe
+     * on by default; RECOMP_KEYBOARD=0 turns it off. */
+    setenv("RECOMP_KEYBOARD", "1", 0);
+#  endif
 #endif
 #if defined(__SWITCH__)
     /* Every periodic log line flushes to the SD card; keep the log to what

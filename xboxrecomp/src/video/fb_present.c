@@ -373,6 +373,22 @@ void xbox_FramebufferWindowStart(void)
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
-int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
-void xbox_FramebufferKeySet(int vk, int down) { (void)vk; (void)down; }
+
+/* No GDI window here, but the GL renderer's SDL window records keys the same
+ * way (nv2a_gl.c gl_key), for the keyboard pad in src/input -- the same
+ * table, read and written one byte at a time, as on Windows. */
+static volatile unsigned char s_key_down[256];
+
+int xbox_FramebufferKeyDown(int vk)
+{
+    if ((unsigned)vk > 255)
+        return 0;
+    return s_key_down[vk] != 0;
+}
+
+void xbox_FramebufferKeySet(int vk, int down)
+{
+    if ((unsigned)vk <= 255)
+        s_key_down[vk] = down ? 1 : 0;
+}
 #endif
