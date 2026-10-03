@@ -610,7 +610,8 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
             f = fopen(path, "ab");
             if (f)
                 fclose(f);
-#if defined(__SWITCH__)
+#if defined(__SWITCH__) || defined(XBOXRECOMP_EMBEDDED)
+            /* Also the ARM handhelds: their games live on an exFAT card. */
             continue;       /* exists; its size is reported from the table */
 #endif
             if (truncate(path, (off_t)(s_part_sectors[i] * 512ull)) != 0)

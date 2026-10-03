@@ -1,5 +1,6 @@
 # Build artifacts
 build/
+build-r36s/
 out/
 bin/
 *.obj

@@ -16,6 +16,30 @@ project(xboxrecomp VERSION 0.9.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# Linux ARM handhelds (PortMaster): no HLE D3D8 renderer (no libepoxy), no
+# OpenSSL (nothing calls it), the GL renderer on an OpenGL ES 3 context.
+option(XBOXRECOMP_EMBEDDED "Linux ARM handheld build (GLES, minimal deps)" OFF)
+if(XBOXRECOMP_EMBEDDED)
+    set(XBOXRECOMP_GL_ES ON CACHE BOOL "" FORCE)
+    # Seen by the runtime (kernel_path.c: no sparse partition images, which
+    # exFAT cannot hold) and by the game sources.
+    add_compile_definitions(XBOXRECOMP_EMBEDDED=1)
+endif()
+
+# SDL2 before 2.0.12 (Ubuntu 20.04, the PortMaster builder's base) ships an
+# sdl2-config.cmake without the SDL2::SDL2 target the subdirectories link.
+# Make it from pkg-config once, here, so every find_package(SDL2) after this
+# sees it.
+if(NOT WIN32 AND NOT NINTENDO_SWITCH)
+    find_package(SDL2 QUIET)
+    if(NOT TARGET SDL2::SDL2)
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(SDL2PC REQUIRED IMPORTED_TARGET GLOBAL sdl2)
+        add_library(SDL2::SDL2 ALIAS PkgConfig::SDL2PC)
+        message(STATUS "SDL2::SDL2 from pkg-config (SDL ${SDL2PC_VERSION})")
+    endif()
+endif()
+
 # Common definitions for all targets
 add_compile_definitions(
     WIN32_LEAN_AND_MEAN

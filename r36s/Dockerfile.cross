@@ -1,0 +1,40 @@
+# NFSU2 (Xbox recomp) cross build image for R36S / dArkOS: an x86_64 Ubuntu
+# 20.04 with focal's aarch64 cross gcc (9.x, the same compiler version as the
+# arm64 image) and glibc 2.31 target libraries, so the output matches what
+# r36s/Dockerfile builds under qemu -- but the compiler runs natively (several
+# times faster on the ~130 MB of lifted C).
+#
+# Target libraries come from arm64 multiarch (ubuntu-ports): only the SDL2
+# runtime is installed through apt (its -dev package's dependency tree is not
+# co-installable with amd64); the -dev package itself is unpacked on top for
+# the headers, libSDL2.so and sdl2.pc. Nothing else is linked (GL is loaded by
+# SDL at run time; FFmpeg is a static VP6-only build).
+#
+#   docker build -t nfsu2-r36s-cross:focal -f r36s/Dockerfile.cross r36s
+ARG BASE=docker.m.daocloud.io/library/ubuntu:20.04
+FROM ${BASE}
+ARG APT_MIRROR=http://mirrors.aliyun.com/ubuntu
+ARG PORTS_MIRROR=http://mirrors.aliyun.com/ubuntu-ports
+ARG PIP_INDEX=https://mirrors.aliyun.com/pypi/simple/
+ENV DEBIAN_FRONTEND=noninteractive
+RUN sed -i -e "s|http://archive.ubuntu.com/ubuntu|${APT_MIRROR}|g" \
+           -e "s|http://security.ubuntu.com/ubuntu|${APT_MIRROR}|g" \
+           -e "s|^deb http|deb [arch=amd64] http|" /etc/apt/sources.list \
+ && for s in focal focal-updates focal-security; do \
+        echo "deb [arch=arm64] ${PORTS_MIRROR} $s main restricted universe multiverse" \
+            >> /etc/apt/sources.list; done \
+ && dpkg --add-architecture arm64 \
+ && apt-get update && apt-get install -y --no-install-recommends \
+        gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu \
+        ninja-build ccache pkg-config file make nasm ca-certificates \
+        python3 python3-pip \
+        libsdl2-2.0-0:arm64 \
+ && cd /tmp && apt-get download libsdl2-dev:arm64 \
+ && dpkg-deb -x libsdl2-dev_*_arm64.deb / && rm -f /tmp/*.deb \
+ && rm -rf /var/lib/apt/lists/* \
+ && pip3 install --no-cache-dir -i ${PIP_INDEX} "cmake==3.27.9"
+# SDL_config.h includes <SDL2/_real_SDL_config.h> from the multiarch include
+# dir, which the cross gcc does not search: put it where it does.
+RUN mkdir -p /usr/aarch64-linux-gnu/include/SDL2 \
+ && ln -s /usr/include/aarch64-linux-gnu/SDL2/_real_SDL_config.h \
+          /usr/aarch64-linux-gnu/include/SDL2/_real_SDL_config.h

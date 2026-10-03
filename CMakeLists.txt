@@ -98,7 +98,7 @@ else()
     # The generated chunks are huge straight-line functions; -O1 keeps GCC's
     # memory and time per chunk sane while still allocating registers. The
     # Switch's CPU is the bottleneck there, so it gets -O2.
-    if(NINTENDO_SWITCH)
+    if(NINTENDO_SWITCH OR XBOXRECOMP_EMBEDDED)
         set(NFSU2_GEN_OPT "-O2" CACHE STRING "Optimisation for the lifted code")
     else()
         set(NFSU2_GEN_OPT "-O1" CACHE STRING "Optimisation for the lifted code")

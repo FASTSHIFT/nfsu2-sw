@@ -17,9 +17,9 @@ if(WIN32)
     # Offline smoke test for the pure format layer (no D3D11 device needed).
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke
                      ${CMAKE_CURRENT_BINARY_DIR}/d3d8_smoke)
-elseif(NINTENDO_SWITCH)
-    # No HLE D3D8 renderer on the Switch: titles there draw through the NV2A
-    # executor and src/nv2a_gl.
+elseif(NINTENDO_SWITCH OR XBOXRECOMP_EMBEDDED)
+    # No HLE D3D8 renderer on the Switch / ARM handhelds: titles there draw
+    # through the NV2A executor and src/nv2a_gl (no libepoxy needed).
     add_library(xbox_d3d8 STATIC d3d8_null.c)
     target_link_libraries(xbox_d3d8 PUBLIC platform)
 else()
