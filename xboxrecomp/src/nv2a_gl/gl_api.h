@@ -117,7 +117,6 @@ typedef ptrdiff_t     GLintptr;
     X(void, glScissor, (GLint, GLint, GLsizei, GLsizei)) \
     X(void, glClearColor, (GLfloat, GLfloat, GLfloat, GLfloat)) \
     X(void, glGetIntegerv, (GLenum, GLint *)) \
-    X(void, glClearDepth, (GLdouble)) \
     X(void, glClearStencil, (GLint)) \
     X(void, glClear, (GLbitfield)) \
     X(void, glEnable, (GLenum)) \
@@ -127,7 +126,6 @@ typedef ptrdiff_t     GLintptr;
     X(void, glBlendColor, (GLfloat, GLfloat, GLfloat, GLfloat)) \
     X(void, glDepthFunc, (GLenum)) \
     X(void, glDepthMask, (GLboolean)) \
-    X(void, glDepthRange, (GLdouble, GLdouble)) \
     X(void, glColorMask, (GLboolean, GLboolean, GLboolean, GLboolean)) \
     X(void, glStencilFunc, (GLenum, GLint, GLuint)) \
     X(void, glStencilOp, (GLenum, GLenum, GLenum)) \
@@ -200,6 +198,28 @@ NV2A_GL_FUNCS(NV2A_GL_DECLARE)
  * (0 on success); `getproc` is SDL_GL_GetProcAddress or equivalent. */
 int nv2a_gl_load(void *(*getproc)(const char *name));
 
+/* OpenGL ES 3.x instead of desktop GL 3.3 core (set before nv2a_gl_load).
+ * ES has no double-precision depth clear, only glClearDepthf; the call
+ * below picks whichever the context has. */
+extern int nv2a_gl_api_es;
+typedef void (GLAPIENTRY *PFN_glClearDepth)(GLdouble);
+typedef void (GLAPIENTRY *PFN_glClearDepthf)(GLfloat);
+extern PFN_glClearDepth  p_glClearDepth;
+extern PFN_glClearDepthf p_glClearDepthf;
+static inline void nv2a_glClearDepth(double d)
+{
+    if (nv2a_gl_api_es)
+        p_glClearDepthf((GLfloat)d);
+    else
+        p_glClearDepth(d);
+}
+
+#define GL_EXTENSIONS                     0x1F03
+#define GL_TEXTURE_SWIZZLE_R              0x8E42
+#define GL_TEXTURE_SWIZZLE_B              0x8E44
+#define GL_RED                            0x1903
+#define GL_BLUE                           0x1905
+
 /* The renderer calls through these names. */
 #define glGetString              p_glGetString
 #define glGetError               p_glGetError
@@ -207,7 +227,7 @@ int nv2a_gl_load(void *(*getproc)(const char *name));
 #define glScissor                p_glScissor
 #define glClearColor             p_glClearColor
 #define glGetIntegerv            p_glGetIntegerv
-#define glClearDepth             p_glClearDepth
+#define glClearDepth             nv2a_glClearDepth
 #define glClearStencil           p_glClearStencil
 #define glClear                  p_glClear
 #define glEnable                 p_glEnable
@@ -217,7 +237,6 @@ int nv2a_gl_load(void *(*getproc)(const char *name));
 #define glBlendColor             p_glBlendColor
 #define glDepthFunc              p_glDepthFunc
 #define glDepthMask              p_glDepthMask
-#define glDepthRange             p_glDepthRange
 #define glColorMask              p_glColorMask
 #define glStencilFunc            p_glStencilFunc
 #define glStencilOp              p_glStencilOp

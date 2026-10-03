@@ -178,6 +178,20 @@ static void bind_tex(GLuint tex)
     }
 }
 
+/* Guest texels are 0xAARRGGBB words: B, G, R, A in memory, which desktop GL
+ * takes as GL_BGRA. ES 3.0 has no BGRA upload; the bytes go up as RGBA and
+ * the texture's swizzle swaps red and blue back when it is sampled -- no CPU
+ * pass, and the movie path still uploads straight from guest memory. */
+#define TEX_FMT (nv2a_gl_api_es ? GL_RGBA : GL_BGRA)
+static int s_es_border, s_es_s3tc;      /* ES driver features (ready) */
+static void tex_bgra_swizzle(void)
+{
+    if (nv2a_gl_api_es) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
+    }
+}
+
 /* ── Surfaces ──────────────────────────────────────────────────────── */
 
 /* w, h are the surface in the title's pixels (anti-aliasing included) --
@@ -276,7 +290,7 @@ static GlSurf *surf_get(uint32_t va, uint32_t w, uint32_t h,
     tex_param_forget(s->tex);
     glBindTexture(GL_TEXTURE_2D, s->tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)s->pw, (GLsizei)s->ph, 0,
-                 GL_BGRA, GL_UNSIGNED_BYTE, NULL);
+                 GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glGenRenderbuffers(1, &s->ds);
@@ -605,7 +619,7 @@ static GLuint tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h,
         bind_tex(t->tex);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(pitch / 4));
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)w, (GLsizei)h, GL_BGRA,
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)w, (GLsizei)h, TEX_FMT,
                         GL_UNSIGNED_BYTE, (const uint8_t *)xbox_GetMemoryOffset() + va);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
         gl_step_done("texture upload");
@@ -622,8 +636,9 @@ static GLuint tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h,
         bind_tex(t->tex);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(pitch / 4));
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0, GL_BGRA,
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0, TEX_FMT,
                      GL_UNSIGNED_BYTE, (const uint8_t *)xbox_GetMemoryOffset() + va);
+        tex_bgra_swizzle();
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
         tex_account(t, w * h * 4);
         return t->tex;
@@ -637,7 +652,7 @@ static GLuint tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h,
         static int s3tc = -1;
         if (s3tc < 0) {
             const char *e = getenv("RECOMP_GL_DXT");
-            s3tc = !(e && *e == '0');
+            s3tc = !(e && *e == '0') && (!nv2a_gl_api_es || s_es_s3tc);
         }
         if (s3tc) {
             GLenum fmt = color == 0x0C ? GL_COMPRESSED_RGBA_S3TC_DXT1_EXT
@@ -676,19 +691,22 @@ static GLuint tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h,
             for (x = 0; x < w; x++)
                 s_decode[(size_t)y * w + x] = src[swizzle_index(x, y, w, h)] | fill;
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0,
-                     GL_BGRA, GL_UNSIGNED_BYTE, s_decode);
+                     TEX_FMT, GL_UNSIGNED_BYTE, s_decode);
+        tex_bgra_swizzle();
         tex_account(t, w * h * 4);
         gl_step_done("texture upload");
     } else if (s_decode && (color == 0x0B ? decode_indexed(va, w, h, s_decode)
                                     : nv2a_backend_decode_texture(&nt, s_decode))) {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0,
-                     GL_BGRA, GL_UNSIGNED_BYTE, s_decode);
+                     TEX_FMT, GL_UNSIGNED_BYTE, s_decode);
+        tex_bgra_swizzle();
         tex_account(t, w * h * 4);
         gl_step_done("texture upload");
     } else {
         static const uint32_t magenta = 0xFFFF00FFu;
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_BGRA,
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, TEX_FMT,
                      GL_UNSIGNED_BYTE, &magenta);
+        tex_bgra_swizzle();
         tex_account(t, 4);
         if (s_trace)
             fprintf(stderr, "  [GL] texture 0x%08X format 0x%02X not decodable\n",
@@ -702,7 +720,7 @@ static GLint wrap_mode(uint32_t m)
     switch (m) {
     case 2:  return GL_MIRRORED_REPEAT;
     case 3:  return GL_CLAMP_TO_EDGE;
-    case 4:  return GL_CLAMP_TO_BORDER;
+    case 4:  return nv2a_gl_api_es && !s_es_border ? GL_CLAMP_TO_EDGE : GL_CLAMP_TO_BORDER;
     case 5:  return GL_CLAMP_TO_EDGE;
     default: return GL_REPEAT;
     }
@@ -781,7 +799,7 @@ typedef struct {
     uint64_t   vkey;            /* 0: fixed-function; else program hash */
     Nv2aPshKey pkey;
     GLuint     prog;
-    GLint      u_c, u_surf, u_aa, u_m, u_vpoff, u_xform;
+    GLint      u_c, u_surf, u_aa, u_m, u_vpoff, u_xform, u_bgra;
     GLint      u_t[4], u_tscale, u_c0, u_c1, u_fc0, u_fc1, u_fogcolor, u_afunc, u_aref;
     uint32_t   used;
     int        vpc_valid;       /* vpc holds what this program's "c" was given */
@@ -794,7 +812,7 @@ typedef struct {
     struct GlUni {
         float surf[4], aa[2], m[16], vpoff[4], tscale[4][2];
         float c0[8][4], c1[8][4], fog[4], fc[2][4], aref;
-        int   xform, afunc;
+        int   xform, afunc, bgra;
     } uni;
 } GlProg;
 
@@ -1019,6 +1037,7 @@ static GlProg *prog_get(const Nv2aRawBatch *b, const Nv2aPshKey *pk)
     } else {
         vs[nvs++] = nv2a_gl_vsh_fixed();
     }
+    vs[nvs++] = nv2a_gl_vsh_epilogue();
     if (nv2a_gl_psh(pk, fsrc, sizeof fsrc) < 0)
         return NULL;
     v = compile(GL_VERTEX_SHADER, vs, nvs);
@@ -1060,6 +1079,7 @@ static GlProg *prog_get(const Nv2aRawBatch *b, const Nv2aPshKey *pk)
     p->u_m = glGetUniformLocation(p->prog, "u_m");
     p->u_vpoff = glGetUniformLocation(p->prog, "u_vpoff");
     p->u_xform = glGetUniformLocation(p->prog, "u_xform");
+    p->u_bgra = glGetUniformLocation(p->prog, "u_bgra");
     p->u_tscale = glGetUniformLocation(p->prog, "u_tscale");
     p->u_c0 = glGetUniformLocation(p->prog, "u_c0");
     p->u_c1 = glGetUniformLocation(p->prog, "u_c1");
@@ -1092,6 +1112,18 @@ static int ready(void)
         return s_state > 0;
     s_state = -1;
     s_trace = getenv("RECOMP_GL_TRACE") != NULL;
+    {
+        /* RECOMP_GL_ES=1: an OpenGL ES 3.x context (GLSL ES 3.00 shaders),
+         * for GPUs with no desktop GL (Mali on ARM handhelds). The build
+         * default is NV2A_GL_ES_DEFAULT. */
+        const char *e = getenv("RECOMP_GL_ES");
+#ifdef NV2A_GL_ES_DEFAULT
+        nv2a_gl_api_es = !(e && e[0] == '0');
+#else
+        nv2a_gl_api_es = e && e[0] == '1';
+#endif
+        nv2a_shader_es = nv2a_gl_api_es;
+    }
     if (nv2a_gl_adopt_window((void **)&s_win, (void **)&s_ctx)) {
         /* The host already made the window and context (a loading screen)
          * and has let go of the context: take it on this thread. */
@@ -1104,9 +1136,15 @@ static int ready(void)
             fprintf(stderr, "  [GL] SDL video: %s\n", SDL_GetError());
             return 0;
         }
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+        if (nv2a_gl_api_es) {
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+        } else {
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+        }
         SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
         s_win = SDL_CreateWindow("NV2A", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                  1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
@@ -1125,6 +1163,22 @@ static int ready(void)
         return 0;
     fprintf(stderr, "  [GL] %s / %s / %s\n", (const char *)glGetString(GL_VENDOR),
             (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));
+    if (nv2a_gl_api_es) {
+        /* What ES lacks of desktop GL 3.3, per driver: clamp-to-border
+         * (core in 3.2, else an extension) and S3TC. */
+        const char *ver = (const char *)glGetString(GL_VERSION);
+        const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+        int maj = 0, min = 0;
+        if (ver)
+            sscanf(ver, "OpenGL ES %d.%d", &maj, &min);
+        s_es_border = (maj > 3 || (maj == 3 && min >= 2))
+                   || (ext && (strstr(ext, "_texture_border_clamp") != NULL));
+        s_es_s3tc = ext && (strstr(ext, "GL_EXT_texture_compression_s3tc") != NULL
+                            || strstr(ext, "GL_EXT_texture_compression_dxt1") != NULL);
+        fprintf(stderr, "  [GL] OpenGL ES %d.%d: clamp-to-border %s, S3TC %s\n", maj, min,
+                s_es_border ? "yes" : "no (edge clamp instead)",
+                s_es_s3tc ? "yes" : "no (DXT decoded on the CPU)");
+    }
     {
         const char *e = getenv("RECOMP_GL_SCALE");
         GLint mt = 0, mr = 0;
@@ -1291,7 +1345,9 @@ static void apply_state(const uint32_t *r, int has_depth)
      * depth. GL clips there, so a screen quad placed at the far plane
      * (NFSU2's loading screen, z = 1.0 through its vertex program) vanished
      * whenever rounding put it a hair beyond. */
-    glEnable(0x864F);                               /* GL_DEPTH_CLAMP */
+    /* ES has no depth clamp; nv2a_clip clamps z in the vertex shader too. */
+    if (!nv2a_gl_api_es)
+        glEnable(0x864F);                           /* GL_DEPTH_CLAMP */
 }
 
 static void psh_key(const uint32_t *r, Nv2aPshKey *k)
@@ -1428,6 +1484,16 @@ static void attr_enable(uint32_t a, int on)
 /* The byte ranges the direct attributes of `b` span, merged where they
  * overlap (interleaved attributes share one), each from a 4-aligned start;
  * of_run[a] says which range attribute a is in. Returns the range count. */
+/* Attributes uploaded as stored D3DCOLOR bytes (B, G, R, A in memory). */
+static uint32_t bgra_attrs(const Nv2aRawBatch *b)
+{
+    uint32_t m = 0, a;
+    for (a = 0; a < NV2A_RAW_ATTRS; a++)
+        if ((b->attr_direct & b->attr_present & (1u << a)) && b->direct[a].type == 0)
+            m |= 1u << a;
+    return m;
+}
+
 typedef struct { const uint8_t *lo, *hi; GLintptr at; } VRun;
 static uint32_t vertex_runs(const Nv2aRawBatch *b, VRun *run, int *of_run)
 {
@@ -1550,7 +1616,10 @@ static int upload_vertices(const Nv2aRawBatch *b)
         off = at + run[of_run[a]].at + (b->direct[a].ptr - run[of_run[a]].lo);
         size = (GLint)b->direct[a].size;
         switch (b->direct[a].type) {
-        case 0:  size = GL_BGRA; type = GL_UNSIGNED_BYTE; norm = GL_TRUE; break;
+        /* D3DCOLOR. ES has no GL_BGRA size: read as RGBA, and the vertex
+         * shader swaps it back (u_bgra, bgra_attrs). */
+        case 0:  size = nv2a_gl_api_es ? 4 : GL_BGRA;
+                 type = GL_UNSIGNED_BYTE; norm = GL_TRUE; break;
         case 1:  type = GL_SHORT; norm = GL_TRUE; break;
         case 2:  type = GL_FLOAT; norm = GL_FALSE; break;
         case 4:  type = GL_UNSIGNED_BYTE; norm = GL_TRUE; break;
@@ -1694,6 +1763,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
         u.aref = (float)(r[0x340 / 4] & 0xFF);
         u.xform = b->xform == 1 ? 1 : 0;
         u.afunc = r[0x300 / 4] ? (GLint)r[0x33C / 4] : 0x207;
+        u.bgra = nv2a_gl_api_es ? (int)bgra_attrs(b) : 0;
         if (!p->uni_valid || memcmp(&u, &p->uni, sizeof u) != 0) {
             p->uni = u;
             p->uni_valid = 1;
@@ -1702,6 +1772,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
             if (p->u_m >= 0) glUniform4fv(p->u_m, 4, u.m);
             if (p->u_vpoff >= 0) glUniform4fv(p->u_vpoff, 1, u.vpoff);
             if (p->u_xform >= 0) glUniform1i(p->u_xform, u.xform);
+            if (p->u_bgra >= 0) glUniform1i(p->u_bgra, u.bgra);
             if (p->u_tscale >= 0) glUniform2fv(p->u_tscale, 4, &u.tscale[0][0]);
             if (p->u_c0 >= 0) glUniform4fv(p->u_c0, 8, &u.c0[0][0]);
             if (p->u_c1 >= 0) glUniform4fv(p->u_c1, 8, &u.c1[0][0]);
@@ -2076,8 +2147,14 @@ static void gl_flip(void)
             char path[320];
             glBindFramebuffer(GL_READ_FRAMEBUFFER, s->fbo);
             glPixelStorei(GL_PACK_ALIGNMENT, 4);
-            glReadPixels(0, 0, (GLsizei)s->pw, (GLsizei)s->ph, GL_BGRA,
-                         GL_UNSIGNED_BYTE, pix);
+            glReadPixels(0, 0, (GLsizei)s->pw, (GLsizei)s->ph,
+                         nv2a_gl_api_es ? GL_RGBA : GL_BGRA, GL_UNSIGNED_BYTE, pix);
+            if (nv2a_gl_api_es) {               /* ES reads RGBA only */
+                size_t k;
+                for (k = 0; k < need; k += 4) {
+                    uint8_t t = pix[k]; pix[k] = pix[k + 2]; pix[k + 2] = t;
+                }
+            }
             snprintf(path, sizeof path, "%s%05u.bmp", dump_prefix, s_frame);
             dump_bmp(path, pix, s->pw, s->ph);
         }

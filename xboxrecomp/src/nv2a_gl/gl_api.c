@@ -7,6 +7,10 @@
 NV2A_GL_FUNCS(NV2A_GL_DEFINE)
 #undef NV2A_GL_DEFINE
 
+int nv2a_gl_api_es;
+PFN_glClearDepth  p_glClearDepth;
+PFN_glClearDepthf p_glClearDepthf;
+
 int nv2a_gl_load(void *(*getproc)(const char *name))
 {
     int missing = 0;
@@ -19,5 +23,20 @@ int nv2a_gl_load(void *(*getproc)(const char *name))
     }
     NV2A_GL_FUNCS(NV2A_GL_RESOLVE)
 #undef NV2A_GL_RESOLVE
+
+    /* The one call whose signature differs between desktop GL and ES. */
+    if (nv2a_gl_api_es) {
+        p_glClearDepthf = (PFN_glClearDepthf)getproc("glClearDepthf");
+        if (!p_glClearDepthf) {
+            fprintf(stderr, "  [GL] missing entry point glClearDepthf\n");
+            missing++;
+        }
+    } else {
+        p_glClearDepth = (PFN_glClearDepth)getproc("glClearDepth");
+        if (!p_glClearDepth) {
+            fprintf(stderr, "  [GL] missing entry point glClearDepth\n");
+            missing++;
+        }
+    }
     return missing;
 }

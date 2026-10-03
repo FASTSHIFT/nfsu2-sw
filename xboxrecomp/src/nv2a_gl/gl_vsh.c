@@ -292,11 +292,87 @@ static const char s_vk_prelude[] =
     "}\n";
 
 int nv2a_shader_vk;
+int nv2a_shader_es;
+
+/* OpenGL ES 3.00: no BGRA vertex format, so D3DCOLOR attributes arrive as
+ * (B, G, R, A) and are put right here, per attribute, by the u_bgra mask.
+ * Inputs cannot be assigned, so they are i_vN and the program reads copies
+ * vN; the title-facing main() is renamed and the epilogue's main fills the
+ * copies first. Everything after the inputs is the desktop prelude. */
+static const char s_es_head[] =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "precision highp int;\n"
+    "layout(location = 0) in vec4 i_v0;\n"
+    "layout(location = 1) in vec4 i_v1;\n"
+    "layout(location = 2) in vec4 i_v2;\n"
+    "layout(location = 3) in vec4 i_v3;\n"
+    "layout(location = 4) in vec4 i_v4;\n"
+    "layout(location = 5) in vec4 i_v5;\n"
+    "layout(location = 6) in vec4 i_v6;\n"
+    "layout(location = 7) in vec4 i_v7;\n"
+    "layout(location = 8) in vec4 i_v8;\n"
+    "layout(location = 9) in vec4 i_v9;\n"
+    "layout(location = 10) in vec4 i_v10;\n"
+    "layout(location = 11) in vec4 i_v11;\n"
+    "layout(location = 12) in vec4 i_v12;\n"
+    "layout(location = 13) in vec4 i_v13;\n"
+    "layout(location = 14) in vec4 i_v14;\n"
+    "layout(location = 15) in vec4 i_v15;\n"
+    "vec4 v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15;\n"
+    "uniform int u_bgra;       /* bit a: attribute a is D3DCOLOR, stored B,G,R,A */\n";
+
+static const char *es_tail(void)
+{
+    static char tail[2048];
+    if (!tail[0]) {
+        size_t n = 0;
+        int a;
+        n += (size_t)snprintf(tail + n, sizeof tail - n, "void main() {\n");
+        for (a = 0; a < 16; a++)
+            n += (size_t)snprintf(tail + n, sizeof tail - n,
+                                  "    v%d = (u_bgra & %d) != 0 ? i_v%d.zyxw : i_v%d;\n",
+                                  a, 1 << a, a, a);
+        snprintf(tail + n, sizeof tail - n, "    nv2a_user_main();\n}\n");
+    }
+    return tail;
+}
+
+/* On ES the title-facing main() is nv2a_user_main(); es_tail's main calls it. */
+static const char *es_rename_main(const char *src, char *buf, size_t cap)
+{
+    const char *m = strstr(src, "void main()");
+    if (!m)
+        return src;
+    snprintf(buf, cap, "%.*svoid nv2a_user_main()%s", (int)(m - src), src,
+             m + sizeof "void main()" - 1);
+    return buf;
+}
+
+static const char *gl_prelude(void);
 
 const char *nv2a_gl_vsh_prelude(void)
 {
+    static char es[8192];
     if (nv2a_shader_vk)
         return s_vk_prelude;
+    if (!nv2a_shader_es)
+        return gl_prelude();
+    if (!es[0]) {
+        /* The desktop prelude minus its version line and inputs. */
+        const char *body = strstr(gl_prelude(), "uniform vec4 c[192];");
+        snprintf(es, sizeof es, "%s%s", s_es_head, body ? body : "");
+    }
+    return es;
+}
+
+const char *nv2a_gl_vsh_epilogue(void)
+{
+    return nv2a_shader_es && !nv2a_shader_vk ? es_tail() : "";
+}
+
+static const char *gl_prelude(void)
+{
     return
         "#version 330 core\n"
         "layout(location = 0) in vec4 v0;\n"
@@ -352,7 +428,17 @@ const char *nv2a_gl_vsh_prelude(void)
         "}\n";
 }
 
+static const char *main_program(void);
+
 const char *nv2a_gl_vsh_main_program(void)
+{
+    static char es[2048];
+    if (nv2a_shader_es && !nv2a_shader_vk)
+        return es[0] ? es : es_rename_main(main_program(), es, sizeof es);
+    return main_program();
+}
+
+static const char *main_program(void)
 {
     return
         "void main() {\n"
@@ -390,5 +476,10 @@ const char *nv2a_gl_vsh_fixed(void)
         "    vD0 = clamp(v3, 0.0, 1.0); vD1 = clamp(v4, 0.0, 1.0);\n"
         "    vT0 = v9; vT1 = v10; vT2 = v11; vT3 = v12; vFog = 0.0;\n"
         "}\n";
-    return nv2a_shader_vk ? body + sizeof decl - 1 : body;
+    static char es[2048];
+    if (nv2a_shader_vk)
+        return body + sizeof decl - 1;
+    if (nv2a_shader_es)
+        return es[0] ? es : es_rename_main(body, es, sizeof es);
+    return body;
 }

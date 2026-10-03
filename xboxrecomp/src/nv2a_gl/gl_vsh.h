@@ -12,9 +12,14 @@ int nv2a_gl_vsh_program(const uint32_t (*prog)[4], uint32_t slots,
 
 /* Nonzero: emit Vulkan GLSL (nv2a_vk). Set once, before the first shader. */
 extern int nv2a_shader_vk;
+/* Nonzero: emit GLSL ES 3.00 (the GL renderer on an OpenGL ES context). */
+extern int nv2a_shader_es;
 
 /* Declarations and helpers every vertex shader starts with. */
 const char *nv2a_gl_vsh_prelude(void);
+/* Follows main(): "" on desktop GL; on ES the real main, which fixes up the
+ * inputs (BGRA colours) and calls the renamed one. */
+const char *nv2a_gl_vsh_epilogue(void);
 /* main() for a vertex-program shader (follows the program body). */
 const char *nv2a_gl_vsh_main_program(void);
 /* main() for fixed-function / pre-transformed batches (no program body). */
