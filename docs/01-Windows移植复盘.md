@@ -1,4 +1,4 @@
-# NFS Underground 2 (Xbox) 静态重编译 —— Windows 移植复盘
+# 01 - NFSU2（Xbox 静态重编译）Windows 移植复盘
 
 > 本文记录把 2004 年 EA 的《极品飞车：地下狂飙 2》(Xbox NTSC-U, title_id `0x4541005A`)
 > 通过 **xboxrecomp** 静态重编译到现代主机、并在 **Windows 上完整跑起来（画面 + BGM + 键盘操作 + 存档）**
