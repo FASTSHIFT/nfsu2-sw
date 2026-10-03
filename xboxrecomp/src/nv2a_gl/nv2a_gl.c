@@ -192,6 +192,21 @@ static void tex_bgra_swizzle(void)
     }
 }
 
+/* The GL_FRAMEBUFFER binding and viewport as last set by surf_bind, so it can
+ * skip calls that change nothing. Anything else that binds a framebuffer
+ * (present, read-backs, surface creation) calls fbo_forget(). */
+static GLuint s_bound_fbo = (GLuint)-1;
+static GLsizei s_vp_w = -1, s_vp_h = -1;
+static void fbo_forget(void) { s_bound_fbo = (GLuint)-1; s_vp_w = s_vp_h = -1; }
+static void viewport_set(GLsizei w, GLsizei h)
+{
+    if (w != s_vp_w || h != s_vp_h) {
+        glViewport(0, 0, w, h);
+        s_vp_w = w;
+        s_vp_h = h;
+    }
+}
+
 /* ── Surfaces ──────────────────────────────────────────────────────── */
 
 /* w, h are the surface in the title's pixels (anti-aliasing included) --
@@ -298,6 +313,7 @@ static GlSurf *surf_get(uint32_t va, uint32_t w, uint32_t h,
     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, (GLsizei)s->pw, (GLsizei)s->ph);
     glGenFramebuffers(1, &s->fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, s->fbo);
+    fbo_forget();
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s->tex, 0);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
                               GL_RENDERBUFFER, s->ds);
@@ -367,7 +383,13 @@ static GlSurf *surf_bind(const Nv2aSurface *sf, uint32_t zeta_va)
         return NULL;
     s = surf_get(sf->color_va, w, h, sf->aa_sx ? sf->aa_sx : 1,
                  sf->aa_sy ? sf->aa_sy : 1);
-    glBindFramebuffer(GL_FRAMEBUFFER, s->fbo);
+    /* Every draw comes through here; on the Mali blob a bind or viewport
+     * that changes nothing still costs a driver call (13 % of the GL
+     * thread's time in the blob, R36S race profile). */
+    if (s_bound_fbo != s->fbo) {
+        glBindFramebuffer(GL_FRAMEBUFFER, s->fbo);
+        s_bound_fbo = s->fbo;
+    }
     if (s_shared_z < 0) {
         const char *e = getenv("RECOMP_GL_SHARED_Z");
         s_shared_z = !(e && e[0] == '0');
@@ -387,7 +409,7 @@ static GlSurf *surf_bind(const Nv2aSurface *sf, uint32_t zeta_va)
         state_dirty();
         glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     }
-    glViewport(0, 0, (GLsizei)s->pw, (GLsizei)s->ph);
+    viewport_set((GLsizei)s->pw, (GLsizei)s->ph);
     s_last = s;
     return s;
 }
@@ -1272,7 +1294,10 @@ typedef struct {
 static GlState s_st;
 static int s_st_valid;
 
-static void state_dirty(void) { s_st_valid = 0; tex_bind_forget(); }
+/* Called by clear, flip and everything that leaves GL state unknown; flip
+ * binds the window framebuffer and its own viewport, so the surface binding
+ * goes too. */
+static void state_dirty(void) { s_st_valid = 0; tex_bind_forget(); fbo_forget(); }
 
 static void apply_state(const uint32_t *r, int has_depth)
 {
@@ -1635,6 +1660,158 @@ static int upload_vertices(const Nv2aRawBatch *b)
     return 1;
 }
 
+static int s_q_on;                      /* threaded submission (below) */
+
+/* ── Pass census and pass skipping ───────────────────────────────────
+ *
+ * RECOMP_GL_SURF_STATS=1: every 300 frames, the colour surfaces drawn into
+ * with their size and draw count per frame -- which passes a frame is made
+ * of (NFSU2's races: the back buffer, the road reflection, the car
+ * environment maps, rain-drop copies, post-processing targets).
+ *
+ * RECOMP_GL_SKIP=<WxH>[,<WxH>...]: drop draws into surfaces of these sizes
+ * (title pixels, before RECOMP_GL_SCALE). Their clears still happen, so a
+ * skipped reflection reads as a cleared surface instead of stale memory. The
+ * GPU is not the limit on the R36S; the driver calls per draw are, and the
+ * reflection passes are hundreds of draws a frame. A "subtraction" switch:
+ * the picture loses those effects, nothing else changes. */
+#define SURF_STATS 16
+static struct { uint32_t va, w, h, draws; } s_ss[SURF_STATS];
+static int s_ss_on = -1;
+#define SKIP_MAX 8
+static uint32_t s_skip_wh[SKIP_MAX];
+static int s_skip_n = -1;
+static uint64_t s_skipped;
+
+static void skip_init(void)
+{
+    const char *e = getenv("RECOMP_GL_SKIP");
+    s_skip_n = 0;
+    while (e && *e && s_skip_n < SKIP_MAX) {
+        char *end;
+        unsigned long w = strtoul(e, &end, 10), h;
+        if (*end != 'x' && *end != 'X')
+            break;
+        h = strtoul(end + 1, &end, 10);
+        if (w && h)
+            s_skip_wh[s_skip_n++] = (uint32_t)(w << 16 | h);
+        e = *end == ',' ? end + 1 : end;
+    }
+    if (s_skip_n) {
+        int i;
+        fprintf(stderr, "  [GL] skipping draws into surfaces of");
+        for (i = 0; i < s_skip_n; i++)
+            fprintf(stderr, " %ux%u", s_skip_wh[i] >> 16, s_skip_wh[i] & 0xFFFF);
+        fprintf(stderr, " (RECOMP_GL_SKIP)\n");
+    }
+}
+
+/* The surface a batch draws into, in title pixels, as surf_bind sizes it. */
+static void batch_surf_size(const Nv2aSurface *sf, uint32_t *w, uint32_t *h)
+{
+    uint32_t bpp = sf->bytes_per_pixel ? sf->bytes_per_pixel : 4;
+    *w = sf->pitch ? sf->pitch / bpp : sf->width;
+    if (*w < sf->width) *w = sf->width;
+    *h = sf->height;
+}
+
+/* Draws so far this frame per surface address that matched a skip size,
+ * and the previous frame's totals. A size alone is ambiguous: NFSU2's road
+ * reflection (hundreds of draws) and its colour-grading / post targets (one
+ * or two full-screen quads each) are all 320x240, and dropping the post
+ * passes left the final combine reading cleared surfaces -- a blue race.
+ * Only surfaces that drew at least RECOMP_GL_SKIP_MIN (default 16) times in
+ * the previous frame are dropped, so scene passes go and post passes stay. */
+#define SKIP_SURF 32
+static struct { uint32_t va, cur, last; } s_skip_surf[SKIP_SURF];
+static uint32_t s_skip_min = 16;
+
+static int pass_skipped(const Nv2aSurface *sf)
+{
+    uint32_t w, h, wh;
+    int i, j;
+    if (s_skip_n < 0) {
+        const char *e = getenv("RECOMP_GL_SKIP_MIN");
+        skip_init();
+        if (e && *e)
+            s_skip_min = (uint32_t)strtoul(e, NULL, 10);
+    }
+    if (!s_skip_n)
+        return 0;
+    batch_surf_size(sf, &w, &h);
+    wh = w << 16 | h;
+    for (i = 0; i < s_skip_n; i++)
+        if (s_skip_wh[i] == wh)
+            break;
+    if (i == s_skip_n)
+        return 0;
+    for (j = 0; j < SKIP_SURF; j++) {
+        if (s_skip_surf[j].va == sf->color_va || !s_skip_surf[j].va) {
+            s_skip_surf[j].va = sf->color_va;
+            s_skip_surf[j].cur++;
+            if (s_skip_surf[j].last < s_skip_min)
+                return 0;                       /* a post pass: keep it */
+            s_skipped++;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Once per presented frame (the executor's flip): this frame's counts become
+ * the reference for the next. */
+static void pass_skip_frame(void)
+{
+    int j;
+    for (j = 0; j < SKIP_SURF && s_skip_surf[j].va; j++) {
+        s_skip_surf[j].last = s_skip_surf[j].cur;
+        s_skip_surf[j].cur = 0;
+    }
+}
+
+static void surf_stats_draw(const Nv2aSurface *sf)
+{
+    uint32_t w, h;
+    int i;
+    if (s_ss_on < 0)
+        s_ss_on = getenv("RECOMP_GL_SURF_STATS") != NULL;
+    if (!s_ss_on)
+        return;
+    batch_surf_size(sf, &w, &h);
+    for (i = 0; i < SURF_STATS; i++) {
+        if (!s_ss[i].draws || (s_ss[i].va == sf->color_va && s_ss[i].w == w && s_ss[i].h == h)) {
+            s_ss[i].va = sf->color_va; s_ss[i].w = w; s_ss[i].h = h;
+            s_ss[i].draws++;
+            return;
+        }
+    }
+}
+
+/* From gl_flip: one report per 300 frames. */
+static void surf_stats_frame(void)
+{
+    static uint32_t frames;
+    static uint64_t last_skipped;
+    int i;
+    if (s_ss_on <= 0 && s_skip_n <= 0)
+        return;
+    if (++frames < 300)
+        return;
+    if (s_ss_on > 0) {
+        fprintf(stderr, "  [GL] passes per frame (300 frames):");
+        for (i = 0; i < SURF_STATS && s_ss[i].draws; i++)
+            fprintf(stderr, " %08X %ux%u:%u", s_ss[i].va, s_ss[i].w, s_ss[i].h,
+                    (s_ss[i].draws + frames / 2) / frames);
+        fprintf(stderr, "\n");
+        memset(s_ss, 0, sizeof s_ss);
+    }
+    if (s_skip_n > 0)
+        fprintf(stderr, "  [GL] skipped %llu draws/frame (RECOMP_GL_SKIP)\n",
+                (unsigned long long)((s_skipped - last_skipped) / frames));
+    last_skipped = s_skipped;
+    frames = 0;
+}
+
 static void gl_draw_raw(const Nv2aRawBatch *b)
 {
     GlSurf *s;
@@ -1649,6 +1826,11 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
 
     if (!ready())
         return;
+    if (!s_q_on) {                  /* queued draws were counted in q_draw */
+        surf_stats_draw(&b->surface);
+        if (pass_skipped(&b->surface))
+            return;
+    }
     s_regs = r;
     s_batch = b;
     s = surf_bind(&b->surface, b->zeta_va);
@@ -1830,7 +2012,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
                     int q;
                     memcpy(&u0, b->direct[9].ptr, 4);
                     memcpy(&v0, b->direct[9].ptr + 4, 4);
-                    glBindFramebuffer(0x8CA8, src->fbo);         /* GL_READ_FRAMEBUFFER */
+                    glBindFramebuffer(0x8CA8, src->fbo); fbo_forget();         /* GL_READ_FRAMEBUFFER */
                     fprintf(stderr, "          src %ux%u at (%g,%g)+4/12/20/28:", src->w, src->h, u0, v0);
                     for (q = 0; q < 4; q++) {
                         GLint xx = (GLint)u0 + 4 + q * 8, yy = (GLint)v0 + 4 + q * 8;
@@ -1839,7 +2021,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
                         fprintf(stderr, " %02X%02X%02X%02X", px[0], px[1], px[2], px[3]);
                     }
                     fprintf(stderr, "\n");
-                    glBindFramebuffer(0x8CA8, s->fbo);
+                    glBindFramebuffer(0x8CA8, s->fbo); fbo_forget();
                 }
             }
             {
@@ -2063,6 +2245,9 @@ static void gl_flip(void)
     if (!ready())
         return;
     s_frame++;
+    surf_stats_frame();
+    if (!s_q_on)
+        pass_skip_frame();
     {
         /* A frame over 50 ms (a hitch): say what it did -- compiling programs
          * (Mesa, at first use), uploading textures (decode + glTexImage), or
@@ -2246,7 +2431,6 @@ typedef struct {
 #define PROG_ROWS 136
 #define CONST_ROWS 192
 
-static int s_q_on;
 static uint8_t *s_q;
 static size_t s_q_head, s_q_tail;               /* bytes written / read, ever */
 static int s_q_consumer_waits, s_q_producer_waits, s_q_flips;
@@ -2408,6 +2592,9 @@ static void q_draw(const Nv2aRawBatch *b)
     Nv2aRawBatch *qb;
     uint8_t *rec;
 
+    surf_stats_draw(&b->surface);
+    if (pass_skipped(&b->surface))
+        return;
     s_q_live_regs = b->regs;
     nreg = q_reg_collect();
     if (b->vp_program && b->vp_prog_gen != s_q_prog_gen && b->vp_slots <= PROG_ROWS)
@@ -2485,6 +2672,7 @@ static void q_flip(void)
     size_t size;
     uint8_t *rec;
 
+    pass_skip_frame();                  /* executor side, like q_draw's skips */
     /* No more than two frames behind the executor. */
     if (__atomic_load_n(&s_q_flips, __ATOMIC_ACQUIRE) >= 2) {
         uint64_t t0 = q_now_ns();
