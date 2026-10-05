@@ -127,6 +127,9 @@ static GLuint        s_vao, s_vbo, s_ibo;
 typedef struct { GLuint buf; GLenum target; GLsizeiptr cap, off; } GlRing;
 static GlRing s_vring = { 0, GL_ARRAY_BUFFER, 16 << 20, 0 };
 static GlRing s_iring = { 0, GL_ELEMENT_ARRAY_BUFFER, 4 << 20, 0 };
+static int    s_vao_bound;                  /* bind_vao / bind_buf (ring_alloc) */
+static GLuint s_buf_bound[2];               /* ARRAY, ELEMENT_ARRAY */
+static int    ring_persist_init(void *(*getproc)(const char *));
 static const uint32_t *s_regs;          /* the executor's method shadow */
 static uint32_t      s_frame;
 /* Hitch accounting (gl_flip logs frames over 50 ms): per frame, programs
@@ -166,9 +169,13 @@ static void active_unit(int i)
     }
 }
 /* Bind on the active unit (known after active_unit). */
+static int s_stage_unit = -1;            /* bind_stage's unit during tex_get */
 static void bind_tex(GLuint tex)
 {
-    int u = s_active_unit;
+    int u;
+    if (s_stage_unit >= 0)
+        active_unit(s_stage_unit);
+    u = s_active_unit;
     if (u >= 0 && u < 4 && (s_bound_known & (1 << u)) && s_bound[u] == tex)
         return;
     glBindTexture(GL_TEXTURE_2D, tex);
@@ -176,6 +183,17 @@ static void bind_tex(GLuint tex)
         s_bound[u] = tex;
         s_bound_known |= 1 << u;
     }
+}
+/* Bind on unit i, switching units only when the binding changes: a draw's
+ * four stages usually keep their textures, and selecting each unit anyway
+ * was 4 glActiveTexture a draw (RECOMP_GL_CALL_STATS: 6051 a frame on the
+ * R36S, the most frequent call). */
+static void bind_unit(int i, GLuint tex)
+{
+    if ((s_bound_known & (1 << i)) && s_bound[i] == tex)
+        return;
+    active_unit(i);
+    bind_tex(tex);
 }
 
 /* Guest texels are 0xAARRGGBB words: B, G, R, A in memory, which desktop GL
@@ -760,9 +778,8 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2])
     GlSurf *rt;
 
     scale[0] = scale[1] = 1.0f;
-    active_unit(i);
     if (!(control0 & 0x40000000u) || !regs[base]) {
-        bind_tex(0);
+        bind_unit(i, 0);
         return;
     }
     va = s_batch->tex_va[i];
@@ -778,7 +795,7 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2])
         if (h) scale[1] = 1.0f / (float)h;
     }
     if (!w || !h || w > 4096 || h > 4096) {
-        bind_tex(0);
+        bind_unit(i, 0);
         return;
     }
     s_palette_reg = regs[base + 8];          /* SET_TEXTURE_PALETTE */
@@ -789,9 +806,13 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2])
         /* The image the title samples is the logical one; the FBO holds it
          * at the anti-aliased size. Normalised coordinates cover both. */
     } else {
+        /* An upload binds the new texture; on unit i, so the units of the
+         * stages already bound for this draw keep theirs. */
+        s_stage_unit = i;
         tex = tex_get(va, color, w, h, pitch);
+        s_stage_unit = -1;
     }
-    bind_tex(tex);
+    bind_unit(i, tex);
     {
         /* Sampler state lives in the texture object: set it only when it
          * differs from what that texture last got. A texture id reused for a
@@ -807,6 +828,7 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2])
         if (tp->id != tex || tp->key != key) {
             tp->id = tex;
             tp->key = key;
+            active_unit(i);                     /* tex is bound on unit i */
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap_mode(addr & 0xF));
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap_mode((addr >> 8) & 0xF));
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mag);
@@ -1229,10 +1251,16 @@ static int ready(void)
     glGenBuffers(1, &s_ibo);
     s_vring.buf = s_vbo;
     s_iring.buf = s_ibo;
-    glBindBuffer(GL_ARRAY_BUFFER, s_vbo);
-    glBufferData(GL_ARRAY_BUFFER, s_vring.cap, NULL, GL_STREAM_DRAW);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_ibo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, s_iring.cap, NULL, GL_STREAM_DRAW);
+    s_vao_bound = 1;
+    /* Desktop 3.3 core has no EXT_buffer_storage: per-draw maps there. */
+    if (!nv2a_gl_api_es || !ring_persist_init(SDL_GL_GetProcAddress)) {
+        glBindBuffer(GL_ARRAY_BUFFER, s_vring.buf);
+        glBufferData(GL_ARRAY_BUFFER, s_vring.cap, NULL, GL_STREAM_DRAW);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_iring.buf);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, s_iring.cap, NULL, GL_STREAM_DRAW);
+    }
+    s_buf_bound[0] = s_vring.buf;
+    s_buf_bound[1] = s_iring.buf;
     s_state = 1;
     prog_cache_prewarm();
     return 1;
@@ -1297,7 +1325,8 @@ static int s_st_valid;
 /* Called by clear, flip and everything that leaves GL state unknown; flip
  * binds the window framebuffer and its own viewport, so the surface binding
  * goes too. */
-static void state_dirty(void) { s_st_valid = 0; tex_bind_forget(); fbo_forget(); }
+static void buf_bind_forget(void);
+static void state_dirty(void) { s_st_valid = 0; tex_bind_forget(); fbo_forget(); buf_bind_forget(); }
 
 static void apply_state(const uint32_t *r, int has_depth)
 {
@@ -1452,11 +1481,126 @@ static uint32_t zmax_of(const uint32_t *r)
 
 /* Space for `size` bytes; returns the offset, and a pointer to write them to
  * (NULL if mapping failed: then ring_put the data instead). */
+/* The VAO and the two ring buffers as last bound here: the renderer has one
+ * VAO and one buffer per target, so after the first draw these binds are
+ * no-ops -- 2 glBindBuffer + 1 glBindVertexArray a draw on the R36S. */
+static void buf_bind_forget(void) { s_vao_bound = 0; s_buf_bound[0] = s_buf_bound[1] = 0; }
+static void bind_vao(void)
+{
+    if (!s_vao_bound) {
+        glBindVertexArray(s_vao);
+        s_vao_bound = 1;
+    }
+}
+static void bind_buf(GLenum target, GLuint buf)
+{
+    int k = target == GL_ELEMENT_ARRAY_BUFFER;
+    if (s_buf_bound[k] != buf) {
+        glBindBuffer(target, buf);
+        s_buf_bound[k] = buf;
+    }
+}
+
+/* Persistent rings (GL_EXT_buffer_storage, RECOMP_GL_PERSIST=0 turns it
+ * off): each ring is mapped once, coherent, and a draw only writes its
+ * bytes -- no glMapBufferRange/glUnmapBuffer pair per upload (6 calls a draw
+ * on the R36S's Mali blob, which charges per call). The ring is split into
+ * RING_SEGS segments; leaving one puts a fence behind it, and entering one
+ * waits for its fence, so nothing the GPU may still read is overwritten. */
+#define RING_SEGS 4
+typedef void (GLAPIENTRY *PFN_glBufferStorageEXT)(GLenum, GLsizeiptr, const void *, GLbitfield);
+static int s_persist;                       /* rings are persistent */
+static uint8_t *s_ring_map[2];
+static GLsync s_ring_fence[2][RING_SEGS];
+static int s_ring_seg[2];
+
+/* Give the rings (their buffers already made, nothing allocated) persistent
+ * storage. Returns 1 if both are mapped; else 0, with fresh buffers in the
+ * rings for the per-draw path (an immutable store cannot be re-specified). */
+static int ring_persist_init(void *(*getproc)(const char *))
+{
+    const GLbitfield fl = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+    const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+    const char *e = getenv("RECOMP_GL_PERSIST");
+    PFN_glBufferStorageEXT storage;
+    GlRing *g[2] = { &s_vring, &s_iring };
+    int k;
+
+    if ((e && *e == '0') || !ext || !strstr(ext, "GL_EXT_buffer_storage"))
+        return 0;
+    storage = (PFN_glBufferStorageEXT)getproc("glBufferStorageEXT");
+    if (!storage)
+        return 0;
+    while (glGetError() != GL_NO_ERROR) { }
+    for (k = 0; k < 2; k++) {
+        glBindBuffer(g[k]->target, g[k]->buf);
+        storage(g[k]->target, g[k]->cap, NULL, fl);
+        s_ring_map[k] = (uint8_t *)glMapBufferRange(g[k]->target, 0, g[k]->cap, fl);
+        if (!s_ring_map[k] || glGetError() != GL_NO_ERROR) {
+            fprintf(stderr, "  [GL] persistent rings: mapping failed, per-draw maps instead\n");
+            s_ring_map[0] = s_ring_map[1] = NULL;
+            glGenBuffers(1, &s_vring.buf);
+            glGenBuffers(1, &s_iring.buf);
+            return 0;
+        }
+        g[k]->off = 0;
+    }
+    s_persist = 1;
+    fprintf(stderr, "  [GL] persistent rings: %ld + %ld KB, %d segments\n",
+            (long)(s_vring.cap >> 10), (long)(s_iring.cap >> 10), RING_SEGS);
+    return 1;
+}
+
+/* Persistent: the offset for `size` bytes, after fencing the segments left
+ * behind and waiting for the ones entered. */
+static GLintptr ring_alloc_persist(GlRing *g, GLsizeiptr size, void **ptr)
+{
+    int k = g == &s_iring, end;
+    GLsizeiptr seg = g->cap / RING_SEGS;
+    GLintptr at = (g->off + 63) & ~(GLintptr)63;
+
+    if (size > seg) {
+        /* Bigger than a segment (never seen): wait for everything. */
+        int s;
+        glFinish();
+        for (s = 0; s < RING_SEGS; s++)
+            if (s_ring_fence[k][s]) { glDeleteSync(s_ring_fence[k][s]); s_ring_fence[k][s] = 0; }
+        if (size > g->cap) { *ptr = NULL; return -1; }
+        at = 0;
+        s_ring_seg[k] = 0;
+    } else if (at + size > g->cap) {
+        at = 0;
+    }
+    end = (int)((at + size - 1) / seg);
+    while (s_ring_seg[k] != end) {
+        int s = s_ring_seg[k];
+        if (!s_ring_fence[k][s])
+            s_ring_fence[k][s] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        s = (s + 1) % RING_SEGS;
+        s_ring_seg[k] = s;
+        if (s_ring_fence[k][s]) {
+            glClientWaitSync(s_ring_fence[k][s], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+            glDeleteSync(s_ring_fence[k][s]);
+            s_ring_fence[k][s] = 0;
+        }
+    }
+    g->off = at + size;
+    bind_buf(g->target, g->buf);
+    *ptr = s_ring_map[k] + at;
+    return at;
+}
+
 static GLintptr ring_alloc(GlRing *g, GLsizeiptr size, void **ptr)
 {
     GLintptr at;
 
-    glBindBuffer(g->target, g->buf);
+    if (s_persist) {
+        at = ring_alloc_persist(g, size, ptr);
+        if (at >= 0)
+            return at;
+        return 0;                           /* too big for the ring: dropped */
+    }
+    bind_buf(g->target, g->buf);
     if (size > g->cap) {
         g->cap = size * 2;
         g->off = g->cap;                    /* forces the orphan below */
@@ -1479,6 +1623,8 @@ static GLintptr ring_alloc(GlRing *g, GLsizeiptr size, void **ptr)
 static void ring_done(GlRing *g, GLintptr at, GLsizeiptr size, void *ptr,
                       const void *fallback)
 {
+    if (s_persist)
+        return;                             /* coherent: nothing to flush */
     if (ptr)
         glUnmapBuffer(g->target);
     else if (fallback)
@@ -1787,6 +1933,51 @@ static void surf_stats_draw(const Nv2aSurface *sf)
     }
 }
 
+/* RECOMP_GL_CALL_STATS=1: every 300 frames, GL calls per frame by entry point
+ * (gl_api.h counts them), per draw, and the time SDL_GL_SwapWindow blocked --
+ * what each submission-cost fix (persistent ring, vertex formats, uniform
+ * packing) would remove, and what triple buffering could hide. */
+static uint64_t s_swap_ns, s_cs_draws;
+static void call_stats_frame(void)
+{
+    static int on = -1;
+    static uint32_t frames;
+    static uint64_t t_start;
+    uint32_t total = 0, order[NV2A_GLID_COUNT], n = 0, i, j;
+    double fr;
+
+    if (on < 0)
+        on = getenv("RECOMP_GL_CALL_STATS") != NULL;
+    if (!on)
+        return;
+    if (!t_start)
+        t_start = hz_now();
+    if (++frames < 300)
+        return;
+    fr = (double)frames;
+    for (i = 0; i < NV2A_GLID_COUNT; i++) {
+        total += nv2a_gl_calls[i];
+        if (nv2a_gl_calls[i])
+            order[n++] = i;
+    }
+    for (i = 1; i < n; i++)                         /* by count, descending */
+        for (j = i; j > 0 && nv2a_gl_calls[order[j]] > nv2a_gl_calls[order[j - 1]]; j--) {
+            uint32_t t = order[j]; order[j] = order[j - 1]; order[j - 1] = t;
+        }
+    fprintf(stderr, "  [GL] calls (300 frames, %.1f fps): %.0f/frame, %.0f draws/frame,"
+            " %.1f calls/draw, swap %.1f ms/frame\n",
+            fr * 1e9 / (double)(hz_now() - t_start), total / fr, s_cs_draws / fr,
+            s_cs_draws ? (double)total / (double)s_cs_draws : 0.0, s_swap_ns / fr / 1e6);
+    fprintf(stderr, "  [GL] calls/frame:");
+    for (i = 0; i < n && i < 24; i++)
+        fprintf(stderr, " %s %.0f", nv2a_gl_names[order[i]] + 2, nv2a_gl_calls[order[i]] / fr);
+    fprintf(stderr, "\n");
+    memset(nv2a_gl_calls, 0, sizeof nv2a_gl_calls);
+    s_swap_ns = s_cs_draws = 0;
+    frames = 0;
+    t_start = hz_now();
+}
+
 /* From gl_flip: one report per 300 frames. */
 static void surf_stats_frame(void)
 {
@@ -1873,6 +2064,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     if (!p)
         return;
     s_hz_draws++;
+    s_cs_draws++;
     if (p->prog != s_cur_prog) {
         glUseProgram(p->prog);
         s_cur_prog = p->prog;
@@ -2061,7 +2253,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
 
     apply_state(r, b->zeta_va != 0);
 
-    glBindVertexArray(s_vao);
+    bind_vao();
     if (!upload_vertices(b))
         return;
     {
@@ -2379,8 +2571,13 @@ static void gl_flip(void)
     }
 swap:
     gl_step_done("present");
-    SDL_GL_SwapWindow(s_win);
+    {
+        uint64_t t0 = hz_now();
+        SDL_GL_SwapWindow(s_win);
+        s_swap_ns += hz_now() - t0;
+    }
     gl_step_done("swap");
+    call_stats_frame();
     tex_bind_forget();
     {
         SDL_Event e;

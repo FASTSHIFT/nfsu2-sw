@@ -30,6 +30,15 @@ typedef char          GLchar;
 typedef unsigned char GLubyte;
 typedef ptrdiff_t     GLsizeiptr;
 typedef ptrdiff_t     GLintptr;
+typedef uint64_t      GLuint64;
+typedef struct __GLsync *GLsync;
+
+#define GL_MAP_PERSISTENT_BIT             0x0040
+#define GL_MAP_COHERENT_BIT               0x0080
+#define GL_SYNC_GPU_COMMANDS_COMPLETE     0x9117
+#define GL_SYNC_FLUSH_COMMANDS_BIT        0x00000001
+#define GL_TIMEOUT_EXPIRED                0x911B
+#define GL_WAIT_FAILED                    0x911D
 
 #define GL_FALSE                          0
 #define GL_NO_ERROR                       0
@@ -182,6 +191,9 @@ typedef ptrdiff_t     GLintptr;
 X(void, glBufferSubData, (GLenum, GLintptr, GLsizeiptr, const void *)) \
 X(void *, glMapBufferRange, (GLenum, GLintptr, GLsizeiptr, GLbitfield)) \
 X(GLboolean, glUnmapBuffer, (GLenum)) \
+    X(GLsync, glFenceSync, (GLenum, GLbitfield)) \
+    X(GLenum, glClientWaitSync, (GLsync, GLbitfield, GLuint64)) \
+    X(void, glDeleteSync, (GLsync)) \
     X(void, glVertexAttribPointer, (GLuint, GLint, GLenum, GLboolean, GLsizei, const void *)) \
     X(void, glEnableVertexAttribArray, (GLuint)) \
     X(void, glDisableVertexAttribArray, (GLuint)) \
@@ -193,6 +205,19 @@ X(GLboolean, glUnmapBuffer, (GLenum)) \
     typedef ret (GLAPIENTRY *PFN_##name) args; extern PFN_##name p_##name;
 NV2A_GL_FUNCS(NV2A_GL_DECLARE)
 #undef NV2A_GL_DECLARE
+
+/* Calls per entry point (RECOMP_GL_CALL_STATS, nv2a_gl.c): every call through
+ * the names below bumps its counter. One non-atomic add -- only one thread at
+ * a time owns the context -- so it stays on. */
+#define NV2A_GL_ID(ret, name, args) NV2A_GLID_##name,
+enum { NV2A_GL_FUNCS(NV2A_GL_ID) NV2A_GLID_COUNT };
+#undef NV2A_GL_ID
+extern uint32_t nv2a_gl_calls[NV2A_GLID_COUNT];
+extern const char *const nv2a_gl_names[NV2A_GLID_COUNT];
+/* A function, not a comma expression: two counted calls in one expression
+ * (a printf of two glGetString) stay sequenced. */
+static inline void nv2a_gl_count(int id) { nv2a_gl_calls[id]++; }
+#define NV2A_GLCALL(name) (nv2a_gl_count(NV2A_GLID_##name), p_##name)
 
 /* Resolve every entry point. Returns the number that could not be found
  * (0 on success); `getproc` is SDL_GL_GetProcAddress or equivalent. */
@@ -221,86 +246,89 @@ static inline void nv2a_glClearDepth(double d)
 #define GL_BLUE                           0x1905
 
 /* The renderer calls through these names. */
-#define glGetString              p_glGetString
-#define glGetError               p_glGetError
-#define glViewport               p_glViewport
-#define glScissor                p_glScissor
-#define glClearColor             p_glClearColor
-#define glGetIntegerv            p_glGetIntegerv
+#define glGetString              NV2A_GLCALL(glGetString)
+#define glGetError               NV2A_GLCALL(glGetError)
+#define glViewport               NV2A_GLCALL(glViewport)
+#define glScissor                NV2A_GLCALL(glScissor)
+#define glClearColor             NV2A_GLCALL(glClearColor)
+#define glGetIntegerv            NV2A_GLCALL(glGetIntegerv)
 #define glClearDepth             nv2a_glClearDepth
-#define glClearStencil           p_glClearStencil
-#define glClear                  p_glClear
-#define glEnable                 p_glEnable
-#define glDisable                p_glDisable
-#define glBlendFunc              p_glBlendFunc
-#define glBlendEquation          p_glBlendEquation
-#define glBlendColor             p_glBlendColor
-#define glDepthFunc              p_glDepthFunc
-#define glDepthMask              p_glDepthMask
-#define glColorMask              p_glColorMask
-#define glStencilFunc            p_glStencilFunc
-#define glStencilOp              p_glStencilOp
-#define glStencilMask            p_glStencilMask
-#define glCullFace               p_glCullFace
-#define glFrontFace              p_glFrontFace
-#define glPixelStorei            p_glPixelStorei
-#define glReadPixels             p_glReadPixels
-#define glFinish                 p_glFinish
-#define glGenTextures            p_glGenTextures
-#define glDeleteTextures         p_glDeleteTextures
-#define glBindTexture            p_glBindTexture
-#define glActiveTexture          p_glActiveTexture
-#define glTexImage2D             p_glTexImage2D
-#define glCompressedTexImage2D   p_glCompressedTexImage2D
+#define glClearStencil           NV2A_GLCALL(glClearStencil)
+#define glClear                  NV2A_GLCALL(glClear)
+#define glEnable                 NV2A_GLCALL(glEnable)
+#define glDisable                NV2A_GLCALL(glDisable)
+#define glBlendFunc              NV2A_GLCALL(glBlendFunc)
+#define glBlendEquation          NV2A_GLCALL(glBlendEquation)
+#define glBlendColor             NV2A_GLCALL(glBlendColor)
+#define glDepthFunc              NV2A_GLCALL(glDepthFunc)
+#define glDepthMask              NV2A_GLCALL(glDepthMask)
+#define glColorMask              NV2A_GLCALL(glColorMask)
+#define glStencilFunc            NV2A_GLCALL(glStencilFunc)
+#define glStencilOp              NV2A_GLCALL(glStencilOp)
+#define glStencilMask            NV2A_GLCALL(glStencilMask)
+#define glCullFace               NV2A_GLCALL(glCullFace)
+#define glFrontFace              NV2A_GLCALL(glFrontFace)
+#define glPixelStorei            NV2A_GLCALL(glPixelStorei)
+#define glReadPixels             NV2A_GLCALL(glReadPixels)
+#define glFinish                 NV2A_GLCALL(glFinish)
+#define glGenTextures            NV2A_GLCALL(glGenTextures)
+#define glDeleteTextures         NV2A_GLCALL(glDeleteTextures)
+#define glBindTexture            NV2A_GLCALL(glBindTexture)
+#define glActiveTexture          NV2A_GLCALL(glActiveTexture)
+#define glTexImage2D             NV2A_GLCALL(glTexImage2D)
+#define glCompressedTexImage2D   NV2A_GLCALL(glCompressedTexImage2D)
 #define GL_COMPRESSED_RGBA_S3TC_DXT1_EXT 0x83F1
 #define GL_COMPRESSED_RGBA_S3TC_DXT3_EXT 0x83F2
 #define GL_COMPRESSED_RGBA_S3TC_DXT5_EXT 0x83F3
-#define glTexSubImage2D          p_glTexSubImage2D
-#define glTexParameteri          p_glTexParameteri
-#define glGenFramebuffers        p_glGenFramebuffers
-#define glDeleteFramebuffers     p_glDeleteFramebuffers
-#define glBindFramebuffer        p_glBindFramebuffer
-#define glFramebufferTexture2D   p_glFramebufferTexture2D
-#define glFramebufferRenderbuffer p_glFramebufferRenderbuffer
-#define glCheckFramebufferStatus p_glCheckFramebufferStatus
-#define glBlitFramebuffer        p_glBlitFramebuffer
-#define glGenRenderbuffers       p_glGenRenderbuffers
-#define glDeleteRenderbuffers    p_glDeleteRenderbuffers
-#define glBindRenderbuffer       p_glBindRenderbuffer
-#define glRenderbufferStorage    p_glRenderbufferStorage
-#define glCreateShader           p_glCreateShader
-#define glDeleteShader           p_glDeleteShader
-#define glDeleteProgram          p_glDeleteProgram
-#define glShaderSource           p_glShaderSource
-#define glCompileShader          p_glCompileShader
-#define glGetShaderiv            p_glGetShaderiv
-#define glGetShaderInfoLog       p_glGetShaderInfoLog
-#define glCreateProgram          p_glCreateProgram
-#define glAttachShader           p_glAttachShader
-#define glBindAttribLocation     p_glBindAttribLocation
-#define glLinkProgram            p_glLinkProgram
-#define glGetProgramiv           p_glGetProgramiv
-#define glGetProgramInfoLog      p_glGetProgramInfoLog
-#define glUseProgram             p_glUseProgram
-#define glGetUniformLocation     p_glGetUniformLocation
-#define glUniform1i              p_glUniform1i
-#define glUniform1iv             p_glUniform1iv
-#define glUniform1f              p_glUniform1f
-#define glUniform2fv             p_glUniform2fv
-#define glUniform4fv             p_glUniform4fv
-#define glGenVertexArrays        p_glGenVertexArrays
-#define glBindVertexArray        p_glBindVertexArray
-#define glGenBuffers             p_glGenBuffers
-#define glBindBuffer             p_glBindBuffer
-#define glBufferData             p_glBufferData
-#define glBufferSubData          p_glBufferSubData
-#define glMapBufferRange         p_glMapBufferRange
-#define glUnmapBuffer            p_glUnmapBuffer
-#define glVertexAttribPointer    p_glVertexAttribPointer
-#define glEnableVertexAttribArray p_glEnableVertexAttribArray
-#define glDisableVertexAttribArray p_glDisableVertexAttribArray
-#define glVertexAttrib4f         p_glVertexAttrib4f
-#define glDrawElements           p_glDrawElements
-#define glDrawArrays             p_glDrawArrays
+#define glTexSubImage2D          NV2A_GLCALL(glTexSubImage2D)
+#define glTexParameteri          NV2A_GLCALL(glTexParameteri)
+#define glGenFramebuffers        NV2A_GLCALL(glGenFramebuffers)
+#define glDeleteFramebuffers     NV2A_GLCALL(glDeleteFramebuffers)
+#define glBindFramebuffer        NV2A_GLCALL(glBindFramebuffer)
+#define glFramebufferTexture2D   NV2A_GLCALL(glFramebufferTexture2D)
+#define glFramebufferRenderbuffer NV2A_GLCALL(glFramebufferRenderbuffer)
+#define glCheckFramebufferStatus NV2A_GLCALL(glCheckFramebufferStatus)
+#define glBlitFramebuffer        NV2A_GLCALL(glBlitFramebuffer)
+#define glGenRenderbuffers       NV2A_GLCALL(glGenRenderbuffers)
+#define glDeleteRenderbuffers    NV2A_GLCALL(glDeleteRenderbuffers)
+#define glBindRenderbuffer       NV2A_GLCALL(glBindRenderbuffer)
+#define glRenderbufferStorage    NV2A_GLCALL(glRenderbufferStorage)
+#define glCreateShader           NV2A_GLCALL(glCreateShader)
+#define glDeleteShader           NV2A_GLCALL(glDeleteShader)
+#define glDeleteProgram          NV2A_GLCALL(glDeleteProgram)
+#define glShaderSource           NV2A_GLCALL(glShaderSource)
+#define glCompileShader          NV2A_GLCALL(glCompileShader)
+#define glGetShaderiv            NV2A_GLCALL(glGetShaderiv)
+#define glGetShaderInfoLog       NV2A_GLCALL(glGetShaderInfoLog)
+#define glCreateProgram          NV2A_GLCALL(glCreateProgram)
+#define glAttachShader           NV2A_GLCALL(glAttachShader)
+#define glBindAttribLocation     NV2A_GLCALL(glBindAttribLocation)
+#define glLinkProgram            NV2A_GLCALL(glLinkProgram)
+#define glGetProgramiv           NV2A_GLCALL(glGetProgramiv)
+#define glGetProgramInfoLog      NV2A_GLCALL(glGetProgramInfoLog)
+#define glUseProgram             NV2A_GLCALL(glUseProgram)
+#define glGetUniformLocation     NV2A_GLCALL(glGetUniformLocation)
+#define glUniform1i              NV2A_GLCALL(glUniform1i)
+#define glUniform1iv             NV2A_GLCALL(glUniform1iv)
+#define glUniform1f              NV2A_GLCALL(glUniform1f)
+#define glUniform2fv             NV2A_GLCALL(glUniform2fv)
+#define glUniform4fv             NV2A_GLCALL(glUniform4fv)
+#define glGenVertexArrays        NV2A_GLCALL(glGenVertexArrays)
+#define glBindVertexArray        NV2A_GLCALL(glBindVertexArray)
+#define glGenBuffers             NV2A_GLCALL(glGenBuffers)
+#define glBindBuffer             NV2A_GLCALL(glBindBuffer)
+#define glBufferData             NV2A_GLCALL(glBufferData)
+#define glBufferSubData          NV2A_GLCALL(glBufferSubData)
+#define glMapBufferRange         NV2A_GLCALL(glMapBufferRange)
+#define glUnmapBuffer            NV2A_GLCALL(glUnmapBuffer)
+#define glFenceSync              NV2A_GLCALL(glFenceSync)
+#define glClientWaitSync         NV2A_GLCALL(glClientWaitSync)
+#define glDeleteSync             NV2A_GLCALL(glDeleteSync)
+#define glVertexAttribPointer    NV2A_GLCALL(glVertexAttribPointer)
+#define glEnableVertexAttribArray NV2A_GLCALL(glEnableVertexAttribArray)
+#define glDisableVertexAttribArray NV2A_GLCALL(glDisableVertexAttribArray)
+#define glVertexAttrib4f         NV2A_GLCALL(glVertexAttrib4f)
+#define glDrawElements           NV2A_GLCALL(glDrawElements)
+#define glDrawArrays             NV2A_GLCALL(glDrawArrays)
 
 #endif /* NV2A_GL_API_H */

@@ -7,6 +7,11 @@
 NV2A_GL_FUNCS(NV2A_GL_DEFINE)
 #undef NV2A_GL_DEFINE
 
+uint32_t nv2a_gl_calls[NV2A_GLID_COUNT];
+#define NV2A_GL_NAME(ret, name, args) #name,
+const char *const nv2a_gl_names[NV2A_GLID_COUNT] = { NV2A_GL_FUNCS(NV2A_GL_NAME) };
+#undef NV2A_GL_NAME
+
 int nv2a_gl_api_es;
 PFN_glClearDepth  p_glClearDepth;
 PFN_glClearDepthf p_glClearDepthf;
