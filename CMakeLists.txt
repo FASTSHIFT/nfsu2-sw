@@ -137,8 +137,14 @@ else()
     set(NFSU2_PGO "" CACHE STRING "PGO stage: empty, gen or use")
     set(NFSU2_PGO_DIR "" CACHE PATH "Profile directory (gen: on the device; use: here)")
     if(NFSU2_PGO STREQUAL "gen")
-        list(APPEND _gen_opts "-fprofile-generate=${NFSU2_PGO_DIR}" "-fno-profile-values")
+        # -ftest-coverage: .gcno notes next to the objects (compile time only),
+        # so gcov can name the functions in the profile (call counts per
+        # function for picking rewrite candidates, docs/02).
+        list(APPEND _gen_opts "-fprofile-generate=${NFSU2_PGO_DIR}" "-fno-profile-values"
+             "-ftest-coverage")
         target_link_options(${PROJECT_NAME} PRIVATE "-fprofile-generate=${NFSU2_PGO_DIR}")
+        # The title rarely exits cleanly; SIGUSR1 writes the .gcda (main.c).
+        target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_PGO_GEN=1)
     elseif(NFSU2_PGO STREQUAL "use")
         list(APPEND _gen_opts "-fprofile-use=${NFSU2_PGO_DIR}" "-fprofile-partial-training"
              "-fprofile-correction" "-Wno-missing-profile")

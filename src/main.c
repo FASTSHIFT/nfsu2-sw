@@ -282,8 +282,49 @@ int main(int argc, char **argv)
 }
 #endif
 
+#ifdef NFSU2_PGO_GEN
+/* Instrumented build (NFSU2_PGO=gen): the title is usually killed rather than
+ * returning, so `kill -USR1 <pid>` writes the profile. SIGUSR1 is blocked in
+ * every thread (they inherit the mask) and taken by this one with sigwait, so
+ * the dump does not run in signal context. libgcov dumps once; a later exit
+ * does not add the counts again. */
+#include <pthread.h>
+#include <signal.h>
+extern void __gcov_dump(void);
+
+static void *pgo_dump_thread(void *arg)
+{
+    sigset_t *set = arg;
+    int sig;
+
+    for (;;) {
+        if (sigwait(set, &sig) == 0) {
+            fprintf(stderr, "[PGO] writing profile\n");
+            __gcov_dump();
+            fprintf(stderr, "[PGO] profile written\n");
+        }
+    }
+    return NULL;
+}
+
+static void pgo_dump_install(void)
+{
+    static sigset_t set;
+    pthread_t th;
+
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+    if (pthread_create(&th, NULL, pgo_dump_thread, &set) == 0)
+        pthread_detach(th);
+}
+#endif
+
 static int game_main(void)
 {
+#ifdef NFSU2_PGO_GEN
+    pgo_dump_install();    /* before any other thread exists */
+#endif
     xbox_guest_pin(0);     /* the boot thread becomes the title's first thread */
     char xbe_path[512];
     const char *game_dir;
