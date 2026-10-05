@@ -697,17 +697,159 @@ void sub_0033518D(void)
  *       g_eax = result;
  *   }
  */
+/* ── EA mixer kernels, native (docs/04 §8) ─────────────────────────────
+ *
+ * On the R36S the EA mixer thread (entry 0x00274CA0) took ~29% of the guest
+ * core in a race, beside the main thread on the same core (RECOMP_GUEST_ONE_
+ * CORE): 80% of it in a handful of SSE leaf loops at 0x0027xxxx. Lifted,
+ * every xmm lane goes through memory and every loop turn through flag
+ * emulation; these are the two hottest, written in C with the same float
+ * operations in the same order (one rounding per mul and per add, no
+ * contraction: -ffp-contract=off below), so the output is bit for bit the
+ * lifted code's. Both are reached only through the dispatch table (the
+ * mixer calls them indirectly), so recomp_lookup_manual is the one hook.
+ * RECOMP_NATIVE=0 runs the lifted ones; RECOMP_NATIVE_CHECK=1 runs both on
+ * a copy of the output and reports the first differences. */
+#pragma GCC optimize ("fp-contract=off")
+void sub_0027AF30(void);
+void sub_0027CCF0(void);
+
+static int native_mode(void)
+{
+    static int mode = -1;               /* 0 lifted, 1 native, 2 native + check */
+    if (mode < 0) {
+        const char *e = getenv("RECOMP_NATIVE"), *c = getenv("RECOMP_NATIVE_CHECK");
+        mode = (e && *e == '0') ? 0 : (c && *c == '1') ? 2 : 1;
+    }
+    return mode;
+}
+
+/* sub_0027AF30: cdecl (int n, float gain, const float *src, float *dst):
+ * dst[i] += src[i] * gain, i from n-1 down to 0. Scalar from the top until
+ * n is a multiple of 16 or a pointer is not 16-byte aligned (then scalar
+ * to the end), then 16 at a time -- the order does not change the result,
+ * each element is one mul and one add either way. */
+static void mix_gain_native(void)
+{
+    uint32_t n = MEM32(esp + 4), src = MEM32(esp + 12), dst = MEM32(esp + 16);
+    float gain = MEMF(esp + 8);
+    float *s = (float *)XBOX_PTR(src), *d = (float *)XBOX_PTR(dst);
+    int32_t i;
+
+    /* As the original's control flow: scalar steps while n is not a
+     * multiple of 16 (or a pointer is unaligned), each one ending the call
+     * when n reaches 0; then 16-element blocks while n > 0 after the
+     * subtraction -- one block even when it starts at n = 16k. A start at
+     * n = 0 runs one block over [-16, 0): never seen, kept as it was. */
+    i = (int32_t)n;
+    for (;;) {
+        if (!(i & 0xF) && !(src & 0xF) && !(dst & 0xF))
+            break;
+        d[i - 1] = d[i - 1] + s[i - 1] * gain;
+        if (--i == 0)
+            goto done;
+    }
+    do {
+        int32_t k;
+        for (k = -16; k < 0; k++)
+            d[i + k] = d[i + k] + s[i + k] * gain;
+        i -= 16;
+    } while (i > 0);
+done:
+    esp += 4;                           /* ret: cdecl, the caller pops */
+}
+
+/* sub_0027CCF0: cdecl (int n, const float *src, float *dst, uint32_t *ipos,
+ * uint32_t *frac, uint32_t step_int, uint32_t step_frac): linear-interpolating
+ * resampler, position = ipos.frac in 32.32 fixed point; for each output
+ *   t   = (float)(int32_t)(frac >> 1) * K       (K = 0x3D4570, 2^-31)
+ *   out = (src[ip+1] - src[ip]) * t + src[ip]
+ *   frac += step_frac (carry into) ip += step_int
+ * then writes ip and frac back. The SSE path does 8 at once with exactly
+ * these per-lane operations, so it is the same arithmetic. */
+static void resample_native(void)
+{
+    uint32_t n = MEM32(esp + 4), src = MEM32(esp + 8), dst = MEM32(esp + 12);
+    uint32_t pip = MEM32(esp + 16), pfr = MEM32(esp + 20);
+    uint32_t sint = MEM32(esp + 24), sfrac = MEM32(esp + 28);
+    uint32_t ip = MEM32(pip), fr = MEM32(pfr);
+    const float k = MEMF(0x003D4570u);
+    const float *s = (const float *)XBOX_PTR(src);
+    float *d = (float *)XBOX_PTR(dst);
+    int32_t i;
+
+    /* The original: blocks of 8 while 8 remain, then n % 8 single steps;
+     * the same sequence of positions either way. (A negative n would run
+     * (n & 7) steps there and none here -- never seen.) */
+    for (i = 0; i < (int32_t)n; i++) {
+        uint64_t sum = (uint64_t)fr + sfrac;
+        float a = s[ip], b = s[ip + 1];
+        float t = (float)(int32_t)(fr >> 1) * k;
+        d[i] = (b - a) * t + a;
+        fr = (uint32_t)sum;
+        ip = ip + sint + (uint32_t)(sum >> 32);
+    }
+    MEM32(pfr) = fr;
+    MEM32(pip) = ip;
+    esp += 4;
+}
+
+/* Native + check: the lifted function on a copy of the output, compared. */
+static void native_checked(void (*native)(void), void (*lifted)(void), const char *name,
+                           uint32_t dst, uint32_t bytes, uint32_t st0, uint32_t st1)
+{
+    static unsigned long calls[2], bad[2];
+    int w = native == resample_native;
+    uint8_t *d = (uint8_t *)XBOX_PTR(dst);
+    static uint8_t keep[65536], mine[65536];
+    uint32_t s0 = st0 ? MEM32(st0) : 0, s1 = st1 ? MEM32(st1) : 0, n0, n1;
+    uint32_t sp = esp;
+
+    if (bytes > sizeof keep) {          /* larger than ever seen: no check */
+        native();
+        return;
+    }
+    memcpy(keep, d, bytes);
+    native();
+    memcpy(mine, d, bytes);
+    n0 = st0 ? MEM32(st0) : 0; n1 = st1 ? MEM32(st1) : 0;
+    memcpy(d, keep, bytes);
+    if (st0) MEM32(st0) = s0;
+    if (st1) MEM32(st1) = s1;
+    esp = sp;
+    lifted();
+    calls[w]++;
+    if ((memcmp(mine, d, bytes) || (st0 && MEM32(st0) != n0) || (st1 && MEM32(st1) != n1))
+        && bad[w]++ < 20)
+        fprintf(stderr, "[native] %s mismatch (call %lu, %u bytes)\n", name, calls[w], bytes);
+    if (calls[w] == 1 || (calls[w] & 0x7FFF) == 0)
+        fprintf(stderr, "[native] %s: %lu calls, %lu mismatches\n", name, calls[w], bad[w]);
+}
+
+static void mix_gain_entry(void)
+{
+    if (native_mode() == 2)
+        native_checked(mix_gain_native, sub_0027AF30, "sub_0027AF30 mix-gain",
+                       MEM32(esp + 16), MEM32(esp + 4) * 4u, 0, 0);
+    else
+        mix_gain_native();
+}
+
+static void resample_entry(void)
+{
+    if (native_mode() == 2)
+        native_checked(resample_native, sub_0027CCF0, "sub_0027CCF0 resample",
+                       MEM32(esp + 12), MEM32(esp + 4) * 4u, MEM32(esp + 16), MEM32(esp + 20));
+    else
+        resample_native();
+}
+
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
-    /*
-     * TODO: Add your overrides here. Examples:
-     *
-     * if (xbox_va == 0x00012345) return traced_sub_00012345;
-     * if (xbox_va == 0x00067890) return stub_00067890;
-     * if (xbox_va == 0x000ABCDE) return fixed_sub_000ABCDE;
-     */
-
-    (void)xbox_va;
+    if (native_mode()) {
+        if (xbox_va == 0x0027AF30u) return mix_gain_entry;
+        if (xbox_va == 0x0027CCF0u) return resample_entry;
+    }
     return (recomp_func_t)0;
 }
 
