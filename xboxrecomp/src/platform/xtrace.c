@@ -115,7 +115,7 @@ static XThread *self(void)
     return t;
 }
 
-static void put(uint32_t type, uint64_t payload)
+static void put_at(uint32_t type, uint64_t payload, uint64_t ts)
 {
     XThread *t = self();
     XEv *e;
@@ -125,9 +125,20 @@ static void put(uint32_t type, uint64_t payload)
         t->dropped++;
         return;
     }
+    if (ts < s_start_ns)
+        ts = s_start_ns;
     e = &t->ev[t->n++];
-    e->ts_type = ((now_ns() - s_start_ns) & 0x1FFFFFFFFFFFFFFFull) | ((uint64_t)type << 61);
+    e->ts_type = ((ts - s_start_ns) & 0x1FFFFFFFFFFFFFFFull) | ((uint64_t)type << 61);
     e->payload = payload;
+}
+static void put(uint32_t type, uint64_t payload) { put_at(type, payload, now_ns()); }
+
+uint64_t xtrace_now(void) { return now_ns(); }
+/* Inside the caller's current span, so its begin and end land in order. */
+void xtrace_span_(const char *name, uint64_t t0, uint64_t t1)
+{
+    put_at(EV_BEGIN, (uint64_t)(uintptr_t)name, t0);
+    put_at(EV_END, 0, t1);
 }
 
 /* An END whose BEGIN came before recording started is dropped by the writer

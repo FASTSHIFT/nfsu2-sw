@@ -3246,7 +3246,9 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         long long now;
         int i;
 
+        xtrace_begin("idle");
         WaitForSingleObject(xbox_irq_line_event(), 10);   /* a device interrupt, or 10 ms */
+        xtrace_end();
         /* ISRs and DPCs run at DISPATCH or above: raising takes the dispatch
          * lock (kernel_hal.c), so none of them runs while a game thread is in
          * a raised section. */

@@ -239,13 +239,14 @@ void xbox_gil_enter(void);             /* kernel_bridge.c: the guest lock */
 void xbox_gil_leave(void);
 void xbox_gil_mark_main(void);
 void nfsu2_text_patch_init(void);    /* text_patch.c: Switch button names */
+void xbox_nx_spread_thread(void);   /* win32_compat.c: off the guest core (Linux: */
+                                    /* RECOMP_GUEST_ONE_CORE), spread (Switch) */
 
 #ifdef __SWITCH__
 #include <pthread.h>
 /* The first guest thread runs inline on whichever host thread boots the
  * title, and Horizon's main thread stack is small for recompiled code; boot
  * on a thread with a stack sized like a desktop main thread instead. */
-void xbox_nx_spread_thread(void);   /* win32_compat.c: off core 0, all cores allowed */
 void xbox_nx_track_thread(void *entry);   /* win32_compat.c: Switch [perf] report */
 
 static void *game_thread(void *arg)
@@ -328,7 +329,9 @@ static int game_main(void)
 #endif
     xtrace_init();         /* RECOMP_TRACE: before any other thread exists */
     xtrace_thread_name("game main");
-    xbox_guest_pin(0);     /* the boot thread becomes the title's first thread */
+    /* Off the guest core while the runtime starts its threads (they inherit
+     * the mask); this thread goes onto it right before the title's code. */
+    xbox_nx_spread_thread();
     char xbe_path[512];
     const char *game_dir;
     void *xbe_data;
@@ -473,6 +476,7 @@ static int game_main(void)
 
     printf("Starting guest at 0x%08X (esp=0x%08X)\n", NFSU2_ENTRY_POINT, g_esp);
     xbox_gil_mark_main();      /* the frame-rate thread (RECOMP_GIL_EAGER) */
+    xbox_guest_pin(0);         /* the boot thread becomes the title's first thread */
     xbox_gil_enter();          /* guest code from here on (kernel_bridge.c) */
     xbe_entry_point();
     xbox_gil_leave();

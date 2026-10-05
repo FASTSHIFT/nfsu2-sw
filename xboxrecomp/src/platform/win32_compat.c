@@ -1020,7 +1020,27 @@ void xbox_nx_thread_report(double interval_s)
     fprintf(stderr, "%s\n", line);
 }
 #else
-void xbox_nx_spread_thread(void) { }
+/* With a guest core (RECOMP_GUEST_ONE_CORE): every host thread that does not
+ * run guest code keeps off it. Affinity is inherited, and the guest's first
+ * thread pins itself before it starts the runtime's threads (GL, executor,
+ * APU, timers, and through them SDL's and the GL driver's own), so without
+ * this all of them landed on the guest core: the first try ran the whole
+ * process on one core (race 1.5-2.2 fps). Guest threads call this too, from
+ * the trampoline, and xbox_guest_pin narrows them back to the guest core. */
+void xbox_nx_spread_thread(void)
+{
+    int core = xbox_guest_core();
+    long n = sysconf(_SC_NPROCESSORS_ONLN), c;
+    cpu_set_t set;
+
+    if (core < 0 || n < 2)
+        return;
+    CPU_ZERO(&set);
+    for (c = 0; c < n && c < CPU_SETSIZE; c++)
+        if (c != core)
+            CPU_SET((int)c, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+}
 void xbox_nx_track_thread(void *entry) { (void)entry; }
 void xbox_nx_retag_thread(void *entry) { (void)entry; }
 #endif

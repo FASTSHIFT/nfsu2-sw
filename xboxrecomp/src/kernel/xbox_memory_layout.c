@@ -1381,7 +1381,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             static uint32_t prev_put;
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
             uint32_t get = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
-            nv2a_thread_pause(put != prev_put || get != put);
+            int busy = put != prev_put || get != put;
+            if (!busy)
+                xtrace_begin("idle");       /* the 1 ms sleep, not the yields */
+            nv2a_thread_pause(busy);
+            if (!busy)
+                xtrace_end();
             prev_put = put;
         }
     }

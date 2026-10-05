@@ -35,6 +35,7 @@
  */
 #include "nv2a_gl.h"
 #include "gl_api.h"
+#include "kms_present.h"
 #include "platform/xtrace.h"
 #include "gl_psh.h"
 #include "gl_vsh.h"
@@ -810,7 +811,17 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2])
         /* An upload binds the new texture; on unit i, so the units of the
          * stages already bound for this draw keep theirs. */
         s_stage_unit = i;
-        tex = tex_get(va, color, w, h, pitch);
+        if (g_xtrace_on) {
+            /* A span only when it did more than find the texture checked this
+             * frame (over 20 us): hashing its bytes, decoding, uploading. */
+            uint32_t texs = s_hz_texs;
+            uint64_t t0 = xtrace_now(), t1;
+            tex = tex_get(va, color, w, h, pitch);
+            t1 = xtrace_now();
+            if (s_hz_texs != texs || t1 - t0 > 20000)
+                xtrace_span_(s_hz_texs != texs ? "tex upload" : "tex check", t0, t1);
+        } else
+            tex = tex_get(va, color, w, h, pitch);
         s_stage_unit = -1;
     }
     bind_unit(i, tex);
@@ -1262,6 +1273,10 @@ static int ready(void)
     }
     s_buf_bound[0] = s_vring.buf;
     s_buf_bound[1] = s_iring.buf;
+    if (nv2a_kms_init(s_win)) {  /* RECOMP_KMS_PRESENT: page flips, no swap */
+        s_buf_bound[0] = s_buf_bound[1] = 0; /* it bound its own objects */
+        tex_bind_forget();
+    }
     s_state = 1;
     prog_cache_prewarm();
     return 1;
@@ -2060,6 +2075,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
         if (s_prog_made != made) {
             s_hz_progs += s_prog_made - made;
             s_hz_prog_ns += hz_now() - t0;
+            xtrace_span("prog compile", t0, hz_now());
         }
     }
     if (!p)
@@ -2503,6 +2519,10 @@ static void gl_flip(void)
          * placeholder (a loading screen), or
          * at least a clear -- a buffer never drawn to reaches the screen as
          * whatever the driver left in it. */
+        if (nv2a_kms_active()) {
+            nv2a_kms_present(0, 0, 0, 0, 0, 0, 0, 0, 0);    /* black */
+            goto presented;
+        }
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         glDisable(GL_SCISSOR_TEST);
         glColorMask(1, 1, 1, 1);
@@ -2544,8 +2564,23 @@ static void gl_flip(void)
     /* The host may know the real on-screen size better than SDL (the
      * Switch's EGL surface follows the display, SDL keeps the window's
      * creation size). */
-    if (!nv2a_gl_screen_size(&ww, &wh) || ww <= 0 || wh <= 0)
+    if (nv2a_kms_active())
+        nv2a_kms_mode(&ww, &wh);
+    else if (!nv2a_gl_screen_size(&ww, &wh) || ww <= 0 || wh <= 0)
         SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    if (nv2a_kms_active()) {
+        float lw = (float)s->w / (float)s->aa_sx, lh = (float)s->h / (float)s->aa_sy;
+        if (xbox_video_widescreen() && lw < lh * 1.5f)
+            lw = lh * 16.0f / 9.0f;
+        float scale = (float)ww / lw < (float)wh / lh ? (float)ww / lw : (float)wh / lh;
+        int dw = (int)(lw * scale), dh = (int)(lh * scale);
+        xtrace_begin("KMS blit");
+        nv2a_kms_present(s->fbo, 0, 0, (int)s->pw, (int)s->ph,
+                         (ww - dw) / 2, (wh - dh) / 2, dw, dh);
+        xtrace_end();
+        fbo_forget();
+        goto presented;
+    }
     glBindFramebuffer(GL_READ_FRAMEBUFFER, s->fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
@@ -2579,6 +2614,7 @@ swap:
         xtrace_end();
         s_swap_ns += hz_now() - t0;
     }
+presented:
     gl_step_done("swap");
     call_stats_frame();
     tex_bind_forget();

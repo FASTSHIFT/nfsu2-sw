@@ -81,6 +81,14 @@ export RECOMP_AUDIO_BLOCKS=16
 export RECOMP_GL_THREAD=1
 export RECOMP_FRAME_LAG=1
 export RECOMP_GIL_EAGER=1
+# The Xbox's one CPU: guest threads (and the DPC/ISR threads) on core 3, the
+# runtime's (GL, executor, APU, the driver's) on 0-2. Guest-lock waits on the
+# main thread 76 -> 0.1 ms a frame, race frame 175 -> 137 ms (docs/02 13).
+export RECOMP_GUEST_ONE_CORE=1
+# Frames go out by KMS page flip from the GL thread instead of
+# eglSwapBuffers, which blocked it ~36 ms a frame (docs/02 13); falls back to
+# the swap by itself.
+export RECOMP_KMS_PRESENT=1
 # Which surfaces a frame draws into (one log line per 300 frames), to pick
 # passes for RECOMP_GL_SKIP=<WxH>,... (docs/02 §7.2).
 export RECOMP_GL_SURF_STATS=1

@@ -37,6 +37,8 @@ void xtrace_begin_(const char *name);
 void xtrace_end_(void);
 void xtrace_counter_(const char *name, int64_t value);
 void xtrace_instant_(const char *name);
+void xtrace_span_(const char *name, uint64_t t0_ns, uint64_t t1_ns);  /* a span after the fact */
+uint64_t xtrace_now(void);                    /* CLOCK_MONOTONIC ns, the trace's clock */
 void xtrace_thread_name(const char *name);   /* this thread's track name */
 void xtrace_init(void);                       /* reads RECOMP_TRACE; idempotent */
 
@@ -44,6 +46,8 @@ void xtrace_init(void);                       /* reads RECOMP_TRACE; idempotent 
 #define xtrace_end()         do { if (g_xtrace_on) xtrace_end_(); } while (0)
 #define xtrace_counter(n, v) do { if (g_xtrace_on) xtrace_counter_(n, (int64_t)(v)); } while (0)
 #define xtrace_instant(n)    do { if (g_xtrace_on) xtrace_instant_(n); } while (0)
+/* A span recorded after it happened (only kept when it turned out to matter). */
+#define xtrace_span(n, t0, t1) do { if (g_xtrace_on) xtrace_span_(n, t0, t1); } while (0)
 
 #ifdef __cplusplus
 }

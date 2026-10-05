@@ -7,6 +7,7 @@ project(nv2a_gl C)
 # Switch's Mesa.
 add_library(xbox_nv2a_gl STATIC
     nv2a_gl.c
+    kms_present.c
     gl_api.c
     gl_vsh.c
     gl_psh.c
@@ -36,7 +37,7 @@ elseif(NINTENDO_SWITCH)
 else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
-    target_link_libraries(xbox_nv2a_gl PUBLIC PkgConfig::SDL2)
+    target_link_libraries(xbox_nv2a_gl PUBLIC PkgConfig::SDL2 ${CMAKE_DL_LIBS})  # kms_present.c
 endif()
 if(NOT MSVC)
     target_compile_options(xbox_nv2a_gl PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)

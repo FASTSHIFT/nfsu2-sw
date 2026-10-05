@@ -18,4 +18,6 @@ void xtrace_end_(void) { }
 void xtrace_counter_(const char *name, int64_t value) { (void)name; (void)value; }
 void xtrace_instant_(const char *name) { (void)name; }
 void xtrace_thread_name(const char *name) { (void)name; }
+void xtrace_span_(const char *name, uint64_t a, uint64_t b) { (void)name; (void)a; (void)b; }
+uint64_t xtrace_now(void) { return 0; }
 void xtrace_init(void) { }
