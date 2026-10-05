@@ -134,19 +134,35 @@ static void put_at(uint32_t type, uint64_t payload, uint64_t ts)
 static void put(uint32_t type, uint64_t payload) { put_at(type, payload, now_ns()); }
 
 uint64_t xtrace_now(void) { return now_ns(); }
-/* Inside the caller's current span, so its begin and end land in order. */
-void xtrace_span_(const char *name, uint64_t t0, uint64_t t1)
-{
-    put_at(EV_BEGIN, (uint64_t)(uintptr_t)name, t0);
-    put_at(EV_END, 0, t1);
-}
 
 /* An END whose BEGIN came before recording started is dropped by the writer
- * (it pairs ENDs with the BEGINs it has seen). */
-void xtrace_begin_(const char *name) { put(EV_BEGIN, (uint64_t)(uintptr_t)name); }
-void xtrace_end_(void) { put(EV_END, 0); }
-void xtrace_instant_(const char *name) { put(EV_INSTANT, (uint64_t)(uintptr_t)name); }
-void xtrace_counter_(const char *name, int64_t v)
+ * (it pairs ENDs with the BEGINs it has seen). Ends close the innermost open
+ * span; their tag is not checked. */
+static uint32_t ev_type(char type)
+{
+    return type == 'B' ? EV_BEGIN : type == 'E' ? EV_END : EV_INSTANT;
+}
+void xtrace_write(const char *tag, char type)
+{
+    put(ev_type(type), type == 'E' ? 0 : (uint64_t)(uintptr_t)tag);
+}
+void xtrace_write_at(const char *tag, char type, uint64_t ts)
+{
+    put_at(ev_type(type), type == 'E' ? 0 : (uint64_t)(uintptr_t)tag, ts);
+}
+
+__thread int g_xtrace_draw_on;
+__thread uint64_t g_xtrace_draw_t;
+static uint32_t s_draw_every = XTRACE_DRAW_SAMPLE;     /* RECOMP_TRACE_DRAW */
+void xtrace_draw_start(void)
+{
+    static __thread uint32_t n;
+    g_xtrace_draw_on = (++n % s_draw_every) == 0;
+    if (g_xtrace_draw_on)
+        g_xtrace_draw_t = now_ns();
+}
+
+void xtrace_counter_write(const char *name, int64_t v)
 {
     int c;
     for (c = 0; c < s_ncounters && s_counter_name[c] != name; c++) { }
@@ -407,6 +423,8 @@ void xtrace_init(void)
         s_secs = atoi(e);
     if ((e = getenv("RECOMP_TRACE_EVENTS")) != NULL && atoi(e) > 1024)
         s_cap = (uint32_t)atoi(e);
+    if ((e = getenv("RECOMP_TRACE_DRAW")) != NULL && atoi(e) >= 1)
+        s_draw_every = (uint32_t)atoi(e);
     /* Blocked here, before other threads exist, so every thread inherits it
      * and only the control thread takes SIGUSR2. */
     sigemptyset(&set);
@@ -414,8 +432,9 @@ void xtrace_init(void)
     pthread_sigmask(SIG_BLOCK, &set, NULL);
     if (pthread_create(&th, NULL, control_thread, &set) == 0)
         pthread_detach(th);
-    fprintf(stderr, "[TRACE] armed: kill -USR2 %d to record (%s, %u events a thread)\n",
-            (int)getpid(), s_secs > 0 ? "stops by itself" : "USR2 again to stop", s_cap);
+    fprintf(stderr, "[TRACE] armed: kill -USR2 %d to record (%s, %u events a thread,"
+            " draw phases 1 in %u)\n", (int)getpid(),
+            s_secs > 0 ? "stops by itself" : "USR2 again to stop", s_cap, s_draw_every);
     if ((e = getenv("RECOMP_TRACE_START")) != NULL && *e == '1')
         start();
 }

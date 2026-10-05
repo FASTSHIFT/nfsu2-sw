@@ -680,11 +680,11 @@ static void gil_lock(void)
         g_gil_contended = 1;
     }
     if (me != s_gil_serving) {
-        xtrace_begin("GIL wait");
+        XTRACE_BEGIN_TAG("GIL wait");
         while (me != s_gil_serving)
             if (!SleepConditionVariableCS(&s_gil_cv, &s_gil_cs, 1))
                 g_gil_contended = 1;       /* 1 ms and still waiting */
-        xtrace_end();
+        XTRACE_END_TAG("GIL wait");
     }
     if (eager) {
         if (counted)
@@ -3246,21 +3246,21 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         long long now;
         int i;
 
-        xtrace_begin("idle");
+        XTRACE_BEGIN_TAG("idle");
         WaitForSingleObject(xbox_irq_line_event(), 10);   /* a device interrupt, or 10 ms */
-        xtrace_end();
+        XTRACE_END_TAG("idle");
         /* ISRs and DPCs run at DISPATCH or above: raising takes the dispatch
          * lock (kernel_hal.c), so none of them runs while a game thread is in
          * a raised section. */
         pending_start_flush(0); /* threads whose creator made no further call */
-        xtrace_begin("raise DISPATCH");
+        XTRACE_BEGIN_TAG("raise DISPATCH");
         xbox_KfRaiseIrql(DISPATCH_LEVEL);
-        xtrace_end();
-        xtrace_begin("vblank+irq+DPC");
+        XTRACE_END_TAG("raise DISPATCH");
+        XTRACE_BEGIN_TAG("vblank+irq+DPC");
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_service_irqs(); /* device interrupts; their DPCs drain below */
         kernel_drain_dpcs();   /* deferred work, before due timers */
-        xtrace_end();
+        XTRACE_END_TAG("vblank+irq+DPC");
         now = (long long)GetTickCount64();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
@@ -10120,12 +10120,13 @@ static void kernel_thunk_dispatch(void)
     xbox_kernel_busy(1);
     /* Not PsCreateSystemThreadEx (255): the first call runs the title's main
      * thread inline and would be one span over the whole run. */
-    if (g_xtrace_on && g_kernel_dispatch_slot >= 0
+    if (XTRACE_ON && g_kernel_dispatch_slot >= 0
         && g_kernel_dispatch_slot < XBOX_KERNEL_THUNK_TABLE_SIZE
         && g_slot_ordinals[g_kernel_dispatch_slot] != 255) {
-        xtrace_begin_(kernel_trace_name(g_slot_ordinals[g_kernel_dispatch_slot]));
+        const char *tag = kernel_trace_name(g_slot_ordinals[g_kernel_dispatch_slot]);
+        XTRACE_BEGIN_TAG(tag);
         kernel_thunk_dispatch_body();
-        xtrace_end_();
+        XTRACE_END_TAG(tag);
     } else
         kernel_thunk_dispatch_body();
     xbox_kernel_busy(-1);

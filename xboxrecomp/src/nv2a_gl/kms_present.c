@@ -172,13 +172,13 @@ static void *flip_thread(void *arg)
         f = K.fence[0];
         pthread_mutex_unlock(&K.lock);
 
-        xtrace_begin("blit fence");
+        XTRACE_BEGIN_TAG("blit fence");
         if (f) {
             k_eglClientWaitSync(K.dpy, f, 0, 200000000ull);       /* 200 ms */
             k_eglDestroySync(K.dpy, f);
         }
-        xtrace_end();
-        xtrace_begin("page flip");
+        XTRACE_END_TAG("blit fence");
+        XTRACE_BEGIN_TAG("page flip");
         for (tries = 0; k_PageFlip(K.fd, K.crtc, K.bo[b].fb, 0, NULL) != 0; tries++) {
             if (errno != EBUSY || tries > 50) {      /* 50 x 2 ms: give up on this one */
                 fprintf(stderr, "  [KMS] page flip: %s\n", strerror(errno));
@@ -186,8 +186,8 @@ static void *flip_thread(void *arg)
             }
             usleep(2000);
         }
-        xtrace_end();
-        xtrace_begin("vblank");
+        XTRACE_END_TAG("page flip");
+        XTRACE_BEGIN_TAG("vblank");
         {
             KVBlank vb;
             memset(&vb, 0, sizeof vb);
@@ -196,7 +196,7 @@ static void *flip_thread(void *arg)
             if (k_WaitVBlank(K.fd, &vb) != 0)
                 usleep(17000);                       /* no vblank wait: a 60 Hz period */
         }
-        xtrace_end();
+        XTRACE_END_TAG("vblank");
 
         pthread_mutex_lock(&K.lock);
         for (k = 0; k < K.nbo; k++)
@@ -403,14 +403,14 @@ void nv2a_kms_present(GLuint src, int sx0, int sy0, int sx1, int sy1,
             struct timespec ts;
             clock_gettime(CLOCK_MONOTONIC, &ts);
             t0 = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-            xtrace_begin("wait scanout buffer");
+            XTRACE_BEGIN_TAG("wait scanout buffer");
         }
         pthread_cond_wait(&K.cv, &K.lock);
     }
     pthread_mutex_unlock(&K.lock);
     if (t0) {
         struct timespec ts;
-        xtrace_end();
+        XTRACE_END_TAG("wait scanout buffer");
         clock_gettime(CLOCK_MONOTONIC, &ts);
         K.gl_waits_ns += (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec - t0;
     }

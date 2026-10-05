@@ -13,11 +13,14 @@ void xbox_nx_track_thread(void *entry) { (void)entry; }
 /* xtrace.h: tracing is POSIX-only (xtrace.c); these keep the hooks linking. */
 #include "xtrace.h"
 volatile int g_xtrace_on;
-void xtrace_begin_(const char *name) { (void)name; }
-void xtrace_end_(void) { }
-void xtrace_counter_(const char *name, int64_t value) { (void)name; (void)value; }
-void xtrace_instant_(const char *name) { (void)name; }
-void xtrace_thread_name(const char *name) { (void)name; }
-void xtrace_span_(const char *name, uint64_t a, uint64_t b) { (void)name; (void)a; (void)b; }
+void xtrace_write(const char *tag, char type) { (void)tag; (void)type; }
+void xtrace_write_at(const char *tag, char type, uint64_t t) { (void)tag; (void)type; (void)t; }
+void xtrace_counter_write(const char *name, int64_t value) { (void)name; (void)value; }
 uint64_t xtrace_now(void) { return 0; }
+void xtrace_thread_name(const char *name) { (void)name; }
 void xtrace_init(void) { }
+#if XTRACE_DRAW && !defined(XTRACE_DISABLE)
+__thread int g_xtrace_draw_on;
+__thread uint64_t g_xtrace_draw_t;
+void xtrace_draw_start(void) { }
+#endif

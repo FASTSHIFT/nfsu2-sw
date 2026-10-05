@@ -1300,9 +1300,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         LARGE_INTEGER a, b;
                         if (!f.QuadPart) { QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t_last); }
                         QueryPerformanceCounter(&a);
-                        xtrace_begin("pb exec");
+                        XTRACE_BEGIN_TAG("pb exec");
                         nv2a_pb_scan(put);
-                        xtrace_end();
+                        XTRACE_END_TAG("pb exec");
                         QueryPerformanceCounter(&b);
                         busy += b.QuadPart - a.QuadPart;
                         if (b.QuadPart - t_last.QuadPart > f.QuadPart) {
@@ -1383,10 +1383,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             uint32_t get = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
             int busy = put != prev_put || get != put;
             if (!busy)
-                xtrace_begin("idle");       /* the 1 ms sleep, not the yields */
+                XTRACE_BEGIN_TAG("idle");       /* the 1 ms sleep, not the yields */
             nv2a_thread_pause(busy);
             if (!busy)
-                xtrace_end();
+                XTRACE_END_TAG("idle");
             prev_put = put;
         }
     }

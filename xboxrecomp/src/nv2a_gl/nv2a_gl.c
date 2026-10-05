@@ -811,7 +811,7 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2])
         /* An upload binds the new texture; on unit i, so the units of the
          * stages already bound for this draw keep theirs. */
         s_stage_unit = i;
-        if (g_xtrace_on) {
+        if (XTRACE_ON) {
             /* A span only when it did more than find the texture checked this
              * frame (over 20 us): hashing its bytes, decoding, uploading. */
             uint32_t texs = s_hz_texs;
@@ -819,7 +819,7 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2])
             tex = tex_get(va, color, w, h, pitch);
             t1 = xtrace_now();
             if (s_hz_texs != texs || t1 - t0 > 20000)
-                xtrace_span_(s_hz_texs != texs ? "tex upload" : "tex check", t0, t1);
+                XTRACE_SPAN(s_hz_texs != texs ? "tex upload" : "tex check", t0, t1);
         } else
             tex = tex_get(va, color, w, h, pitch);
         s_stage_unit = -1;
@@ -2040,6 +2040,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     }
     s_regs = r;
     s_batch = b;
+    XTRACE_DRAW_START;          /* per-draw phases, 1 draw in 16 */
     s = surf_bind(&b->surface, b->zeta_va);
     if (!s)
         return;
@@ -2075,7 +2076,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
         if (s_prog_made != made) {
             s_hz_progs += s_prog_made - made;
             s_hz_prog_ns += hz_now() - t0;
-            xtrace_span("prog compile", t0, hz_now());
+            XTRACE_SPAN("prog compile", t0, hz_now());
         }
     }
     if (!p)
@@ -2086,6 +2087,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
         glUseProgram(p->prog);
         s_cur_prog = p->prog;
     }
+    XTRACE_DRAW_MARK("d:surface+program");
 
     {
         uint32_t texs = s_hz_texs;
@@ -2095,6 +2097,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
         if (s_hz_texs != texs)
             s_hz_tex_ns += hz_now() - t0;
     }
+    XTRACE_DRAW_MARK("d:textures");
     for (i = 0; i < 8; i++) {
         argb_vec4(r[0xA60 / 4 + i], c0[i]);
         argb_vec4(r[0xA80 / 4 + i], c1[i]);
@@ -2268,11 +2271,14 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
         }
     }
 
+    XTRACE_DRAW_MARK("d:uniforms");
     apply_state(r, b->zeta_va != 0);
+    XTRACE_DRAW_MARK("d:state");
 
     bind_vao();
     if (!upload_vertices(b))
         return;
+    XTRACE_DRAW_MARK("d:vertices");
     {
         /* The absent attributes read the title's SET_VERTEX_DATA* values
          * (Nv2aRawBatch.attr_const); set them only when those or the set of
@@ -2336,7 +2342,20 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
                     draws, s->va, s->w, s->h, b->prim, n, b->vertex_count,
                     b->attr_present, b->xform, b->vp_start, pk.shader_program, pk.control,
                     r[0x1B00 / 4], (r[0x1B04 / 4] >> 8) & 0xFF);
-        glDrawElements(mode, (GLsizei)n, idx_type, (const void *)(uintptr_t)idx_at);
+        XTRACE_DRAW_MARK("d:indices");
+        /* The vertex range is known -- indices are into the batch's gathered
+         * vertices -- so say it: without it the Mali blob reads back the
+         * whole index list from the (write-combined, persistent) ring to find
+         * it, ~0.16 us an index, which was most of a draw's driver time
+         * (r36s-tools/gpubench drawbench idx: 1536 indices 266 -> 16 us). */
+        if (b->vertex_count)
+            glDrawRangeElements(mode, 0, b->vertex_count - 1, (GLsizei)n, idx_type,
+                                (const void *)(uintptr_t)idx_at);
+        else
+            glDrawElements(mode, (GLsizei)n, idx_type, (const void *)(uintptr_t)idx_at);
+        XTRACE_DRAW_MARK("d:glDrawElements");      /* or glDrawRangeElements */
+        XTRACE_DRAW_COUNTER("draw verts", b->vertex_count);
+        XTRACE_DRAW_COUNTER("draw indices", n);
         gl_step_done("draw");
         if (s_watch_hit) {
             /* What the watched draw left: the target's centre and corner. */
@@ -2574,10 +2593,10 @@ static void gl_flip(void)
             lw = lh * 16.0f / 9.0f;
         float scale = (float)ww / lw < (float)wh / lh ? (float)ww / lw : (float)wh / lh;
         int dw = (int)(lw * scale), dh = (int)(lh * scale);
-        xtrace_begin("KMS blit");
+        XTRACE_BEGIN_TAG("KMS blit");
         nv2a_kms_present(s->fbo, 0, 0, (int)s->pw, (int)s->ph,
                          (ww - dw) / 2, (wh - dh) / 2, dw, dh);
-        xtrace_end();
+        XTRACE_END_TAG("KMS blit");
         fbo_forget();
         goto presented;
     }
@@ -2609,9 +2628,9 @@ swap:
     gl_step_done("present");
     {
         uint64_t t0 = hz_now();
-        xtrace_begin("SwapWindow");
+        XTRACE_BEGIN_TAG("SwapWindow");
         SDL_GL_SwapWindow(s_win);
-        xtrace_end();
+        XTRACE_END_TAG("SwapWindow");
         s_swap_ns += hz_now() - t0;
     }
 presented:
@@ -2709,12 +2728,12 @@ static uint8_t *q_reserve(size_t size)
         need += Q_BYTES - off;                  /* the wrap filler */
     if (Q_BYTES - (s_q_head - __atomic_load_n(&s_q_tail, __ATOMIC_ACQUIRE)) < need) {
         uint64_t t0 = q_now_ns();
-        xtrace_begin("wait GL (queue full)");
+        XTRACE_BEGIN_TAG("wait GL (queue full)");
         pthread_mutex_lock(&s_q_lock);
         s_q_producer_waits = 1;
         while (Q_BYTES - (s_q_head - __atomic_load_n(&s_q_tail, __ATOMIC_ACQUIRE)) < need)
             q_timed_wait();
-        xtrace_end();
+        XTRACE_END_TAG("wait GL (queue full)");
         s_q_producer_waits = 0;
         pthread_mutex_unlock(&s_q_lock);
         __atomic_add_fetch(&s_q_exec_wait_ns, q_now_ns() - t0, __ATOMIC_RELAXED);
@@ -2914,14 +2933,14 @@ static void q_flip(void)
     /* No more than two frames behind the executor. */
     if (__atomic_load_n(&s_q_flips, __ATOMIC_ACQUIRE) >= 2) {
         uint64_t t0 = q_now_ns();
-        xtrace_begin("wait GL (2 frames queued)");
+        XTRACE_BEGIN_TAG("wait GL (2 frames queued)");
         pthread_mutex_lock(&s_q_lock);
         s_q_producer_waits = 1;
         while (__atomic_load_n(&s_q_flips, __ATOMIC_ACQUIRE) >= 2)
             q_timed_wait();
         s_q_producer_waits = 0;
         pthread_mutex_unlock(&s_q_lock);
-        xtrace_end();
+        XTRACE_END_TAG("wait GL (2 frames queued)");
         __atomic_add_fetch(&s_q_exec_wait_ns, q_now_ns() - t0, __ATOMIC_RELAXED);
     }
     nreg = q_reg_collect();
@@ -2931,7 +2950,7 @@ static void q_flip(void)
     ((QHdr *)rec)->size = (uint32_t)size;
     __atomic_add_fetch(&s_q_flips, 1, __ATOMIC_ACQ_REL);
     q_publish(size);
-    xtrace_instant("flip queued");
+    XTRACE_INSTANT("flip queued");
 }
 
 static void *q_gl_thread(void *arg)
@@ -2951,14 +2970,14 @@ static void *q_gl_thread(void *arg)
 
         if (!avail) {
             uint64_t t0 = q_now_ns();
-            xtrace_begin("queue empty");
+            XTRACE_BEGIN_TAG("queue empty");
             pthread_mutex_lock(&s_q_lock);
             __atomic_store_n(&s_q_consumer_waits, 1, __ATOMIC_SEQ_CST);
             while (__atomic_load_n(&s_q_head, __ATOMIC_SEQ_CST) == s_q_tail)
                 q_timed_wait();
             __atomic_store_n(&s_q_consumer_waits, 0, __ATOMIC_SEQ_CST);
             pthread_mutex_unlock(&s_q_lock);
-            xtrace_end();
+            XTRACE_END_TAG("queue empty");
             __atomic_add_fetch(&s_q_gl_idle_ns, q_now_ns() - t0, __ATOMIC_RELAXED);
             continue;
         }
@@ -2990,20 +3009,20 @@ static void *q_gl_thread(void *arg)
                         bb.direct[a].ptr = rec + (uintptr_t)bb.direct[a].ptr;
                 bb.attrs = (const float *)(rec + (uintptr_t)bb.attrs);
                 bb.indices = (const uint32_t *)(rec + (uintptr_t)bb.indices);
-                xtrace_begin("draw");
+                XTRACE_BEGIN_TAG("draw");
                 gl_draw_raw(&bb);
-                xtrace_end();
+                XTRACE_END_TAG("draw");
             } else if (h->type == Q_CLEAR) {
                 const QClear *c = (const QClear *)(rec + at);
-                xtrace_begin("clear");
+                XTRACE_BEGIN_TAG("clear");
                 gl_clear(&c->s, &c->rs, c->flags, c->argb, c->zs);
-                xtrace_end();
+                XTRACE_END_TAG("clear");
             } else if (h->type == Q_FLIP) {
-                xtrace_begin("flip");
+                XTRACE_BEGIN_TAG("flip");
                 gl_flip();
-                xtrace_end();
+                XTRACE_END_TAG("flip");
                 __atomic_sub_fetch(&s_q_flips, 1, __ATOMIC_ACQ_REL);
-                xtrace_counter("GL frames queued", __atomic_load_n(&s_q_flips, __ATOMIC_RELAXED));
+                XTRACE_COUNTER("GL frames queued", __atomic_load_n(&s_q_flips, __ATOMIC_RELAXED));
             }
         }
         __atomic_store_n(&s_q_tail, s_q_tail + h->size, __ATOMIC_SEQ_CST);

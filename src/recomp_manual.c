@@ -308,15 +308,15 @@ void sub_002E8F20(void)
                     MEM32(esp + 4) = prev;
                 prev = mine;
             }
-            xtrace_instant("frame");
-            xtrace_begin("frame fence");
+            XTRACE_INSTANT("frame");
+            XTRACE_BEGIN_TAG("frame fence");
             sub_002E8F20_gen();
-            xtrace_end();
+            XTRACE_END_TAG("frame fence");
             return;
         }
-        xtrace_begin("BlockOnFence");
+        XTRACE_BEGIN_TAG("BlockOnFence");
         sub_002E8F20_gen();
-        xtrace_end();
+        XTRACE_END_TAG("BlockOnFence");
         return;
     }
     if (sem)

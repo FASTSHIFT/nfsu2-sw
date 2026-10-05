@@ -524,13 +524,13 @@ static void se_frame(MCPXAPUState *d)
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     memset(mixbins, 0, sizeof(mixbins));
 
-    xtrace_begin("apu vp");
+    XTRACE_BEGIN_TAG("apu vp");
     mcpx_apu_vp_frame(d, mixbins);
-    xtrace_end();
-    xtrace_begin("apu dsp+out");
+    XTRACE_END_TAG("apu vp");
+    XTRACE_BEGIN_TAG("apu dsp+out");
     mcpx_apu_dsp_frame(d, mixbins);
     mcpx_apu_monitor_frame(d);
-    xtrace_end();
+    XTRACE_END_TAG("apu dsp+out");
 
     d->ep_frame_div++;
 

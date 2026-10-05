@@ -199,6 +199,7 @@ X(GLboolean, glUnmapBuffer, (GLenum)) \
     X(void, glDisableVertexAttribArray, (GLuint)) \
     X(void, glVertexAttrib4f, (GLuint, GLfloat, GLfloat, GLfloat, GLfloat)) \
     X(void, glDrawElements, (GLenum, GLsizei, GLenum, const void *)) \
+    X(void, glDrawRangeElements, (GLenum, GLuint, GLuint, GLsizei, GLenum, const void *)) \
     X(void, glDrawArrays, (GLenum, GLint, GLsizei))
 
 #define NV2A_GL_DECLARE(ret, name, args) \
@@ -329,6 +330,7 @@ static inline void nv2a_glClearDepth(double d)
 #define glDisableVertexAttribArray NV2A_GLCALL(glDisableVertexAttribArray)
 #define glVertexAttrib4f         NV2A_GLCALL(glVertexAttrib4f)
 #define glDrawElements           NV2A_GLCALL(glDrawElements)
+#define glDrawRangeElements      NV2A_GLCALL(glDrawRangeElements)
 #define glDrawArrays             NV2A_GLCALL(glDrawArrays)
 
 #endif /* NV2A_GL_API_H */
