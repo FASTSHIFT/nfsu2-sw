@@ -18,6 +18,7 @@
  *   - Intercept D3D/audio calls for custom rendering or sound
  */
 
+#include "platform/xtrace.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -307,8 +308,15 @@ void sub_002E8F20(void)
                     MEM32(esp + 4) = prev;
                 prev = mine;
             }
+            xtrace_instant("frame");
+            xtrace_begin("frame fence");
+            sub_002E8F20_gen();
+            xtrace_end();
+            return;
         }
+        xtrace_begin("BlockOnFence");
         sub_002E8F20_gen();
+        xtrace_end();
         return;
     }
     if (sem)

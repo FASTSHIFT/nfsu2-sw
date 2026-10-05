@@ -19,6 +19,7 @@
 #  include <signal.h>
 #  include <unistd.h>
 #endif
+#include "platform/xtrace.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -325,6 +326,8 @@ static int game_main(void)
 #ifdef NFSU2_PGO_GEN
     pgo_dump_install();    /* before any other thread exists */
 #endif
+    xtrace_init();         /* RECOMP_TRACE: before any other thread exists */
+    xtrace_thread_name("game main");
     xbox_guest_pin(0);     /* the boot thread becomes the title's first thread */
     char xbe_path[512];
     const char *game_dir;

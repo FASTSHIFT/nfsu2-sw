@@ -35,6 +35,7 @@
  */
 #include "nv2a_gl.h"
 #include "gl_api.h"
+#include "platform/xtrace.h"
 #include "gl_psh.h"
 #include "gl_vsh.h"
 #include "../kernel/nv2a_backend.h"
@@ -2573,7 +2574,9 @@ swap:
     gl_step_done("present");
     {
         uint64_t t0 = hz_now();
+        xtrace_begin("SwapWindow");
         SDL_GL_SwapWindow(s_win);
+        xtrace_end();
         s_swap_ns += hz_now() - t0;
     }
     gl_step_done("swap");
@@ -2670,10 +2673,12 @@ static uint8_t *q_reserve(size_t size)
         need += Q_BYTES - off;                  /* the wrap filler */
     if (Q_BYTES - (s_q_head - __atomic_load_n(&s_q_tail, __ATOMIC_ACQUIRE)) < need) {
         uint64_t t0 = q_now_ns();
+        xtrace_begin("wait GL (queue full)");
         pthread_mutex_lock(&s_q_lock);
         s_q_producer_waits = 1;
         while (Q_BYTES - (s_q_head - __atomic_load_n(&s_q_tail, __ATOMIC_ACQUIRE)) < need)
             q_timed_wait();
+        xtrace_end();
         s_q_producer_waits = 0;
         pthread_mutex_unlock(&s_q_lock);
         __atomic_add_fetch(&s_q_exec_wait_ns, q_now_ns() - t0, __ATOMIC_RELAXED);
@@ -2873,12 +2878,14 @@ static void q_flip(void)
     /* No more than two frames behind the executor. */
     if (__atomic_load_n(&s_q_flips, __ATOMIC_ACQUIRE) >= 2) {
         uint64_t t0 = q_now_ns();
+        xtrace_begin("wait GL (2 frames queued)");
         pthread_mutex_lock(&s_q_lock);
         s_q_producer_waits = 1;
         while (__atomic_load_n(&s_q_flips, __ATOMIC_ACQUIRE) >= 2)
             q_timed_wait();
         s_q_producer_waits = 0;
         pthread_mutex_unlock(&s_q_lock);
+        xtrace_end();
         __atomic_add_fetch(&s_q_exec_wait_ns, q_now_ns() - t0, __ATOMIC_RELAXED);
     }
     nreg = q_reg_collect();
@@ -2888,6 +2895,7 @@ static void q_flip(void)
     ((QHdr *)rec)->size = (uint32_t)size;
     __atomic_add_fetch(&s_q_flips, 1, __ATOMIC_ACQ_REL);
     q_publish(size);
+    xtrace_instant("flip queued");
 }
 
 static void *q_gl_thread(void *arg)
@@ -2897,6 +2905,7 @@ static void *q_gl_thread(void *arg)
     (void)arg;
     xbox_nx_spread_thread();
     xbox_nx_track_thread((void *)q_gl_thread);
+    xtrace_thread_name("GL");
     for (;;) {
         size_t avail = __atomic_load_n(&s_q_head, __ATOMIC_SEQ_CST) - s_q_tail;
         uint8_t *rec;
@@ -2906,12 +2915,14 @@ static void *q_gl_thread(void *arg)
 
         if (!avail) {
             uint64_t t0 = q_now_ns();
+            xtrace_begin("queue empty");
             pthread_mutex_lock(&s_q_lock);
             __atomic_store_n(&s_q_consumer_waits, 1, __ATOMIC_SEQ_CST);
             while (__atomic_load_n(&s_q_head, __ATOMIC_SEQ_CST) == s_q_tail)
                 q_timed_wait();
             __atomic_store_n(&s_q_consumer_waits, 0, __ATOMIC_SEQ_CST);
             pthread_mutex_unlock(&s_q_lock);
+            xtrace_end();
             __atomic_add_fetch(&s_q_gl_idle_ns, q_now_ns() - t0, __ATOMIC_RELAXED);
             continue;
         }
@@ -2943,13 +2954,20 @@ static void *q_gl_thread(void *arg)
                         bb.direct[a].ptr = rec + (uintptr_t)bb.direct[a].ptr;
                 bb.attrs = (const float *)(rec + (uintptr_t)bb.attrs);
                 bb.indices = (const uint32_t *)(rec + (uintptr_t)bb.indices);
+                xtrace_begin("draw");
                 gl_draw_raw(&bb);
+                xtrace_end();
             } else if (h->type == Q_CLEAR) {
                 const QClear *c = (const QClear *)(rec + at);
+                xtrace_begin("clear");
                 gl_clear(&c->s, &c->rs, c->flags, c->argb, c->zs);
+                xtrace_end();
             } else if (h->type == Q_FLIP) {
+                xtrace_begin("flip");
                 gl_flip();
+                xtrace_end();
                 __atomic_sub_fetch(&s_q_flips, 1, __ATOMIC_ACQ_REL);
+                xtrace_counter("GL frames queued", __atomic_load_n(&s_q_flips, __ATOMIC_RELAXED));
             }
         }
         __atomic_store_n(&s_q_tail, s_q_tail + h->size, __ATOMIC_SEQ_CST);

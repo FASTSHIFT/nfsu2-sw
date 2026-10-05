@@ -29,6 +29,7 @@
 #include "xbox_memory_layout.h"
 #include "guest_vmem.h"
 #include "recomp_icall_feedback.h"
+#include "platform/xtrace.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -678,9 +679,13 @@ static void gil_lock(void)
     if (me != s_gil_serving && xbox_thread_holds_dispatch()) {
         g_gil_contended = 1;
     }
-    while (me != s_gil_serving)
-        if (!SleepConditionVariableCS(&s_gil_cv, &s_gil_cs, 1))
-            g_gil_contended = 1;           /* 1 ms and still waiting */
+    if (me != s_gil_serving) {
+        xtrace_begin("GIL wait");
+        while (me != s_gil_serving)
+            if (!SleepConditionVariableCS(&s_gil_cv, &s_gil_cs, 1))
+                g_gil_contended = 1;       /* 1 ms and still waiting */
+        xtrace_end();
+    }
     if (eager) {
         if (counted)
             s_gil_waiting[prio]--;
@@ -785,7 +790,9 @@ struct bridge_thread_start {
     recomp_func_t fn;
     uint32_t ctx1, ctx2, stack_top;
     uint32_t tib;          /* allocated at creation: it is also the KTHREAD */
+    uint32_t entry_va;     /* the guest start routine: the trace names it */
 };
+static RECOMP_TLS uint32_t t_spawn_entry;   /* bridge_spawn_thread's caller sets it */
 
 static void bridge_write_handle(uint32_t handle_va, HANDLE h);
 
@@ -825,6 +832,19 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
         else
             fprintf(stderr, "  [KERNEL] worker thread has no TIB of its own;"
                             " it shares the main thread's\n");
+    }
+    {
+        /* The trace's track name: the lifted function it runs. */
+        static char names[64][24];
+        static int nnames;
+        int k = __atomic_fetch_add(&nnames, 1, __ATOMIC_RELAXED);
+        if (k < 64) {
+            /* XAPI's CreateThread starts every thread in one wrapper with the
+             * real routine as the first context: entry:context1 tells the
+             * threads apart (and for XAPI threads, context1 is the routine). */
+            snprintf(names[k], sizeof names[k], "guest %06X:%06X", s->entry_va, ctx1);
+            xtrace_thread_name(names[k]);
+        }
     }
     free(s);
     guest_thread_self();
@@ -898,6 +918,7 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
     if (!s) return NULL;
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
     s->tib = xbox_AllocThreadTib();
+    s->entry_va = t_spawn_entry;
 
     th = CreateThread(NULL, 0, bridge_thread_main, s, CREATE_SUSPENDED, NULL);
     /* Registered now, not when it first runs: the creator sets its priority
@@ -1044,9 +1065,11 @@ static void bridge_PsCreateSystemThreadEx(void)
                     fflush(stderr);
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
-                    HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top,
-                                                    (uint8_t)STACK_ARG(7));
+                    HANDLE th;
+                    t_spawn_entry = start_routine;
+                    th = bridge_spawn_thread(fn, start_context1,
+                                             start_context2, stack_top,
+                                             (uint8_t)STACK_ARG(7));
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
@@ -3193,6 +3216,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 
     (void)unused;
     xbox_guest_pin(1);             /* DPCs and vblank: interrupt-like, guest core */
+    xtrace_thread_name("timer/DPC");
     if (slot < 0) {
         fprintf(stderr, "  [KERNEL] timer thread has no worker stack; "
                         "timer DPCs will not run\n");
@@ -3227,10 +3251,14 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
          * lock (kernel_hal.c), so none of them runs while a game thread is in
          * a raised section. */
         pending_start_flush(0); /* threads whose creator made no further call */
+        xtrace_begin("raise DISPATCH");
         xbox_KfRaiseIrql(DISPATCH_LEVEL);
+        xtrace_end();
+        xtrace_begin("vblank+irq+DPC");
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_service_irqs(); /* device interrupts; their DPCs drain below */
         kernel_drain_dpcs();   /* deferred work, before due timers */
+        xtrace_end();
         now = (long long)GetTickCount64();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
@@ -8508,8 +8536,10 @@ static void bridge_PsCreateSystemThread(void)
                 if (!stack_top) {
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
-                    HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top, 0);
+                    HANDLE th;
+                    t_spawn_entry = start_routine;
+                    th = bridge_spawn_thread(fn, start_context1,
+                                             start_context2, stack_top, 0);
                     if (xbox_handle_ptr && th)
                         bridge_write_handle(xbox_handle_ptr, th);
                 }
@@ -10051,6 +10081,32 @@ static int kernel_call_keeps_gil(int slot)
         || ord == 160 || ord == 161;          /* KeRaiseIrqlTo*, KfRaise/LowerIrql */
 }
 
+/* Trace span names for kernel calls (the ones a frame waits in), else one
+ * name per ordinal. Static strings: the trace keys names by pointer. */
+static const char *kernel_trace_name(ULONG ord)
+{
+    static char other[XBOX_KERNEL_THUNK_TABLE_SIZE][16];
+    switch (ord) {
+    case 99:  return "k:KeDelayExecutionThread";
+    case 159: return "k:KeWaitForSingleObject";
+    case 158: return "k:KeWaitForMultipleObjects";
+    case 233: return "k:NtWaitForSingleObject";
+    case 234: return "k:NtWaitForSingleObjectEx";
+    case 235: return "k:NtWaitForMultipleObjectsEx";
+    case 238: return "k:NtYieldExecution";
+    case 145: return "k:KeSetEvent";
+    case 225: return "k:NtSetEvent";
+    case 219: return "k:NtReadFile";
+    case 236: return "k:NtWriteFile";
+    case 190: return "k:NtCreateFile";
+    }
+    if (ord >= XBOX_KERNEL_THUNK_TABLE_SIZE)
+        return "k:?";
+    if (!other[ord][0])
+        snprintf(other[ord], sizeof other[ord], "k:%lu", (unsigned long)ord);
+    return other[ord];
+}
+
 static void kernel_thunk_dispatch(void)
 {
     if (kernel_call_keeps_gil(g_kernel_dispatch_slot)) {
@@ -10060,7 +10116,16 @@ static void kernel_thunk_dispatch(void)
     int gil = xbox_gil_suspend();                /* the kernel is not guest code */
     pending_start_flush(GetCurrentThreadId());   /* threads this one created */
     xbox_kernel_busy(1);
-    kernel_thunk_dispatch_body();
+    /* Not PsCreateSystemThreadEx (255): the first call runs the title's main
+     * thread inline and would be one span over the whole run. */
+    if (g_xtrace_on && g_kernel_dispatch_slot >= 0
+        && g_kernel_dispatch_slot < XBOX_KERNEL_THUNK_TABLE_SIZE
+        && g_slot_ordinals[g_kernel_dispatch_slot] != 255) {
+        xtrace_begin_(kernel_trace_name(g_slot_ordinals[g_kernel_dispatch_slot]));
+        kernel_thunk_dispatch_body();
+        xtrace_end_();
+    } else
+        kernel_thunk_dispatch_body();
     xbox_kernel_busy(-1);
     xbox_gil_resume(gil);
 }

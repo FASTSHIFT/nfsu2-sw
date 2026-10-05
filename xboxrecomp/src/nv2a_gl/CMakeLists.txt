@@ -12,6 +12,7 @@ add_library(xbox_nv2a_gl STATIC
     gl_psh.c
 )
 target_include_directories(xbox_nv2a_gl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(xbox_nv2a_gl PUBLIC platform)    # platform/xtrace.h
 
 # OpenGL ES 3.x by default instead of desktop GL 3.3 core (ARM handhelds
 # whose GPU driver has no desktop GL). RECOMP_GL_ES=0/1 overrides at run time.

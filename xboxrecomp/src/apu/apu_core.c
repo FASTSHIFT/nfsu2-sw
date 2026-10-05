@@ -19,6 +19,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "platform/xtrace.h"
 #include "apu_state.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
@@ -523,9 +524,13 @@ static void se_frame(MCPXAPUState *d)
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     memset(mixbins, 0, sizeof(mixbins));
 
+    xtrace_begin("apu vp");
     mcpx_apu_vp_frame(d, mixbins);
+    xtrace_end();
+    xtrace_begin("apu dsp+out");
     mcpx_apu_dsp_frame(d, mixbins);
     mcpx_apu_monitor_frame(d);
+    xtrace_end();
 
     d->ep_frame_div++;
 
@@ -546,6 +551,7 @@ static void se_frame(MCPXAPUState *d)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+    xtrace_thread_name("apu");
     /* Audio misses are audible, a late game frame is not: stay ahead of the
      * game's busy threads for the few microseconds a block takes. */
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);

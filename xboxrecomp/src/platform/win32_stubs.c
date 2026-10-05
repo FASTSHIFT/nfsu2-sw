@@ -9,3 +9,13 @@ void xbox_nx_raise_host_thread(void) { }
 void xbox_nx_retag_thread(void *entry) { (void)entry; }
 void xbox_nx_spread_thread(void) { }
 void xbox_nx_track_thread(void *entry) { (void)entry; }
+
+/* xtrace.h: tracing is POSIX-only (xtrace.c); these keep the hooks linking. */
+#include "xtrace.h"
+volatile int g_xtrace_on;
+void xtrace_begin_(const char *name) { (void)name; }
+void xtrace_end_(void) { }
+void xtrace_counter_(const char *name, int64_t value) { (void)name; (void)value; }
+void xtrace_instant_(const char *name) { (void)name; }
+void xtrace_thread_name(const char *name) { (void)name; }
+void xtrace_init(void) { }

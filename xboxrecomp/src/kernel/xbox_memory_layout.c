@@ -13,6 +13,7 @@
  */
 
 #include "xbox_memory_layout.h"
+#include "platform/xtrace.h"
 #include "kernel.h"
 #include <stdio.h>
 #if !defined(_WIN32)
@@ -1207,6 +1208,7 @@ static DWORD WINAPI nv2a_flag_thread(LPVOID param)
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    xtrace_thread_name("executor");
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         nv2a_ack_flags(regs);
         {
@@ -1298,7 +1300,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         LARGE_INTEGER a, b;
                         if (!f.QuadPart) { QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t_last); }
                         QueryPerformanceCounter(&a);
+                        xtrace_begin("pb exec");
                         nv2a_pb_scan(put);
+                        xtrace_end();
                         QueryPerformanceCounter(&b);
                         busy += b.QuadPart - a.QuadPart;
                         if (b.QuadPart - t_last.QuadPart > f.QuadPart) {
