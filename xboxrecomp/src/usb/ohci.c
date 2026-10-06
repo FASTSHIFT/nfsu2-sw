@@ -11,6 +11,7 @@
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/kernel.h"
 #include "usb_gamepad.h"
+#include "../platform/xtrace.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1112,6 +1113,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
 
     (void)unused;
     xbox_guest_pin(1);             /* the ISR runs guest code: guest core, above it */
+    xtrace_thread_name("ohci");
     {
         uint32_t tib = xbox_AllocThreadTib();
         if (!tib) {

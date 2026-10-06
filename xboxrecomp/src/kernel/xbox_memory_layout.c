@@ -14,6 +14,9 @@
 
 #include "xbox_memory_layout.h"
 #include "platform/xtrace.h"
+#if !defined(_WIN32)
+#include "platform/knobs.h"
+#endif
 #include "kernel.h"
 #include <stdio.h>
 #if !defined(_WIN32)
@@ -1151,9 +1154,15 @@ static void spin_ack_flush(void)
 
 void recomp_spin_wake(void)
 {
+    static __thread unsigned skip;
     spin_ack_flush();
+    KNOB_COUNT(KC_SPIN_WAKE);
     if (!__atomic_load_n(&s_hw_sleepers, __ATOMIC_RELAXED))
         return;
+    if (++skip < (unsigned)knob(KN_SPIN_WAKE_EVERY))
+        return;
+    skip = 0;
+    KNOB_COUNT(KC_SPIN_BCAST);
     pthread_mutex_lock(&s_hw_lock);
     s_hw_wakes++;
     pthread_cond_broadcast(&s_hw_cond);
@@ -1176,19 +1185,25 @@ static void nv2a_thread_pause(int busy)
     Sleep(0);
 #else
     if (busy) {
+        KNOB_COUNT(KC_HW_YIELD);
         sched_yield();
     } else {
         struct timespec ts;
         unsigned seen;
+        long ns = (long)knob(KN_HW_SLEEP_US) * 1000L;
+        KNOB_COUNT(KC_HW_SLEEP);
         clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 1000000L;
+        ts.tv_sec  += ns / 1000000000L;
+        ts.tv_nsec += ns % 1000000000L;
         if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
         pthread_mutex_lock(&s_hw_lock);
         seen = s_hw_wakes;
         __atomic_add_fetch(&s_hw_sleepers, 1, __ATOMIC_RELAXED);
         while (seen == s_hw_wakes)
-            if (pthread_cond_timedwait(&s_hw_cond, &s_hw_lock, &ts) != 0)
+            if (pthread_cond_timedwait(&s_hw_cond, &s_hw_lock, &ts) != 0) {
+                KNOB_COUNT(KC_HW_TIMEOUT);
                 break;
+            }
         __atomic_sub_fetch(&s_hw_sleepers, 1, __ATOMIC_RELAXED);
         pthread_mutex_unlock(&s_hw_lock);
     }
@@ -1198,6 +1213,7 @@ static void nv2a_thread_pause(int busy)
 static DWORD WINAPI nv2a_flag_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    xtrace_thread_name("nv2a flags");
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         nv2a_ack_flags(regs);
         nv2a_thread_pause(0);

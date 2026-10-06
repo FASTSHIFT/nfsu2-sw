@@ -19,6 +19,9 @@
  * default trace clock is BOOTTIME, which on an awake device differs from it
  * only by a constant).
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE                 /* pthread_setname_np */
+#endif
 #include "xtrace.h"
 
 #include <pthread.h>
@@ -185,6 +188,22 @@ void xtrace_thread_name(const char *name)
     snprintf(t_pending_name, sizeof t_pending_name, "%s", name);
     if (t)
         snprintf(t->name, sizeof t->name, "%s", name);
+#if defined(__linux__)
+    {
+        /* Also the OS thread name (15 chars), for top/perf/strace: keep the
+         * tail of a long guest name ("guest 21C8E6:274CA0" -> "g:274CA0"). */
+        char os[16];
+        const char *c = strchr(name, ':');
+        if (strlen(name) > 15 && c)
+            snprintf(os, sizeof os, "g%s", c);
+        else
+            snprintf(os, sizeof os, "%s", name);
+        /* Not the main thread: its name is the process name pidof sees
+         * (perfetto_bridge.py, threads.sh). */
+        if (getpid() != (pid_t)syscall(SYS_gettid))
+            pthread_setname_np(pthread_self(), os);
+    }
+#endif
 }
 
 /* ── protobuf writer ─────────────────────────────────────────────── */

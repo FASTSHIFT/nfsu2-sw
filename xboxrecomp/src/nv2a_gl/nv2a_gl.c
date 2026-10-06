@@ -37,6 +37,9 @@
 #include "gl_api.h"
 #include "kms_present.h"
 #include "platform/xtrace.h"
+#if !defined(_WIN32) && !defined(__SWITCH__)
+#include "platform/knobs.h"
+#endif
 #include "gl_psh.h"
 #include "gl_vsh.h"
 #include "../kernel/nv2a_backend.h"
@@ -579,6 +582,10 @@ uint32_t nv2a_gl_frame_count(void) { return s_frame; }
 
 static void tex_account(GlTex *t, uint32_t bytes)
 {
+#if !defined(_WIN32) && !defined(__SWITCH__)
+    __atomic_add_fetch(&g_knob_count[KC_UP_TEX_KB], bytes >> 10, __ATOMIC_RELAXED);
+    KNOB_COUNT(KC_UP_TEX_N);
+#endif
     s_hz_texs++;
     s_hz_tex_bytes += bytes;
     static uint64_t budget;
@@ -664,6 +671,10 @@ static GLuint tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h,
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)w, (GLsizei)h, TEX_FMT,
                         GL_UNSIGNED_BYTE, (const uint8_t *)xbox_GetMemoryOffset() + va);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+#if !defined(_WIN32) && !defined(__SWITCH__)
+        __atomic_add_fetch(&g_knob_count[KC_UP_TEX_KB], (unsigned)((size_t)w * h * 4 >> 10), __ATOMIC_RELAXED);
+        KNOB_COUNT(KC_UP_TEX_N);
+#endif
         gl_step_done("texture upload");
         return t->tex;
     }
@@ -1627,6 +1638,10 @@ static GLintptr ring_alloc(GlRing *g, GLsizeiptr size, void **ptr)
         at = 0;
     }
     g->off = at + size;
+#if !defined(_WIN32) && !defined(__SWITCH__)
+    __atomic_add_fetch(&g_knob_count[g == &s_vring ? KC_UP_VTX_KB : KC_UP_IDX_KB],
+                       (unsigned)(size >> 10), __ATOMIC_RELAXED);
+#endif
     *ptr = glMapBufferRange(g->target, at, size,
                             GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT
                             );
@@ -2626,6 +2641,18 @@ static void gl_flip(void)
     }
 swap:
     gl_step_done("present");
+#if !defined(_WIN32) && !defined(__SWITCH__)
+    if (knob(KN_FPS_CAP) > 0) {                 /* knobs.h: live frame cap */
+        static uint64_t next;
+        uint64_t now = hz_now(), per = 1000000000ull / (uint64_t)knob(KN_FPS_CAP);
+        if (next > now && next - now < per * 2) {
+            struct timespec ts = { 0, (long)(next - now) };
+            nanosleep(&ts, NULL);
+        }
+        now = hz_now();
+        next = (next > now && next - now < per * 2 ? next : now) + per;
+    }
+#endif
     {
         uint64_t t0 = hz_now();
         XTRACE_BEGIN_TAG("SwapWindow");

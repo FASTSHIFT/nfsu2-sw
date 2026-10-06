@@ -30,6 +30,12 @@
 #include "guest_vmem.h"
 #include "recomp_icall_feedback.h"
 #include "platform/xtrace.h"
+#if !defined(_WIN32)
+#include "platform/knobs.h"
+#else
+#define KNOB_COUNT(id) ((void)0)
+#define knob(id) 0
+#endif
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -681,9 +687,13 @@ static void gil_lock(void)
     }
     if (me != s_gil_serving) {
         XTRACE_BEGIN_TAG("GIL wait");
+        KNOB_COUNT(KC_GIL_WAIT);
         while (me != s_gil_serving)
-            if (!SleepConditionVariableCS(&s_gil_cv, &s_gil_cs, 1))
+            if (!SleepConditionVariableCS(&s_gil_cv, &s_gil_cs,
+                                          (DWORD)knob(KN_GIL_WAIT_MS))) {
+                KNOB_COUNT(KC_GIL_TIMEOUT);
                 g_gil_contended = 1;       /* 1 ms and still waiting */
+            }
         XTRACE_END_TAG("GIL wait");
     }
     if (eager) {
@@ -750,11 +760,30 @@ void xbox_gil_resume(int depth)
 
 /* RECOMP_SPIN_HINT's periodic yield: a poll loop waits for another thread,
  * an interrupt or a DPC -- all of which need the lock. */
-void recomp_spin_yield(void)
+static void gil_yield_now(void)
 {
     int d = xbox_gil_suspend();
+    KNOB_COUNT(KC_SPIN_YIELD_REAL);
     SwitchToThread();
     xbox_gil_resume(d);
+}
+
+/* Live-tunable (knobs.h), defaults = stock: SPIN_YIELD_EVERY=n yields once
+ * per n spin-hint calls, SPIN_YIELD_IDLE=1 skips the yield when no other
+ * thread is queued for the lock (the unlock/yield/relock then hands it to
+ * nobody). recomp_preempt is not throttled: it only runs when someone waits. */
+void recomp_spin_yield(void)
+{
+    static RECOMP_TLS unsigned tick;
+    KNOB_COUNT(KC_SPIN_YIELD);
+    if (knob(KN_SPIN_YIELD_IDLE) && gil_enabled() && t_gil_depth > 0
+            && __atomic_load_n(&s_gil_next, __ATOMIC_RELAXED)
+               - __atomic_load_n(&s_gil_serving, __ATOMIC_RELAXED) <= 1)
+        return;
+    if (++tick < (unsigned)knob(KN_SPIN_YIELD_EVERY))
+        return;
+    tick = 0;
+    gil_yield_now();
 }
 
 /* RECOMP_PREEMPT: someone is waiting -- yield, unless this is an ISR or DPC
@@ -767,7 +796,7 @@ void recomp_preempt(void)
 {
     if (t_gil_depth <= 0 || t_gil_nopreempt || xbox_thread_holds_dispatch())
         return;
-    recomp_spin_yield();
+    gil_yield_now();
 }
 
 #define GUEST_CALL(f) do { xbox_gil_enter(); (f)(); xbox_gil_leave(); } while (0)
@@ -2079,6 +2108,7 @@ static NTSTATUS kdisp_wait(uint32_t count, const uint32_t *vas,
                 if (ms - spent < slice)
                     slice = ms - spent;
             }
+            KNOB_COUNT(KC_KDISP_SLEEP);
             SleepConditionVariableCS(&g_kdisp_cv, &g_kdisp_cs, slice);
         }
     }

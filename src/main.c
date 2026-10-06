@@ -20,6 +20,9 @@
 #  include <unistd.h>
 #endif
 #include "platform/xtrace.h"
+#if !defined(_WIN32)
+#include "platform/knobs.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -329,6 +332,9 @@ static int game_main(void)
 #endif
     xtrace_init();         /* RECOMP_TRACE: before any other thread exists */
     xtrace_thread_name("game main");
+#if !defined(_WIN32)
+    knobs_init();          /* [wake] counters + live tunables (RECOMP_KNOBS) */
+#endif
     /* Off the guest core while the runtime starts its threads (they inherit
      * the mask); this thread goes onto it right before the title's code. */
     xbox_nx_spread_thread();
