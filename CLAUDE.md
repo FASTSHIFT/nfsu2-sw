@@ -50,6 +50,9 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   `NFSU2_GAME_DIR=/root/nfsu2x/game xvfb-run -a …/nfsu2_recomp`.
 - Menu pad script (Linux): `RECOMP_PAD_SCRIPT="10000:start:300,…,70000:start:300,80000:a:200,90000:a:200"`
   (times from the first pad read). `RECOMP_GL_DUMP=<prefix>,N` dumps frames.
+- This workspace (VMware guest, no xvfb): `bash tools/pc/run.sh <dir> <secs>`
+  (unattended, pad script, BMP dumps) and `tools/pc/live.sh` (interactive);
+  `tools/pc/env.sh` picks llvmpipe + spin throttles under VMware (docs/06).
 - Header changes in `templates/runtime/recomp_types.h` must be copied to
   `gen/recomp_types.h` (regen does it) and rebuild all generated code.
 

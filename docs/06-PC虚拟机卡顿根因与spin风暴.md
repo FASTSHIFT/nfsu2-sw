@@ -48,7 +48,7 @@ graph TD
 
 ## 4. 虚拟 GPU（菜单阶段）
 
-先在同一个菜单场景下排除了几个怀疑点（`build/gpuab.sh`，每组 15 秒）：
+先在同一个菜单场景下排除了几个怀疑点（`tools/pc/gpuab.sh`，每组 15 秒）：
 
 | 组 | 菜单 fps | executor 等 fence |
 |---|---|---|
@@ -86,17 +86,18 @@ graph TD
 - **`[wake]` 计数**（`xboxrecomp/src/platform/knobs.{c,h}`）：每秒往日志打一行，同时写成 xtrace counter，可在 Perfetto 里看曲线。计数项：spin_wake/bcast、hw_sleep/hw_tmo/hw_yield、yield/yield_real、gil_wait/gil_tmo、kdisp、上传量（up_vtx_kb/up_idx_kb/up_tex_kb/up_tex_n）。
 - **在线调参**：游戏每秒重读一次 `/tmp/nfsu2.knobs`。`RECOMP_KNOBS=<路径>` 可以换文件；`=0` 关闭这个线程，只保留环境变量设的默认值；`RECOMP_KNOBS_QUIET=1` 不打印 `[wake]`。启动时的默认值用 `RECOMP_KNOB_<NAME>=v` 设置。可调项：`SPIN_WAKE_EVERY`、`SPIN_YIELD_EVERY`、`SPIN_YIELD_IDLE`、`HW_SLEEP_US`、`GIL_WAIT_MS`、`FPS_CAP`。
 - **OS 线程名**：非主线程会设成 `nv2a flags`、`executor`、`ohci`、`apu`、`g:274CA0` 等名字，`top -H` 和 perf 里直接能看到。主线程保留原名，这样 `pidof nfsu2_recomp` 仍然能用。
-- 本地脚本，放在 `build/` 下，不进 git：
-  - `run.sh`：VMware 下默认用 llvmpipe，`PC_GPU=1` 可切回 svga；
+- 脚本在 `tools/pc/`（已进 git，用 `bash` 调用）：
+  - `env.sh`：公共环境，VMware 下默认用 llvmpipe 和两个节流，`PC_GPU=1` 切回 svga；
+  - `run.sh <dir> <secs>`：无人值守跑，自动按键进菜单，转储 BMP；
   - `live.sh`：手动玩；
   - `knob.sh KEY=VAL` 改参数，`knob.sh -s` 查看当前状态；
-  - `gpuab.sh`：菜单场景的 A/B 对比；
-  - `vmbench.sh`、`vmscan.sh`、`thr.sh`：按线程统计。
+  - `gpuab.sh <tag> [ENV=..]`：菜单场景的 A/B 对比；
+  - `thr.sh`：按线程统计。
 
 ## 8. PC 回归的结论（修订 docs/05）
 
 - 用 llvmpipe 跑 L1 函数差分、L2 回放截图、画面冒烟测试，可行，不会拖垮桌面。
 - **性能数字仍然只能在真机上测**：PC 的数据受虚拟化和软件光栅化影响，没有参考价值。
-- **PC 默认配置**（`build/run.sh`、`build/live.sh`，只在检测到 VMware 时生效，`PC_GPU=1` 关闭）：llvmpipe，加上 `RECOMP_KNOB_SPIN_WAKE_EVERY=64`、`RECOMP_KNOB_SPIN_YIELD_IDLE=1`。knob 的环境变量写法是 `RECOMP_KNOB_<NAME>`，它会在游戏代码运行之前就生效；`/tmp/nfsu2.knobs` 里的值可以再覆盖它。
+- **PC 默认配置**（`tools/pc/env.sh`，`run.sh`、`live.sh`、`gpuab.sh` 共用；只在检测到 VMware 时生效，`PC_GPU=1` 关闭）：llvmpipe，加上 `RECOMP_KNOB_SPIN_WAKE_EVERY=64`、`RECOMP_KNOB_SPIN_YIELD_IDLE=1`。knob 的环境变量写法是 `RECOMP_KNOB_<NAME>`，它会在游戏代码运行之前就生效；`/tmp/nfsu2.knobs` 里的值可以再覆盖它。
 - 用户实测玩了一整局（2026-10-06）：完全不卡，比赛约 24–27fps。**声音有点滞后**。音频 buffer 本身不大（48kHz，设备 buffer 1024 加队列 8×256，约 64ms）。滞后更可能是因为 fps 在 4–43 之间波动，APU 按 guest 时钟推进，和 PulseAudio 的消费速度对不上；也可能是节流延迟了 DSP 应答。这一点还没有确认。对自动测试（截图、函数差分）没有影响；需要验证音频的测试必须在真机上做。
 - 待观察：偶发的 OHCI 枚举卡住。现象是只投递了一次中断，pad 一直没到，键盘没反应。后续运行都没有复现，与本次改动无关。
