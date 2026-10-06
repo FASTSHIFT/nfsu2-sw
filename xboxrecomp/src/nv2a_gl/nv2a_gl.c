@@ -1969,6 +1969,7 @@ static void surf_stats_draw(const Nv2aSurface *sf)
  * what each submission-cost fix (persistent ring, vertex formats, uniform
  * packing) would remove, and what triple buffering could hide. */
 static uint64_t s_swap_ns, s_cs_draws;
+static uint64_t s_draws_total;              /* every draw that reached GL, for [fps] */
 static void call_stats_frame(void)
 {
     static int on = -1;
@@ -2098,6 +2099,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
         return;
     s_hz_draws++;
     s_cs_draws++;
+    s_draws_total++;
     if (p->prog != s_cur_prog) {
         glUseProgram(p->prog);
         s_cur_prog = p->prog;
@@ -2528,7 +2530,12 @@ static void gl_flip(void)
             clock_gettime(CLOCK_MONOTONIC, &now);
             dt = (double)(now.tv_sec - last.tv_sec) + (now.tv_nsec - last.tv_nsec) / 1e9;
             if (dt >= 10.0) {
-                fprintf(stderr, "[fps] %.1f fps (frame %u)\n", (s_frame - last_frame) / dt, s_frame);
+                /* Draws per frame too: what a quality knob or pass skip removed. */
+                static uint64_t last_draws;
+                uint32_t nf = s_frame - last_frame;
+                fprintf(stderr, "[fps] %.1f fps (frame %u) %.0f draws/frame\n", nf / dt, s_frame,
+                        nf ? (double)(s_draws_total - last_draws) / nf : 0.0);
+                last_draws = s_draws_total;
                 last_frame = s_frame;
                 last = now;
             }
