@@ -42,6 +42,8 @@ extern ptrdiff_t g_xbox_mem_offset;
 extern volatile uint32_t g_icall_trace[16];
 extern volatile uint32_t g_icall_trace_idx;
 
+void autotest_init(void);      /* src/autotest.c: RECOMP_SKIP_INTRO boot patch */
+
 typedef struct MCPXAPUState MCPXAPUState;
 extern MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
 extern MCPXAPUState *g_apu_state;
@@ -481,6 +483,7 @@ static int game_main(void)
     xbox_WatchdogStart();
 
     printf("Starting guest at 0x%08X (esp=0x%08X)\n", NFSU2_ENTRY_POINT, g_esp);
+    autotest_init();           /* RECOMP_SKIP_INTRO boot patch (src/autotest.c) */
     xbox_gil_mark_main();      /* the frame-rate thread (RECOMP_GIL_EAGER) */
     xbox_guest_pin(0);         /* the boot thread becomes the title's first thread */
     xbox_gil_enter();          /* guest code from here on (kernel_bridge.c) */
