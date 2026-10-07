@@ -1855,6 +1855,17 @@ static int s_q_on;                      /* threaded submission (below) */
 #define SURF_STATS 16
 static struct { uint32_t va, w, h, draws; } s_ss[SURF_STATS];
 static int s_ss_on = -1;
+
+/* On-demand draw census (knobs DUMP_DRAWS=1): per-surface and per-program
+ * draw counts for the current frame, printed at the next flip. Lets a
+ * running game answer "what is this frame made of" without restarting or
+ * waiting 300 frames for RECOMP_GL_SURF_STATS. */
+#define CENSUS_SURF 32
+#define CENSUS_PROG 64
+static struct { uint32_t va, w, h, draws; } s_census_surf[CENSUS_SURF];
+static struct { uint32_t prog, draws; } s_census_prog[CENSUS_PROG];
+static uint32_t s_census_total;
+static double s_census_fps;              /* last frame's rate, for the dump */
 #define SKIP_MAX 8
 static uint32_t s_skip_wh[SKIP_MAX];
 static int s_skip_n = -1;
@@ -1962,6 +1973,60 @@ static void surf_stats_draw(const Nv2aSurface *sf)
             return;
         }
     }
+}
+
+/* Census accumulation: called from gl_draw_raw for every draw that reaches
+ * GL (after pass_skipped), so the counts reflect what is actually drawn.
+ * The knobs thread sets DUMP_DRAWS; draws accumulate from that moment, and
+ * the next flip prints and clears. */
+static void census_draw(const Nv2aSurface *sf, uint32_t prog)
+{
+    uint32_t w, h;
+    int i;
+    if (!knob(KN_DUMP_DRAWS))
+        return;
+    batch_surf_size(sf, &w, &h);
+    for (i = 0; i < CENSUS_SURF; i++) {
+        if (!s_census_surf[i].draws ||
+            (s_census_surf[i].va == sf->color_va && s_census_surf[i].w == w &&
+             s_census_surf[i].h == h)) {
+            s_census_surf[i].va = sf->color_va;
+            s_census_surf[i].w = w;
+            s_census_surf[i].h = h;
+            s_census_surf[i].draws++;
+            break;
+        }
+    }
+    for (i = 0; i < CENSUS_PROG; i++) {
+        if (!s_census_prog[i].draws || s_census_prog[i].prog == prog) {
+            s_census_prog[i].prog = prog;
+            s_census_prog[i].draws++;
+            break;
+        }
+    }
+    s_census_total++;
+}
+
+/* Print the census and clear it. Called from gl_flip when DUMP_DRAWS is set. */
+static void census_flush(void)
+{
+    int i;
+    if (!knob(KN_DUMP_DRAWS))
+        return;
+    fprintf(stderr, "  [GL] draw census (%u draws, %.1f fps, %.1f ms/frame):\n",
+            s_census_total, s_census_fps, s_census_fps ? 1000.0 / s_census_fps : 0.0);
+    fprintf(stderr, "    by surface:");
+    for (i = 0; i < CENSUS_SURF && s_census_surf[i].draws; i++)
+        fprintf(stderr, " %08X %ux%u:%u", s_census_surf[i].va, s_census_surf[i].w,
+                s_census_surf[i].h, s_census_surf[i].draws);
+    fprintf(stderr, "\n    by program:");
+    for (i = 0; i < CENSUS_PROG && s_census_prog[i].draws; i++)
+        fprintf(stderr, " %u:%u", s_census_prog[i].prog, s_census_prog[i].draws);
+    fprintf(stderr, "\n");
+    memset(s_census_surf, 0, sizeof s_census_surf);
+    memset(s_census_prog, 0, sizeof s_census_prog);
+    s_census_total = 0;
+    knob_set(KN_DUMP_DRAWS, 0);
 }
 
 /* RECOMP_GL_CALL_STATS=1: every 300 frames, GL calls per frame by entry point
@@ -2100,6 +2165,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     s_hz_draws++;
     s_cs_draws++;
     s_draws_total++;
+    census_draw(&b->surface, pk.shader_program);
     if (p->prog != s_cur_prog) {
         glUseProgram(p->prog);
         s_cur_prog = p->prog;
@@ -2490,6 +2556,18 @@ static void gl_flip(void)
     if (!ready())
         return;
     s_frame++;
+    /* Per-frame rate for the census dump (updated every flip, so the number
+     * is the real frame time even when the dump is one-shot). */
+    {
+        static uint64_t last_flip_ns;
+        uint64_t now = hz_now();
+        if (last_flip_ns)
+            s_census_fps = 1e9 / (double)(now - last_flip_ns);
+        last_flip_ns = now;
+    }
+    /* knobs DUMP_DRAWS=1: print this frame's draw census (per surface and
+     * per program) and clear the request. */
+    census_flush();
     surf_stats_frame();
     if (!s_q_on)
         pass_skip_frame();

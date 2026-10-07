@@ -207,6 +207,10 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
  * the table (8 entries) is full. */
 int xbox_ApuDspAckWord(uint32_t va);
 
+/* Runtime poke: hold a guest global at a value, like RECOMP_POKE but callable
+ * at any time (the knobs thread calls it every second). va 0 disables. */
+void xbox_PokeRuntime(uint32_t va, uint32_t val);
+
 /* Keep the runtime from zeroing PMC_INTR_0 / PGRAPH_INTR while a device model
  * has a GPU interrupt pending (counted; pair every on with an off). */
 void xbox_Nv2aHoldInterrupts(int on);

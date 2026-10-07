@@ -634,6 +634,20 @@ static void poke_tick(void)
     }
 }
 
+/* Runtime poke: the knobs thread calls this every second with the guest VA
+ * and value from /tmp/nfsu2.knobs (POKE_VA / POKE_VAL), so a switch can be
+ * flipped in a running game without restarting. va 0 disables. */
+void xbox_PokeRuntime(uint32_t va, uint32_t val)
+{
+    volatile uint32_t *w;
+
+    if (!va || !fence_readable(va, 4))
+        return;
+    w = (volatile uint32_t *)((uintptr_t)va + g_memory_offset);
+    if (*w != val)
+        *w = val;
+}
+
 static void dsp_ack_tick(void)
 {
     int i;

@@ -4,6 +4,7 @@
 #endif
 #include "knobs.h"
 #include "xtrace.h"
+#include "../kernel/xbox_memory_layout.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -19,6 +20,9 @@ volatile int g_knob[KN_COUNT] = {
     [KN_HW_SLEEP_US]      = 1000,
     [KN_GIL_WAIT_MS]      = 1,
     [KN_FPS_CAP]          = 0,
+    [KN_POKE_VA]          = 0,
+    [KN_POKE_VAL]         = 0,
+    [KN_DUMP_DRAWS]       = 0,
 };
 
 static const char *const s_count_name[KC_COUNT] = {
@@ -29,8 +33,9 @@ static const char *const s_count_name[KC_COUNT] = {
 static const char *const s_knob_name[KN_COUNT] = {
     "SPIN_WAKE_EVERY", "SPIN_YIELD_EVERY", "SPIN_YIELD_IDLE",
     "HW_SLEEP_US", "GIL_WAIT_MS", "FPS_CAP",
+    "POKE_VA", "POKE_VAL", "DUMP_DRAWS",
 };
-static const int s_knob_min[KN_COUNT] = { 1, 1, 0, 50, 1, 0 };
+static const int s_knob_min[KN_COUNT] = { 1, 1, 0, 50, 1, 0, 0, 0, 0 };
 
 static int s_quiet;                  /* RECOMP_KNOBS_QUIET: no [wake] lines */
 
@@ -68,7 +73,11 @@ static void knobs_reload(const char *path)
             *eq = 0;
             for (k = 0; k < KN_COUNT; k++)
                 if (strcmp(line, s_knob_name[k]) == 0) {
-                    int v = atoi(eq + 1);
+                    /* POKE_VA is a guest address: accept hex (0x...). */
+                    int v = (k == KN_POKE_VA && eq[1] == '0' &&
+                             (eq[2] == 'x' || eq[2] == 'X'))
+                                ? (int)strtoul(eq + 1, NULL, 0)
+                                : atoi(eq + 1);
                     want[k] = v < s_knob_min[k] ? s_knob_min[k] : v;
                 }
         }
@@ -93,6 +102,11 @@ static void *knobs_thread(void *arg)
         size_t n = 0;
         sleep(1);
         knobs_reload(path);
+        /* Runtime poke: hold a guest global at a value (POKE_VA/POKE_VAL in
+         * the knobs file), so a switch can be flipped in a running game. */
+        if (g_knob[KN_POKE_VA])
+            xbox_PokeRuntime((uint32_t)g_knob[KN_POKE_VA],
+                             (uint32_t)g_knob[KN_POKE_VAL]);
         if (s_quiet)
             continue;
         n += (size_t)snprintf(out + n, sizeof out - n, "[wake]");

@@ -42,6 +42,9 @@ enum {
     KN_HW_SLEEP_US,     /* hardware-thread sleep timeout, us (1000) */
     KN_GIL_WAIT_MS,     /* GIL waiter timeout, ms (1) */
     KN_FPS_CAP,         /* sleep before present to at most n fps; 0 = off (0) */
+    KN_POKE_VA,         /* guest VA to hold at KN_POKE_VAL every second (0) */
+    KN_POKE_VAL,        /* value written to KN_POKE_VA (0) */
+    KN_DUMP_DRAWS,      /* 1: print this frame's draw census at the next flip (0) */
     KN_COUNT
 };
 
@@ -50,6 +53,7 @@ extern volatile int g_knob[KN_COUNT];
 
 #define KNOB_COUNT(id) __atomic_add_fetch(&g_knob_count[id], 1u, __ATOMIC_RELAXED)
 #define knob(id)       (g_knob[id])
+#define knob_set(id, v) __atomic_store_n(&g_knob[id], (v), __ATOMIC_RELAXED)
 
 void knobs_init(void);              /* idempotent; starts the thread */
 
