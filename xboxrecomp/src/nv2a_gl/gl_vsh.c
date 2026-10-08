@@ -88,16 +88,12 @@ static void src(Out *o, const uint32_t *t, int which, int consts_local)
     } else if (mux == 2) {
         emit(o, "v%u.%s", f(t, 1, 9, 4), comp);
     } else if (mux == 3) {
-        int ci = (int)f(t, 1, 13, 8);
+        uint32_t ci = f(t, 1, 13, 8);
         const char *arr = consts_local ? "cl" : "c";
-        /* Merged batches index a per-draw block: blk*192 + row. nv2a_blk()
-         * is gl_VertexID compared against u_vstart[] (returns 0 unmerged).
-         * int throughout: GLSL 3.30 rejects int*uint, and nv2a_blk() is int. */
-        const char *blk = (nv2a_shader_merge && !consts_local) ? "nv2a_blk() * 192 + " : "";
         if (f(t, 3, 1, 1))
-            emit(o, "%s[%sclamp(%d + a0, 0, 191)].%s", arr, blk, ci, comp);
+            emit(o, "%s[clamp(%u + a0, 0, 191)].%s", arr, ci, comp);
         else
-            emit(o, "%s[%s%d].%s", arr, blk, ci < 192 ? ci : 191, comp);
+            emit(o, "%s[%u].%s", arr, ci < 192 ? ci : 191, comp);
     } else {
         emit(o, "vec4(0.0).%s", comp);
     }
@@ -149,8 +145,7 @@ int nv2a_gl_vsh_program(const uint32_t (*prog)[4], uint32_t slots,
     emit(&o, "void nv2a_program(void)\n{\n");
     emit(&o, "    int a0 = 0;\n");
     if (writes_consts)
-        emit(&o, "    vec4 cl[192];\n    for (int i = 0; i < 192; i++) cl[i] = c[%si];\n",
-             nv2a_shader_merge ? "nv2a_blk() * 192 + " : "");
+        emit(&o, "    vec4 cl[192];\n    for (int i = 0; i < 192; i++) cl[i] = c[i];\n");
 
     for (pc = start; pc < slots; pc++) {
         const uint32_t *t = prog[pc];
@@ -298,8 +293,6 @@ static const char s_vk_prelude[] =
 
 int nv2a_shader_vk;
 int nv2a_shader_es;
-int nv2a_shader_merge;
-int nv2a_merge_max = NV2A_MERGE_MAX;
 
 /* OpenGL ES 3.00: no BGRA vertex format, so D3DCOLOR attributes arrive as
  * (B, G, R, A) and are put right here, per attribute, by the u_bgra mask.
@@ -358,62 +351,19 @@ static const char *es_rename_main(const char *src, char *buf, size_t cap)
 
 static const char *gl_prelude(void);
 
-/* Append nv2a_blk() and the enlarged c[] by rewriting `body`'s
- * `uniform vec4 c[192];` line into `out`. Returns out on success, body
- * unchanged (with out untouched) if the line is missing or out is small. */
-static const char *merge_augment(const char *body, char *out, size_t cap)
-{
-    const char *at = strstr(body, "uniform vec4 c[192];\n");
-    if (!at)
-        return body;
-    if (snprintf(out, cap,
-                 "%.*s"
-                 "uniform vec4 c[%d];\n"
-                 "uniform int u_vstart[%d];\n"
-                 "uniform int u_nsub;\n"
-                 "int nv2a_blk() {\n"
-                 "    int b = 0;\n"
-                 "    for (int i = 1; i < u_nsub; i++)\n"
-                 "        if (gl_VertexID >= u_vstart[i]) b = i;\n"
-                 "    return b;\n"
-                 "}\n"
-                 "%s",
-                 (int)(at - body), body,
-                 192 * nv2a_merge_max, nv2a_merge_max,
-                 at + sizeof "uniform vec4 c[192];\n" - 1) >= (int)cap)
-        return body;
-    return out;
-}
-
 const char *nv2a_gl_vsh_prelude(void)
 {
     static char es[8192];
-    static char mg[16384];
-    const char *base;
     if (nv2a_shader_vk)
         return s_vk_prelude;
-    if (nv2a_shader_es) {
-        if (!es[0]) {
-            /* The desktop prelude minus its version line and inputs. */
-            const char *body = strstr(gl_prelude(), "uniform vec4 c[192];");
-            char full[8192];
-            snprintf(full, sizeof full, "%s%s", s_es_head, body ? body : "");
-            /* Merged batches: c[] becomes nv2a_merge_max per-draw blocks and
-             * nv2a_blk() picks the block from gl_VertexID. */
-            if (nv2a_shader_merge) {
-                char aug[12288];
-                snprintf(es, sizeof es, "%s",
-                         merge_augment(full, aug, sizeof aug));
-            } else {
-                snprintf(es, sizeof es, "%s", full);
-            }
-        }
-        return es;
+    if (!nv2a_shader_es)
+        return gl_prelude();
+    if (!es[0]) {
+        /* The desktop prelude minus its version line and inputs. */
+        const char *body = strstr(gl_prelude(), "uniform vec4 c[192];");
+        snprintf(es, sizeof es, "%s%s", s_es_head, body ? body : "");
     }
-    base = gl_prelude();
-    if (!nv2a_shader_merge)
-        return base;
-    return merge_augment(base, mg, sizeof mg);
+    return es;
 }
 
 const char *nv2a_gl_vsh_epilogue(void)

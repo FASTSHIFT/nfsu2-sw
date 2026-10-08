@@ -106,40 +106,6 @@ static int           s_finish = -1;      /* RECOMP_GL_FINISH */
 
 static int           s_new_obj;          /* this operation uses something new */
 
-/* Draw merging (RECOMP_GL_MERGE). Must be set BEFORE prog_cache_prewarm():
- * the merge shaders declare an enlarged c[] and nv2a_blk(); if prewarm
- * compiles the non-merge form first, every later draw reuses it and the
- * batch's 192*n constants do not fit -- the picture corrupts. */
-static int s_merge = -1;
-static int s_mg_max = NV2A_MERGE_MAX;   /* runtime blocks (<= NV2A_MERGE_MAX) */
-static void mg_init(void)
-{
-    if (s_merge >= 0)
-        return;
-    s_merge = 0;
-    if (getenv("RECOMP_GL_MERGE") != NULL && !nv2a_shader_vk) {
-        GLint lim = 0;
-        /* The merged shader declares c[192*blocks] + u_vstart[blocks] as
-         * plain vertex uniforms. Desktop GL allows several blocks; a Mali
-         * GLES context often allows only one (min 256 vectors), so size the
-         * batch to what the driver reports and give up if it cannot fit two
-         * (merging one draw saves nothing). */
-        glGetIntegerv(0x8DFB /* GL_MAX_VERTEX_UNIFORM_VECTORS */, &lim);
-        int blocks = lim > 0 ? (int)(lim - 32) / 192 : 0;
-        if (blocks > NV2A_MERGE_MAX) blocks = NV2A_MERGE_MAX;
-        if (blocks >= 2) {
-            s_merge = 1;
-            s_mg_max = blocks;
-            nv2a_merge_max = blocks;
-        }
-        fprintf(stderr, "  [GL] merge: %d vertex uniform vectors -> %d blocks"
-                        " (%s)\n", (int)lim, blocks, s_merge ? "on" : "off");
-    }
-    nv2a_shader_merge = s_merge;
-    if (s_merge)
-        fprintf(stderr, "  [GL] draw merging on (RECOMP_GL_MERGE)\n");
-}
-
 /* RECOMP_GL_FINISH: wait for the GPU after every operation, so a hard GPU
  * hang happens at the operation that causes it. Only operations that touch
  * something new (a shader just compiled, a surface or texture just made)
@@ -902,8 +868,6 @@ typedef struct {
     Nv2aPshKey pkey;
     GLuint     prog;
     GLint      u_c, u_surf, u_aa, u_m, u_vpoff, u_xform, u_bgra;
-    GLint      u_vstart, u_nsub;   /* merged batches (RECOMP_GL_MERGE) */
-    int        nsub_set;        /* u_nsub currently holds a nonzero count */
     GLint      u_t[4], u_tscale, u_c0, u_c1, u_fc0, u_fc1, u_fogcolor, u_afunc, u_aref;
     uint32_t   used;
     int        vpc_valid;       /* vpc holds what this program's "c" was given */
@@ -1178,8 +1142,6 @@ static GlProg *prog_get(const Nv2aRawBatch *b, const Nv2aPshKey *pk)
     last = p;
     p->u_c = glGetUniformLocation(p->prog, "c");
     p->vpc_rows = p->u_c >= 0 && glGetUniformLocation(p->prog, "c[191]") == p->u_c + 191;
-    p->u_vstart = glGetUniformLocation(p->prog, "u_vstart");
-    p->u_nsub = glGetUniformLocation(p->prog, "u_nsub");
     p->u_surf = glGetUniformLocation(p->prog, "u_surf");
     p->u_aa = glGetUniformLocation(p->prog, "u_aa");
     p->u_m = glGetUniformLocation(p->prog, "u_m");
@@ -1328,7 +1290,6 @@ static int ready(void)
         tex_bind_forget();
     }
     s_state = 1;
-    mg_init();                          /* before prewarm: merge shader form */
     prog_cache_prewarm();
     return 1;
 }
@@ -1879,267 +1840,6 @@ static int upload_vertices(const Nv2aRawBatch *b)
 
 static int s_q_on;                      /* threaded submission (below) */
 
-/* ── Draw merging (RECOMP_GL_MERGE, desktop GL) ──────────────────────
- *
- * NFSU2 submits thousands of tiny draws (a tree, a wall, a sign), each with
- * its own c[192] constant block. On the Xbox the GPU consumed the pushbuffer
- * in hardware, so that was free; lifted to a host CPU each draw is a real
- * glDrawElements. This collects consecutive draws that share program,
- * textures, GL state, primitive, surface and a single interleaved vertex
- * run, and submits them as ONE glDrawRangeElements, with each sub-draw's
- * constants in its own block of an enlarged c[] (gl_vsh.c nv2a_blk() picks
- * the block from gl_VertexID). Off unless RECOMP_GL_MERGE=1. */
-/* s_merge is defined up top (mg_init), before prog_cache_prewarm. */
-
-#define MG_MAX NV2A_MERGE_MAX
-typedef struct {
-    int       on;
-    GlProg   *p;
-    GlSurf   *s;
-    uint32_t  sig;                      /* state hash */
-    uint32_t  ap, ad;                   /* attr present / direct masks */
-    uint32_t  prim;
-    GLenum    mode;
-    uint32_t  texva[4];
-    uint32_t  color_va, zeta_va;
-    /* one interleaved vertex run: bytes per vertex + per-attr layout */
-    uint32_t  vstride;
-    uint32_t  astride[NV2A_RAW_ATTRS], aoff[NV2A_RAW_ATTRS];
-    GLint     aglsize[NV2A_RAW_ATTRS];
-    GLenum    agltype[NV2A_RAW_ATTRS];
-    GLboolean aglnorm[NV2A_RAW_ATTRS];
-    float     aconst[NV2A_RAW_ATTRS][4];
-    /* collected data */
-    uint32_t  nsub, nverts, nidx;
-    uint32_t  vstart[MG_MAX];
-    float     cblk[MG_MAX][192 * 4];
-    uint8_t  *vb; size_t vcap, vlen;
-    uint32_t *ib; size_t icap, ilen;
-    uint64_t  draws_saved;
-} Mg;
-static Mg s_mg;
-static uint64_t s_mg_flushes, s_mg_subdraws;   /* actual GL draws issued */
-
-/* Hash every register the vertex/fragment shaders or apply_state() read,
- * excluding the vertex constants (which travel per sub-draw instead). */
-static uint32_t mg_state_sig(const uint32_t *r)
-{
-    static const uint32_t rng[][2] = {
-        { 0x260, 0x3A4 },   /* combiners, blend, depth, stencil, cull, colormask */
-        { 0x1B00, 0x1C00 }, /* texture stages (filt/ctl) */
-        { 0x1E00, 0x1E80 }, /* final combiner, tex gen, fog factor */
-    };
-    uint32_t h = 2166136261u, i, a;
-    for (i = 0; i < sizeof rng / sizeof rng[0]; i++)
-        for (a = rng[i][0]; a < rng[i][1]; a += 4)
-            h = (h ^ (r[a / 4] + (a << 7))) * 16777619u;
-    return h;
-}
-
-/* Resolve the glVertexAttribPointer arguments for attribute `a`. */
-static void mg_attr_gl(const Nv2aRawBatch *b, uint32_t a, GLint *size,
-                       GLenum *type, GLboolean *norm)
-{
-    switch (b->direct[a].type) {
-    case 0:  *size = nv2a_gl_api_es ? 4 : GL_BGRA;
-             *type = GL_UNSIGNED_BYTE; *norm = GL_TRUE; break;
-    case 1:  *size = (GLint)b->direct[a].size; *type = GL_SHORT; *norm = GL_TRUE; break;
-    case 2:  *size = (GLint)b->direct[a].size; *type = GL_FLOAT; *norm = GL_FALSE; break;
-    case 4:  *size = (GLint)b->direct[a].size; *type = GL_UNSIGNED_BYTE; *norm = GL_TRUE; break;
-    default: *size = (GLint)b->direct[a].size; *type = GL_SHORT; *norm = GL_FALSE; break;
-    }
-}
-
-/* Can this draw join the batch in s_mg? */
-static int mg_match(const Nv2aRawBatch *b, GlProg *p, GlSurf *s, uint32_t sig)
-{
-    Mg *m = &s_mg;
-    VRun run[NV2A_RAW_ATTRS];
-    int of_run[NV2A_RAW_ATTRS];
-    uint32_t a, nrun, span;
-
-    if (!m->on || m->nsub >= (uint32_t)s_mg_max)
-        return 0;
-    if (m->p != p || m->s != s || m->sig != sig || m->prim != b->prim)
-        return 0;
-    if (m->ap != b->attr_present || m->ad != b->attr_direct)
-        return 0;
-    for (a = 0; a < 4; a++)
-        if (m->texva[a] != b->tex_va[a])
-            return 0;
-    if (m->color_va != b->surface.color_va || m->zeta_va != b->zeta_va)
-        return 0;
-    if (!b->vertex_count || !b->index_count)
-        return 0;
-    nrun = vertex_runs(b, run, of_run);
-    if (nrun != 1)
-        return 0;
-    span = (uint32_t)(run[0].hi - run[0].lo);
-    if (!span || span % b->vertex_count || span / b->vertex_count != m->vstride)
-        return 0;
-    for (a = 0; a < NV2A_RAW_ATTRS; a++) {
-        if (!(b->attr_direct & (1u << a)))
-            continue;
-        if (b->direct[a].stride != m->astride[a] ||
-            (uint32_t)(b->direct[a].ptr - run[0].lo) != m->aoff[a])
-            return 0;
-    }
-    return 1;
-}
-
-/* Start collecting with `b` as the layout/state reference. */
-static int mg_begin(const Nv2aRawBatch *b, GlProg *p, GlSurf *s, uint32_t sig,
-                    const uint32_t *idx, uint32_t n, GLenum mode)
-{
-    Mg *m = &s_mg;
-    VRun run[NV2A_RAW_ATTRS];
-    int of_run[NV2A_RAW_ATTRS];
-    uint32_t a, nrun, span;
-
-    if (b->attr_present != b->attr_direct)      /* conv attrs: not mergeable */
-        return 0;
-    if (!b->vertex_count || !b->index_count)
-        return 0;
-    nrun = vertex_runs(b, run, of_run);
-    if (nrun != 1)
-        return 0;
-    span = (uint32_t)(run[0].hi - run[0].lo);
-    if (!span || span % b->vertex_count)
-        return 0;
-    memset(&m->vstart, 0, sizeof m->vstart);
-    m->on = 1;
-    m->p = p; m->s = s; m->sig = sig;
-    m->ap = b->attr_present; m->ad = b->attr_direct;
-    m->prim = b->prim; m->mode = mode;
-    for (a = 0; a < 4; a++)
-        m->texva[a] = b->tex_va[a];
-    m->color_va = b->surface.color_va;
-    m->zeta_va = b->zeta_va;
-    m->vstride = span / b->vertex_count;
-    for (a = 0; a < NV2A_RAW_ATTRS; a++) {
-        m->astride[a] = b->direct[a].stride;
-        m->aoff[a] = (uint32_t)(b->direct[a].ptr - run[0].lo);
-        mg_attr_gl(b, a, &m->aglsize[a], &m->agltype[a], &m->aglnorm[a]);
-        memcpy(m->aconst[a], b->attr_const[a], sizeof m->aconst[a]);
-    }
-    m->nsub = m->nverts = m->nidx = 0;
-    m->vlen = m->ilen = 0;
-    (void)idx; (void)n;
-    return 1;
-}
-
-/* Append a sub-draw's geometry (indices already point into its own vertices). */
-static int mg_append(const Nv2aRawBatch *b, const uint32_t *idx, uint32_t n)
-{
-    Mg *m = &s_mg;
-    VRun run[NV2A_RAW_ATTRS];
-    int of_run[NV2A_RAW_ATTRS];
-    size_t span, need;
-    uint32_t i;
-
-    if (m->nsub >= (uint32_t)s_mg_max)
-        return 0;
-    vertex_runs(b, run, of_run);
-    span = (size_t)(run[0].hi - run[0].lo);
-    if (m->vlen + span > m->vcap) {
-        size_t cap = m->vcap ? m->vcap * 2 : (1u << 20);
-        while (cap < m->vlen + span) cap *= 2;
-        uint8_t *nv = (uint8_t *)realloc(m->vb, cap);
-        if (!nv) return 0;
-        m->vb = nv; m->vcap = cap;
-    }
-    need = m->ilen + n;
-    if (need > m->icap) {
-        size_t cap = m->icap ? m->icap * 2 : 65536;
-        while (cap < need) cap *= 2;
-        uint32_t *ni = (uint32_t *)realloc(m->ib, cap * sizeof(uint32_t));
-        if (!ni) return 0;
-        m->ib = ni; m->icap = cap;
-    }
-    m->vstart[m->nsub] = m->nverts;
-    memcpy(m->vb + m->vlen, run[0].lo, span);
-    m->vlen += span;
-    m->nverts += b->vertex_count;
-    for (i = 0; i < n; i++)
-        m->ib[m->ilen + i] = idx[i] + m->vstart[m->nsub];
-    m->ilen += n;
-    if (b->vp_consts && m->p->vkey)
-        memcpy(m->cblk[m->nsub], b->vp_consts, 192 * 16);
-    else
-        memset(m->cblk[m->nsub], 0, 192 * 16);
-    m->nsub++;
-    return 1;
-}
-
-/* Submit the batch as one draw. */
-static void mg_flush(void)
-{
-    Mg *m = &s_mg;
-    GLintptr vat, iat;
-    void *vmap, *imap;
-    GLenum idx_type;
-    uint32_t a, i, n;
-
-    if (!m->on)
-        return;
-    m->on = 0;
-    n = m->nsub;
-    if (!n) { m->nverts = m->nidx = m->vlen = m->ilen = 0; return; }
-    m->nidx = (uint32_t)m->ilen;
-
-    vat = ring_alloc(&s_vring, (GLsizeiptr)m->vlen, &vmap);
-    if (vmap)
-        memcpy(vmap, m->vb, m->vlen);
-    ring_done(&s_vring, vat, (GLsizeiptr)m->vlen, vmap, m->vb);
-
-    bind_vao();
-    idx_type = m->nverts <= 65536 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT;
-    iat = ring_alloc(&s_iring, (GLsizeiptr)m->nidx * (idx_type == GL_UNSIGNED_SHORT ? 2 : 4), &imap);
-    if (imap) {
-        if (idx_type == GL_UNSIGNED_SHORT) {
-            uint16_t *o = (uint16_t *)imap;
-            for (i = 0; i < m->nidx; i++) o[i] = (uint16_t)m->ib[i];
-        } else {
-            memcpy(imap, m->ib, (size_t)m->nidx * 4);
-        }
-    }
-    ring_done(&s_iring, iat, (GLsizeiptr)m->nidx * (idx_type == GL_UNSIGNED_SHORT ? 2 : 4), imap, m->ib);
-
-    for (a = 0; a < NV2A_RAW_ATTRS; a++) {
-        if (!(m->ap & (1u << a))) { attr_enable(a, 0); continue; }
-        attr_enable(a, 1);
-        if (!(m->ad & (1u << a))) continue;
-        glVertexAttribPointer(a, m->aglsize[a], m->agltype[a], m->aglnorm[a],
-                              (GLsizei)m->astride[a],
-                              (const void *)(uintptr_t)(vat + m->aoff[a]));
-    }
-    for (a = 0; a < NV2A_RAW_ATTRS; a++)
-        if (!(m->ap & (1u << a)))
-            glVertexAttrib4f(a, m->aconst[a][0], m->aconst[a][1],
-                             m->aconst[a][2], m->aconst[a][3]);
-
-    if (m->p->prog != s_cur_prog) { glUseProgram(m->p->prog); s_cur_prog = m->p->prog; }
-    if (m->p->u_c >= 0)
-        glUniform4fv(m->p->u_c, (GLsizei)(192 * n), &m->cblk[0][0]);
-    if (m->p->u_vstart >= 0)
-        glUniform1iv(m->p->u_vstart, (GLsizei)n, (const GLint *)m->vstart);
-    if (m->p->u_nsub >= 0)
-        glUniform1i(m->p->u_nsub, (GLint)n);
-    m->p->nsub_set = 1;                 /* a later single draw must reset it */
-    m->p->vpc_valid = 0;
-
-    glDrawRangeElements(m->mode, 0, m->nverts - 1, (GLsizei)m->nidx, idx_type,
-                        (const void *)(uintptr_t)iat);
-    gl_step_done("draw");
-    m->draws_saved += n - 1;
-    s_mg_flushes++;
-    s_mg_subdraws += n;
-
-    m->nsub = m->nverts = m->nidx = 0;
-    m->vlen = m->ilen = 0;
-}
-
-
 /* ── Pass census and pass skipping ───────────────────────────────────
  *
  * RECOMP_GL_SURF_STATS=1: every 300 frames, the colour surfaces drawn into
@@ -2418,21 +2118,11 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
 
     if (!ready())
         return;
-    mg_init();
     if (!s_q_on) {                  /* queued draws were counted in q_draw */
         surf_stats_draw(&b->surface);
         if (pass_skipped(&b->surface))
             return;
     }
-    /* Merge: if this draw cannot join the open batch, submit the batch now,
-     * while its surface/program/state are still bound. */
-    if (s_merge && s_mg.on &&
-        (b->surface.color_va != s_mg.color_va || b->zeta_va != s_mg.zeta_va ||
-         b->prim != s_mg.prim || b->attr_present != s_mg.ap ||
-         b->attr_direct != s_mg.ad || b->tex_va[0] != s_mg.texva[0] ||
-         b->tex_va[1] != s_mg.texva[1] || b->tex_va[2] != s_mg.texva[2] ||
-         b->tex_va[3] != s_mg.texva[3] || mg_state_sig(r) != s_mg.sig))
-        mg_flush();
     s_regs = r;
     s_batch = b;
     XTRACE_DRAW_START;          /* per-draw phases, 1 draw in 16 */
@@ -2482,38 +2172,6 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     if (b->index_count < 50)
         s_frag_total++;
     census_draw(&b->surface, pk.shader_program);
-    /* Merge, fast path: a compatible sub-draw appends with no GL calls at
-     * all (the batch's program, textures and state are already bound). */
-    if (s_merge) {
-        const uint32_t *midx;
-        uint32_t mn;
-        GLenum mmode = gl_prim(b, &midx, &mn);
-        uint32_t sig = mg_state_sig(r);
-        static uint64_t dbg_tot, dbg_prim, dbg_app;
-        dbg_tot++;
-        if (mn && midx == b->indices && s_mg.on && mg_match(b, p, s, sig)) {
-            if (mg_append(b, midx, mn)) {
-                dbg_app++;
-                s_mg_merged_frame++;
-                if ((dbg_tot % 300) == 0)
-                    fprintf(stderr, "  [GL] merge: %llu draws -> %llu GL draws "
-                            "(%llu merged, %llu sub/batch, %llu bad-prim)\n",
-                            (unsigned long long)dbg_tot,
-                            (unsigned long long)(s_mg_flushes + dbg_prim),
-                            (unsigned long long)dbg_app,
-                            (unsigned long long)(s_mg_flushes ? s_mg_subdraws / s_mg_flushes : 0),
-                            (unsigned long long)dbg_prim);
-                return;
-            }
-        }
-        if (mn && midx == b->indices)
-            mg_flush();         /* incompatible: submit the open batch first */
-        else
-            dbg_prim++;
-        if (s_mg.on)
-            mg_flush();
-        (void)mmode;
-    }
     if (p->prog != s_cur_prog) {
         glUseProgram(p->prog);
         s_cur_prog = p->prog;
@@ -2548,14 +2206,6 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
 
     /* 192 constants are 3 KB, and most draws in a row share them: upload
      * only when they changed since this program last got them. */
-    /* A merged batch left u_nsub nonzero on this program; a single draw
-     * needs block 0, so put it back (nv2a_blk() returns 0 when u_nsub is 0). */
-    if (p->nsub_set) {
-        if (p->u_nsub >= 0)
-            glUniform1i(p->u_nsub, 0);
-        p->nsub_set = 0;
-        p->vpc_valid = 0;
-    }
     if (p->u_c >= 0 && !(p->vpc_valid && p->vpc_gen == b->vp_const_gen)) {
         /* Same executor version: same contents, no compare needed. */
         if (!p->vpc_valid || !p->vpc_rows) {
@@ -2713,19 +2363,6 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     XTRACE_DRAW_MARK("d:uniforms");
     apply_state(r, b->zeta_va != 0);
     XTRACE_DRAW_MARK("d:state");
-
-    /* Merge: this draw starts a new batch (the early check already flushed
-     * any open one). Its program, textures and state are now bound. */
-    if (s_merge) {
-        const uint32_t *midx;
-        uint32_t mn;
-        GLenum mmode = gl_prim(b, &midx, &mn);
-        uint32_t sig = mg_state_sig(r);
-        if (mn && midx == b->indices &&
-            mg_begin(b, p, s, sig, midx, mn, mmode) && mg_append(b, midx, mn))
-            return;
-        mg_flush();
-    }
 
     bind_vao();
     if (!upload_vertices(b))
@@ -2936,7 +2573,6 @@ static void gl_flip(void)
     }
     /* knobs DUMP_DRAWS=1: print this frame's draw census (per surface and
      * per program) and clear the request. */
-    mg_flush();                     /* merged batch: submit before present */
     census_flush();
     surf_stats_frame();
     if (!s_q_on)
