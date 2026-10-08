@@ -26,6 +26,7 @@ Env: R36S_PASS (default "ark"), R36S_HOST (default 192.168.3.71).
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -93,7 +94,7 @@ def deploy():
     return True
 
 
-def run_driver(mode, timeout=600):
+def run_driver(mode, env=(), timeout=600):
     """Upload the driver, launch it DETACHED (nohup, so an ssh drop doesn't kill
     it mid-race), poll the on-device report file until it appears, then pull
     the report + driver log + game log back here. Returns the parsed report."""
@@ -111,7 +112,7 @@ def run_driver(mode, timeout=600):
 
     # rm any stale report so we don't read last run's result, then start.
     rc, _, _ = ssh([f"rm -f '{REPORT_REMOTE}' && cd {PORT} && "
-                    f"nohup python3 {DRIVER_REMOTE} {mode} >/dev/null 2>&1 &"])
+                    f"nohup python3 {DRIVER_REMOTE} {mode} {' '.join(env)} >/dev/null 2>&1 &"])
     print(f"[driver] started on {HOST} (detached), waiting for report ...")
 
     report = None
@@ -151,11 +152,41 @@ def collect(report):
     return outdir
 
 
+def pull_shot(report, outdir):
+    """The screen is judged on the device (driver: mean brightness of each
+    dumped frame). Only a picture that is not black is worth looking at, so
+    only then is the newest shot copied back, as PNG."""
+    scr = report.get("screen")
+    if not scr or not scr.get("last"):
+        print("[screen] no frame dumped")
+        return
+    means = ", ".join(f"{s['mean']:.0f}" for s in scr["shots"] if s["mean"] is not None)
+    if scr["black"]:
+        print(f"[screen] BLACK (mean per shot: {means})")
+        return
+    bmp = os.path.join(outdir, scr["last"])
+    rc = subprocess.run(["sshpass", "-p", PASS, "scp", "-o", "ConnectTimeout=10",
+                         f"ark@{HOST}:{PORT}/shots/{scr['last']}", bmp],
+                        capture_output=True, text=True, timeout=60).returncode
+    if rc != 0:
+        print("[screen] could not pull the shot")
+        return
+    try:
+        from PIL import Image
+        png = bmp[:-4] + ".png"
+        Image.open(bmp).convert("RGB").save(png)
+        os.remove(bmp)
+        print(f"[screen] ok (mean per shot: {means}) -> {png}")
+    except ImportError:
+        print(f"[screen] ok -> {bmp} (no PIL here, left as BMP)")
+
+
 def print_baseline(b):
     """The race steady state and the load -> race ramp, as a table."""
     st = b["steady"]
-    print(f"\n[baseline] steady state, last {st['frames']} frames "
-          f"(frame {b['steady_first_frame']}+ after HUD live)")
+    print(f"\n[baseline] steady state, {st['frames']} frames of the race scene "
+          f"(scene from frame {b['race_first_frame']}, sampled from {b['steady_first_frame']}, "
+          "counted after HUD live)")
     for k in ("ms", "gl", "wait", "swap", "dc", "frag", "calls"):
         v = st[k]
         print(f"  {k:6s} p50 {v['p50']:9.1f}   min {v['min']:9.1f}   max {v['max']:9.1f}")
@@ -175,6 +206,8 @@ def main():
     ap.add_argument("--baseline", action="store_true",
                     help="per-frame draw/GL stats of the race (RECOMP_PERF_LOG=2), "
                          "summarised on the device")
+    ap.add_argument("--env", action="append", default=[], metavar="KEY=VAL",
+                    help="extra env.txt line for this run only (repeatable)")
     ap.add_argument("--host", default=HOST)
     args = ap.parse_args()
     HOST = args.host
@@ -191,7 +224,10 @@ def main():
         print("[deploy] skipped (--skip-deploy)")
 
     mode = "launch" if args.launch else "baseline" if args.baseline else "race"
-    report = run_driver(mode)
+    for e in args.env:
+        if not re.fullmatch(r"[A-Z0-9_]+=[\w.,:/+-]*", e):
+            sys.exit(f"error: bad --env {e!r} (KEY=VAL, simple characters only)")
+    report = run_driver(mode, args.env)
     if report is None:
         print(json.dumps({"verdict": "FAIL: no report"}))
         return
@@ -200,6 +236,7 @@ def main():
     outdir = collect(report)
     if mode == "baseline" and "baseline" in report:
         print_baseline(report["baseline"])
+        pull_shot(report, outdir)
     verdict = report.get("verdict", "UNKNOWN")
     if verdict == "PASS":
         print(f"[autotest] PASS ({outdir})")

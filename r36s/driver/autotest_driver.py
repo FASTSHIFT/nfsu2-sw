@@ -8,7 +8,7 @@ exactly as typed. The host only uploads this file and runs it:
     python3 autotest_driver.py            # full run (deploy handled by host)
     python3 autotest_driver.py launch     # only: open the game, confirm, exit
     python3 autotest_driver.py race       # open + drive into a race + sample
-    python3 autotest_driver.py baseline   # same entry, then log per-frame draw
+    python3 autotest_driver.py baseline [KEY=VAL ...]   # same entry, then log per-frame draw
                                           # stats (RECOMP_PERF_LOG=2), summarise
                                           # the race frames and quit by hotkey
 
@@ -56,6 +56,13 @@ BTN_RT = 313      # accelerate (right trigger)
 # never be seen. Hold 100 ms of a 200 ms period: every poll sees an edge.
 PAD_MASH = "200,100,7"
 HUD_POLL_S = 1.0
+
+# Frame dumps (RECOMP_GL_DUMP, BMP) so a black or broken picture is noticed: the
+# driver judges "black" on the device, the host only pulls a picture back when
+# it is not.
+SHOTS_DIR = PORT + "/shots"
+SHOT_EVERY = 100        # frames
+BLACK_MEAN = 4.0        # mean channel value (0-255) below this is black
 
 # Printed by src/autotest.c (see the module docstring).
 HUD_LIVE = "[AUTOTEST] HUD live"
@@ -288,11 +295,52 @@ def do_race(pid, timeout=240, hold_rt=True):
     return False
 
 
+def shot_mean(path, stride=4099):
+    """Mean channel value of an uncompressed 24/32-bit BMP, sampled every
+    `stride` bytes (no PIL on the device). None if it cannot be read."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        off = int.from_bytes(data[10:14], "little")
+        bpp = int.from_bytes(data[28:30], "little")
+        px = data[off:]
+        step = bpp // 8
+        if bpp not in (24, 32) or not px:
+            return None
+        vals = [px[i + c] for i in range(0, len(px) - step, stride)
+                for c in range(3)]
+        return sum(vals) / len(vals)
+    except (OSError, IndexError):
+        return None
+
+
+def screen_report():
+    """Per-shot brightness; `last` is the newest shot (the race steady state)."""
+    rc, out = sh(f"ls -1 '{SHOTS_DIR}' 2>/dev/null | sort")
+    names = [n for n in out.splitlines() if n.endswith(".bmp")]
+    shots = [{"file": n, "mean": shot_mean(f"{SHOTS_DIR}/{n}")} for n in names]
+    last = shots[-1] if shots else None
+    return {
+        "shots": shots,
+        "last": last["file"] if last else None,
+        "black": bool(last and last["mean"] is not None and last["mean"] < BLACK_MEAN),
+    }
+
+
 FRAME_RE = re.compile(r"^\[frame\] (\d+) (.*)$")
 BASE_FIELDS = ("ms", "gl", "wait", "swap", "dc", "frag", "calls")
-BASE_FRAMES = 420      # frames after "HUD live" to wait for (race starts ~+220)
-BASE_STEADY = 100      # the last this many frames are the steady-state sample
-
+# The steady state is a scene, not a frame number: after "HUD live" the game
+# loads (~160 draws), shows a pre-race scene (~290 draws of 50+ indices) and
+# only then the race itself (~870), and how long each takes varies from run to
+# run (base2 sampled the pre-race scene with "the last 100 of 420 frames").
+# Draws with 50+ indices are the marker: they are not what RECOMP_GL_EXP_DROPFRAG
+# removes, and not what the draw merging will change.
+RACE_BIG_DRAWS = 600    # dc - frag at or above this = the race scene
+BASE_SETTLE = 120       # frames to skip once the race scene shows up: its first
+                        # ~100 frames are heavier (dc 2300 -> 2670 -> 2290, frame
+                        # time 125 -> 170 -> 122 ms) before it settles
+BASE_STEADY = 100       # frames sampled after that
+BASE_TIMEOUT = 300      # s
 
 def frames_after_hud():
     """[frame] lines (RECOMP_PERF_LOG=2) written after the HUD-live line."""
@@ -320,29 +368,32 @@ def summarise(frames):
     return res
 
 
-def do_baseline(timeout=300):
-    """Wait for BASE_FRAMES frames after the HUD line, then summarise: a
-    series (30-frame windows, to show the load -> pre-race -> race ramp) and
-    the steady state (the last BASE_STEADY frames)."""
+def do_baseline(timeout=BASE_TIMEOUT):
+    """Wait until the race scene has been on screen for BASE_SETTLE +
+    BASE_STEADY frames, then summarise: a series (30-frame windows over
+    everything since HUD live, to show the load -> pre-race -> race ramp) and
+    the steady state (BASE_STEADY frames of the race scene)."""
     end = time.time() + timeout
-    n = 0
     while time.time() < end:
         if not game_pid():
             die("game process gone while sampling")
-        n = len(frames_after_hud())
-        if n >= BASE_FRAMES:
+        fr = frames_after_hud()
+        race = [i for i, f in enumerate(fr) if f["dc"] - f["frag"] >= RACE_BIG_DRAWS]
+        if len(race) >= BASE_SETTLE + BASE_STEADY:
             break
         time.sleep(2)
-    fr = frames_after_hud()
-    log(f"{len(fr)} frames after HUD live")
-    if len(fr) < BASE_FRAMES:
+    else:
+        log(f"race scene never filled the window ({len(fr)} frames, {len(race)} in it)")
         return None
+    pick = race[BASE_SETTLE:BASE_SETTLE + BASE_STEADY]
+    log(f"{len(fr)} frames after HUD live, race scene from frame {race[0]}")
     return {
         "series": [dict(start=i, **{k: quantile([f[k] for f in fr[i:i + 30]], 0.5)
                                     for k in BASE_FIELDS})
                    for i in range(0, len(fr) - 29, 30)],
-        "steady": summarise(fr[-BASE_STEADY:]),
-        "steady_first_frame": len(fr) - BASE_STEADY,
+        "steady": summarise([fr[i] for i in pick]),
+        "race_first_frame": race[0],
+        "steady_first_frame": pick[0],
     }
 
 
@@ -392,13 +443,17 @@ def main():
     log("preconditions ok (ES up, no game)")
     mark("preconditions")
 
-    extra = []
+    # KEY=VALUE arguments after the mode go into env.txt for this run too
+    # (A/B experiments: RECOMP_GL_EXP_RD=2 ...).
+    extra = [a for a in sys.argv[2:] if re.fullmatch(r"[A-Z0-9_]+=[\w.,:/+-]*", a)]
     if mode != "launch":
         extra.append(f"RECOMP_PAD_MASH={PAD_MASH}")
     if mode == "baseline":
         # One [frame] line per presented frame: draws, fragment draws, GL
         # calls, GL / wait / swap ms. The game's own switches stay as in env.txt.
         extra.append("RECOMP_PERF_LOG=2")
+        sh(f"rm -rf '{SHOTS_DIR}' && mkdir -p '{SHOTS_DIR}'")
+        extra.append(f"RECOMP_GL_DUMP={SHOTS_DIR}/f,{SHOT_EVERY}")
     if extra:
         env_apply(extra)
     else:
@@ -435,9 +490,12 @@ def run(mode, timing, t0, mark):
                 base = do_baseline()
                 mark("baseline")
                 if base is None:
-                    report["verdict"] = "FAIL: too few frames after HUD live"
+                    report["verdict"] = "FAIL: the race scene never showed up (or too few frames)"
                 else:
                     report["baseline"] = base
+                    report["screen"] = screen_report()
+                    if report["screen"]["black"]:
+                        log("SCREEN IS BLACK in the last shot")
                     report["temp_c"] = read_temp()
                     report["cpu_mhz"] = read_freq()
                     report["verdict"] = "PASS"

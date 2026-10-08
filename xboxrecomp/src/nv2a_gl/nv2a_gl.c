@@ -1958,6 +1958,31 @@ static void pass_skip_frame(void)
     }
 }
 
+/* Draw-cost experiments (docs/10 §3): is the GL thread's frame time per-draw
+ * submission cost or GPU load? Off unless the variables are set; they change
+ * the picture and exist only to be measured with the perf HUD / [frame] log.
+ *
+ *   RECOMP_GL_EXP_DROPFRAG=1   skip draws with fewer than 50 indices (the merge
+ *                              candidates); 2 = skip every draw. Cost that
+ *                              follows the draw count shows up here.
+ *   RECOMP_GL_EXP_RD=2         GL_RASTERIZER_DISCARD around each draw: vertex
+ *                              work and submission stay, all fragment work
+ *                              goes. Cost that follows pixels shows up here.
+ *   RECOMP_GL_EXP_RD=1         control: the same two calls, but discard is off
+ *                              again before the draw (the call overhead only).
+ */
+static int s_exp_dropfrag = -1, s_exp_rd;
+
+static void exp_init(void)
+{
+    const char *e = getenv("RECOMP_GL_EXP_DROPFRAG"), *r = getenv("RECOMP_GL_EXP_RD");
+    s_exp_dropfrag = e ? atoi(e) : 0;
+    s_exp_rd = r ? atoi(r) : 0;
+    if (s_exp_dropfrag || s_exp_rd)
+        fprintf(stderr, "  [GL] EXPERIMENT: dropfrag=%d rasterizer-discard=%d\n",
+                s_exp_dropfrag, s_exp_rd);
+}
+
 static void surf_stats_draw(const Nv2aSurface *sf)
 {
     uint32_t w, h;
@@ -2117,6 +2142,10 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     float tscale[4][2], c0[8][4], c1[8][4], fog[4], surf[4], aa[2], m[16];
 
     if (!ready())
+        return;
+    if (s_exp_dropfrag < 0)
+        exp_init();
+    if (s_exp_dropfrag == 2 || (s_exp_dropfrag == 1 && b->index_count < 50))
         return;
     if (!s_q_on) {                  /* queued draws were counted in q_draw */
         surf_stats_draw(&b->surface);
@@ -2437,11 +2466,18 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
          * whole index list from the (write-combined, persistent) ring to find
          * it, ~0.16 us an index, which was most of a draw's driver time
          * (r36s-tools/gpubench drawbench idx: 1536 indices 266 -> 16 us). */
+        if (s_exp_rd) {
+            glEnable(GL_RASTERIZER_DISCARD);
+            if (s_exp_rd == 1)
+                glDisable(GL_RASTERIZER_DISCARD);   /* control: calls only */
+        }
         if (b->vertex_count)
             glDrawRangeElements(mode, 0, b->vertex_count - 1, (GLsizei)n, idx_type,
                                 (const void *)(uintptr_t)idx_at);
         else
             glDrawElements(mode, (GLsizei)n, idx_type, (const void *)(uintptr_t)idx_at);
+        if (s_exp_rd == 2)
+            glDisable(GL_RASTERIZER_DISCARD);
         XTRACE_DRAW_MARK("d:glDrawElements");      /* or glDrawRangeElements */
         XTRACE_DRAW_COUNTER("draw verts", b->vertex_count);
         XTRACE_DRAW_COUNTER("draw indices", n);

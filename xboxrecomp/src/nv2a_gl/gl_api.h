@@ -62,6 +62,7 @@ typedef struct __GLsync *GLsync;
 #define GL_STENCIL_TEST                   0x0B90
 #define GL_BLEND                          0x0BE2
 #define GL_SCISSOR_TEST                   0x0C11
+#define GL_RASTERIZER_DISCARD             0x8C89
 #define GL_VIEWPORT                       0x0BA2
 #define GL_UNPACK_ALIGNMENT               0x0CF5
 #define GL_UNPACK_ROW_LENGTH              0x0CF2
