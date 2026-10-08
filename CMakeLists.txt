@@ -53,6 +53,21 @@ else()
     add_executable(${PROJECT_NAME} ${GAME_SOURCES} ${RECOMP_GEN_SOURCES})
 endif()
 
+# autotest HUD hook: src/recomp_manual.c wraps FEngHud::Update (sub_00100360,
+# the per-frame in-race HUD update) so the first call can be logged. The wrap
+# needs the generated body renamed sub_00100360_gen, which tools.recomp does
+# from recomp_manual.c's `extern ... _gen` line; a gen dir lifted before that
+# line existed keeps the plain name, and defining it here too would be a
+# duplicate symbol. Enable the wrap only when the gen dir has the _gen body.
+file(STRINGS "${NFSU2_GEN_DIR}/recomp_funcs.h" _fenghud_gen
+     REGEX "^void sub_00100360_gen\\(void\\);" LIMIT_COUNT 1)
+if(_fenghud_gen)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_WRAP_FENGHUD=1)
+else()
+    message(STATUS "autotest: gen has no sub_00100360_gen -- HUD detection off "
+                   "(regen with tools/regen.sh to enable)")
+endif()
+
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 
 # Movies: VP6 decoded by FFmpeg instead of the lifted On2 decoder

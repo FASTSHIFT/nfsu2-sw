@@ -844,6 +844,29 @@ static void resample_entry(void)
         resample_native();
 }
 
+/* ── FEngHud::Update (0x00100360): "the race HUD is live" ─────────────
+ *
+ * thiscall (this = ecx = FEngHud, Player *, Car *), ret 8. The GC symbols name
+ * it (Speed.elf.c 0x801143D4): Player::UpdateHud (Xbox sub_001F0460) calls it
+ * once per frame while the player owns a HUD (Player+0x9A4 here, +615*4 on
+ * GC), and it walks the gauges -- Tachometer, TurboMeter, NitrousGauge,
+ * LapCounter, ... -- calling each one's Update. The HUD object is built in the
+ * Player constructor (HUD_SingleRace.fng and kin), so this runs in gameplay
+ * and not in the front end. autotest_hud_update() logs the first call and
+ * stops the unattended button mashing (src/autotest.c).
+ *
+ * Wrapped, not replaced: sub_00100360_gen is the lifted body (tools.recomp
+ * renames it from the extern line below). Guarded by CMake, which checks
+ * that the gen dir actually has the _gen body. */
+#ifdef NFSU2_WRAP_FENGHUD
+extern void sub_00100360_gen(void);
+extern void autotest_hud_update(uint32_t hud, uint32_t player);
+void sub_00100360(void)
+{
+    autotest_hud_update(ecx, MEM32(esp + 4));
+    sub_00100360_gen();
+}
+#endif
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
     if (native_mode()) {

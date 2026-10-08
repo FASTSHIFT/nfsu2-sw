@@ -9,11 +9,14 @@ exactly as typed. The host only uploads this file and runs it:
     python3 autotest_driver.py launch     # only: open the game, confirm, exit
     python3 autotest_driver.py race       # open + drive into a race + sample
 
-Reach detection is the render fingerprint: RECOMP_GL_SURF_STATS=1 prints, every
-300 frames, "[GL] passes per frame (300 frames): <VA> <WxH>:<draws> ..." and a
-race draws into six 128x128 surfaces (car env maps) that menus never touch:
+Reach detection is the game's own log: src/autotest.c wraps FEngHud::Update
+(sub_00100360, once per frame while the race HUD exists) and prints
 
-    83095680 830A5680 830B5680 830C5680 830D5680 830E5680
+    [AUTOTEST] HUD live: FEngHud=0x... Player=0x... update#1 t=NN.N s
+
+on its first call. The HUD is built with the Player for a race and does not
+exist in the front end, so the line is "the tachometer is now being drawn".
+Until it shows up the driver just mashes A.
 
 Button codes (odroidgo3-joypad / event2, R36S remap; see dArkOSen dtb sw19/sw22):
     A (confirm) = 305 (BTN_EAST, right)   B (back) = 304 (BTN_SOUTH, bottom)
@@ -40,11 +43,6 @@ BTN_B = 304       # bottom face button
 BTN_SELECT = 704
 BTN_START = 705
 BTN_RT = 313      # accelerate (right trigger)
-
-RACE_SURFACES = {
-    "83095680", "830A5680", "830B5680",
-    "830C5680", "830D5680", "830E5680",
-}
 
 _deadline = 0.0
 
@@ -157,21 +155,14 @@ def exit_game_sure(timeout=60):
     return False
 
 
-def parse_passes(line):
-    m = re.search(r"passes per frame \((\d+) frames\): (.*)$", line)
-    if not m:
-        return set()
-    toks = m.group(2).split()
-    return {toks[i] for i in range(0, len(toks), 2) if toks[i][:2] == "83"}
+def log_has(text):
+    """True if the game log contains `text` (fixed string)."""
+    rc, _ = sh(f"grep -qF '{text}' '{GAME_LOG}'")
+    return rc == 0
 
 
-def in_race(line):
-    return len(parse_passes(line) & RACE_SURFACES) >= 4
-
-
-def latest_pass_line():
-    rc, out = sh(f"grep 'passes per frame' '{GAME_LOG}' | tail -1")
-    return out if rc == 0 else ""
+def first_frame_seen():
+    return sh(f"grep -q '\\[fps\\]' '{GAME_LOG}'")[0] == 0
 
 
 def es_launched_nfs2():
@@ -204,9 +195,9 @@ def wait_game(timeout=60):
 
 def do_launch():
     """Open the game with one A press; confirm via ES log it was NFS2."""
-    # Clear the game log before launching: latest_pass_line() would otherwise
-    # read "passes per frame" lines left over from a previous run and falsely
-    # report "reached race" even when the game never started this time.
+    # Clear the game log before launching: the HUD line of a previous run
+    # would otherwise be taken for this run's and report "reached race" even
+    # when the game never started this time.
     sh(f"rm -f '{GAME_LOG}'")
     log("pressing A to launch")
     press(BTN_A, 200)
@@ -220,34 +211,48 @@ def do_launch():
 
 
 def do_race(pid, timeout=180):
-    """Once the game starts presenting frames, tap A every 1 s until the race
-    fingerprint (six 128x128 env maps) appears, then hold RT so the car moves."""
+    """Mash A until the game logs that the race HUD is live, then hold RT so
+    the car moves. Tapping starts with the first presented frame; before that
+    the game is still booting and ignores the pad."""
     log("waiting for the first frame ...")
     end = time.time() + timeout
     while time.time() < end:
         if not game_pid():
             die("game process gone")
-        if latest_pass_line() or sh(f"grep -q '\\[fps\\]' '{GAME_LOG}'")[0] == 0:
+        if first_frame_seen():
             break
         time.sleep(1)
     else:
         log("timeout waiting for first frame")
         return False
 
-    log("frames started -- tapping A every 1 s until the race fingerprint")
+    if log_has(HUD_HOOK_OFF):
+        die("this build cannot see the race HUD (gen lifted without the "
+            "sub_00100360 wrap) -- regen and rebuild")
+
+    log(f"frames started -- mashing A every {TAP_PERIOD_S * 1000:.0f} ms "
+        f"until the game logs '{HUD_LIVE}'")
+    taps = 0
     while time.time() < end:
-        if not game_pid():
-            die("game process gone")
-        press(BTN_A, 150)
-        line = latest_pass_line()
-        if in_race(line):
-            log("reached race (128x128 env maps present)")
-            # hold the throttle so the car actually drives
-            log("holding RT (accelerate) 8 s ...")
-            btn(BTN_RT, 1, 8000)
-            btn(BTN_RT, 0)
-            return True
-        time.sleep(1)
+        t_tap = time.time()
+        press(BTN_A, TAP_HOLD_MS)
+        taps += 1
+        # The checks fork a shell; do them every few taps so they do not eat
+        # into the tap rate.
+        if taps % CHECK_EVERY == 0:
+            if not game_pid():
+                die("game process gone")
+            rc, line = sh(f"grep -F '{HUD_LIVE}' '{GAME_LOG}' | head -1")
+            if rc == 0 and line:
+                log(f"reached race after {taps} taps: {line}")
+                log("holding RT (accelerate) 8 s ...")
+                btn(BTN_RT, 1, 8000)
+                btn(BTN_RT, 0)
+                return True
+        # Hold the cadence: sleep only what is left of the period.
+        rest = TAP_PERIOD_S - (time.time() - t_tap)
+        if rest > 0:
+            time.sleep(rest)
     log("timeout waiting for race")
     return False
 

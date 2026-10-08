@@ -361,11 +361,63 @@ static void pad_script_parse(int dev)
     s_script_count[dev] = n;
 }
 
+/* RECOMP_PAD_MASH: press A over and over until the run says it is done.
+ *
+ *   RECOMP_PAD_MASH="period_ms,hold_ms[,start_every]"     e.g. "200,70" or "200,70,6"
+ *
+ * For unattended runs that have to get through menus whose length varies
+ * (src/autotest.c): a fixed RECOMP_PAD_SCRIPT either waits too long or
+ * presses too early. A is pressed for hold_ms every period_ms, counted from
+ * the first report the title reads; with start_every every Nth press is Start
+ * instead (title screens ask for it). It adds to RECOMP_PAD_SCRIPT, and it
+ * stops for good once usb_gamepad_mash_stop is set -- autotest.c does that
+ * when the in-race HUD first updates, so Start never pauses the race. */
+volatile int usb_gamepad_mash_stop;
+
+static void pad_mash(uint8_t *digital, uint8_t *analog)
+{
+    static int      configured = -1;
+    static unsigned period, hold, start_every;
+    static unsigned long t0;
+    unsigned long now, k;
+
+    if (configured < 0) {
+        const char *spec = getenv("RECOMP_PAD_MASH");
+        char *end;
+        configured = 0;
+        if (spec && *spec) {
+            period = (unsigned)strtoul(spec, &end, 10);
+            hold = (*end == ',') ? (unsigned)strtoul(end + 1, &end, 10) : 0;
+            start_every = (*end == ',') ? (unsigned)strtoul(end + 1, &end, 10) : 0;
+            if (period && hold && hold < period) {
+                configured = 1;
+                t0 = (unsigned long)GetTickCount();
+                fprintf(stderr, "  PAD1: mashing A %u ms every %u ms%s until the HUD is live\n",
+                        hold, period, start_every ? " (Start every Nth)" : "");
+                fflush(stderr);
+            }
+        }
+    }
+    if (configured != 1 || usb_gamepad_mash_stop)
+        return;
+    now = (unsigned long)GetTickCount() - t0;
+    if (now % period >= hold)
+        return;
+    k = now / period;
+    if (start_every && (k % start_every) == start_every - 1)
+        *digital |= 0x10;
+    else
+        analog[0] = 0xFF;
+}
+
 static void pad_script(int dev, uint8_t *digital, uint8_t *analog)
 {
     const PadStep *steps = s_script_steps[dev];
     unsigned long now;
     int i;
+
+    if (!dev)
+        pad_mash(digital, analog);
 
     now = (unsigned long)GetTickCount();
     if (!s_script_t0) {
