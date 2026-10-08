@@ -45,6 +45,7 @@ enum {
     KN_POKE_VA,         /* guest VA to hold at KN_POKE_VAL every second (0) */
     KN_POKE_VAL,        /* value written to KN_POKE_VA (0) */
     KN_DUMP_DRAWS,      /* 1: print this frame's draw census at the next flip (0) */
+    KN_HUD,             /* 1: on-screen perf HUD (same as RECOMP_HUD=1) (0) */
     KN_COUNT
 };
 

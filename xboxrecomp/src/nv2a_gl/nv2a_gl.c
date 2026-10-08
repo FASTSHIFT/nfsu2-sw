@@ -36,6 +36,7 @@
 #include "nv2a_gl.h"
 #include "gl_api.h"
 #include "kms_present.h"
+#include "perf_hud.h"
 #include "platform/xtrace.h"
 #if !defined(_WIN32) && !defined(__SWITCH__)
 #include "platform/knobs.h"
@@ -2334,7 +2335,9 @@ static void census_flush(void)
  * what each submission-cost fix (persistent ring, vertex formats, uniform
  * packing) would remove, and what triple buffering could hide. */
 static uint64_t s_swap_ns, s_cs_draws;
+static uint64_t s_gl_wait_total_ns;   /* GL thread starved; never reset (HUD) */
 static uint64_t s_draws_total;              /* every draw that reached GL, for [fps] */
+static unsigned s_mg_merged_frame;          /* sub-draws folded into batches this frame */
 static void call_stats_frame(void)
 {
     static int on = -1;
@@ -2488,6 +2491,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
         if (mn && midx == b->indices && s_mg.on && mg_match(b, p, s, sig)) {
             if (mg_append(b, midx, mn)) {
                 dbg_app++;
+                s_mg_merged_frame++;
                 if ((dbg_tot % 300) == 0)
                     fprintf(stderr, "  [GL] merge: %llu draws -> %llu GL draws "
                             "(%llu merged, %llu sub/batch, %llu bad-prim)\n",
@@ -3016,6 +3020,41 @@ static void gl_flip(void)
         goto swap;
     }
 
+    /* Perf HUD (RECOMP_HUD=1 / knob HUD): one line of numbers per frame, drawn
+     * into the title's own surface so it rides the normal present path. The
+     * stats are the previous frame's -- this frame's swap time is not known
+     * yet. */
+    {
+        static uint64_t t_prev, calls_prev, draws_prev, swap_prev, idle_prev;
+        uint64_t now = hz_now(), calls = 0;
+        uint64_t idle = __atomic_load_n(&s_gl_wait_total_ns, __ATOMIC_RELAXED);
+        unsigned k;
+        PerfFrame pf;
+        for (k = 0; k < NV2A_GLID_COUNT; k++)
+            calls += nv2a_gl_calls[k];
+        if (t_prev) {
+            pf.frame_ms = (double)(now - t_prev) / 1e6;
+            pf.swap_ms  = (double)(s_swap_ns - swap_prev) / 1e6;
+            pf.wait_ms  = (double)(idle - idle_prev) / 1e6;
+            pf.gl_ms    = pf.frame_ms - pf.swap_ms - pf.wait_ms;
+            if (pf.gl_ms < 0) pf.gl_ms = 0;
+            pf.draws    = (unsigned)(s_draws_total - draws_prev);
+            pf.gl_calls = (unsigned)(calls - calls_prev);
+            pf.merged   = s_mg_merged_frame;
+            perf_hud_update(&pf);
+        }
+        t_prev = now; calls_prev = calls; draws_prev = s_draws_total; swap_prev = s_swap_ns;
+        idle_prev = idle;
+        s_mg_merged_frame = 0;
+        if (perf_hud_enabled() && s && s_drew_any) {
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s->fbo);
+            perf_hud_draw((int)s->pw, (int)s->ph, 1,
+                          (float)(s->aa_sx ? s->aa_sx : 1), (float)(s->aa_sy ? s->aa_sy : 1));
+            s_cur_prog = 0;                 /* the HUD bound its own program */
+            state_dirty();
+        }
+    }
+
     if (dump_every && (s_frame % (uint32_t)dump_every) == 0) {
         size_t need = (size_t)s->pw * s->ph * 4;
         if (need > pix_cap) {
@@ -3453,7 +3492,11 @@ static void *q_gl_thread(void *arg)
             __atomic_store_n(&s_q_consumer_waits, 0, __ATOMIC_SEQ_CST);
             pthread_mutex_unlock(&s_q_lock);
             XTRACE_END_TAG("queue empty");
-            __atomic_add_fetch(&s_q_gl_idle_ns, q_now_ns() - t0, __ATOMIC_RELAXED);
+            {
+                uint64_t dt = q_now_ns() - t0;
+                __atomic_add_fetch(&s_q_gl_idle_ns, dt, __ATOMIC_RELAXED);
+                __atomic_add_fetch(&s_gl_wait_total_ns, dt, __ATOMIC_RELAXED);
+            }
             continue;
         }
         rec = s_q + s_q_tail % Q_BYTES;

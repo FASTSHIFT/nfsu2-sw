@@ -23,6 +23,7 @@ volatile int g_knob[KN_COUNT] = {
     [KN_POKE_VA]          = 0,
     [KN_POKE_VAL]         = 0,
     [KN_DUMP_DRAWS]       = 0,
+    [KN_HUD]              = 0,
 };
 
 static const char *const s_count_name[KC_COUNT] = {
@@ -33,9 +34,9 @@ static const char *const s_count_name[KC_COUNT] = {
 static const char *const s_knob_name[KN_COUNT] = {
     "SPIN_WAKE_EVERY", "SPIN_YIELD_EVERY", "SPIN_YIELD_IDLE",
     "HW_SLEEP_US", "GIL_WAIT_MS", "FPS_CAP",
-    "POKE_VA", "POKE_VAL", "DUMP_DRAWS",
+    "POKE_VA", "POKE_VAL", "DUMP_DRAWS", "HUD",
 };
-static const int s_knob_min[KN_COUNT] = { 1, 1, 0, 50, 1, 0, 0, 0, 0 };
+static const int s_knob_min[KN_COUNT] = { 1, 1, 0, 50, 1, 0, 0, 0, 0, 0 };
 
 static int s_quiet;                  /* RECOMP_KNOBS_QUIET: no [wake] lines */
 

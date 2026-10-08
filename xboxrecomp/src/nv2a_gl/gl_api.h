@@ -243,6 +243,9 @@ static inline void nv2a_glClearDepth(double d)
 #define GL_EXTENSIONS                     0x1F03
 #define GL_TEXTURE_SWIZZLE_R              0x8E42
 #define GL_TEXTURE_SWIZZLE_B              0x8E44
+#define GL_R8                             0x8229
+#define GL_SRC_ALPHA                      0x0302
+#define GL_ONE_MINUS_SRC_ALPHA            0x0303
 #define GL_RED                            0x1903
 #define GL_BLUE                           0x1905
 

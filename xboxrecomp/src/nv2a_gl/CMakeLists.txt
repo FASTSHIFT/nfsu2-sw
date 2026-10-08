@@ -11,6 +11,7 @@ add_library(xbox_nv2a_gl STATIC
     gl_api.c
     gl_vsh.c
     gl_psh.c
+    perf_hud.c
 )
 target_include_directories(xbox_nv2a_gl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(xbox_nv2a_gl PUBLIC platform)    # platform/xtrace.h
