@@ -15,6 +15,8 @@ Usage:
     r36s/autotest.py --skip-deploy        # binary already deployed
     r36s/autotest.py --deploy-only        # deploy only
     r36s/autotest.py --launch             # driver launch mode (open + exit)
+    r36s/autotest.py --baseline           # enter a race, log per-frame draw
+                                          # stats, print the steady state, quit
     r36s/autotest.py --host 192.168.3.71
 
 Exit code 0 = PASS, 1 = FAIL. See docs/05 for the pipeline design and usage.
@@ -149,6 +151,20 @@ def collect(report):
     return outdir
 
 
+def print_baseline(b):
+    """The race steady state and the load -> race ramp, as a table."""
+    st = b["steady"]
+    print(f"\n[baseline] steady state, last {st['frames']} frames "
+          f"(frame {b['steady_first_frame']}+ after HUD live)")
+    for k in ("ms", "gl", "wait", "swap", "dc", "frag", "calls"):
+        v = st[k]
+        print(f"  {k:6s} p50 {v['p50']:9.1f}   min {v['min']:9.1f}   max {v['max']:9.1f}")
+    print("[baseline] 30-frame medians after HUD live (ms gl wait dc frag calls)")
+    for r in b["series"]:
+        print(f"  +{r['start']:4d}  {r['ms']:6.1f} {r['gl']:6.1f} {r['wait']:6.1f} "
+              f"{r['dc']:6.0f} {r['frag']:6.0f} {r['calls']:7.0f}")
+
+
 def main():
     global HOST
     ap = argparse.ArgumentParser()
@@ -156,6 +172,9 @@ def main():
     ap.add_argument("--skip-deploy", action="store_true")
     ap.add_argument("--launch", action="store_true",
                     help="driver launch mode (open + confirm + exit)")
+    ap.add_argument("--baseline", action="store_true",
+                    help="per-frame draw/GL stats of the race (RECOMP_PERF_LOG=2), "
+                         "summarised on the device")
     ap.add_argument("--host", default=HOST)
     args = ap.parse_args()
     HOST = args.host
@@ -171,7 +190,7 @@ def main():
     else:
         print("[deploy] skipped (--skip-deploy)")
 
-    mode = "launch" if args.launch else "race"
+    mode = "launch" if args.launch else "baseline" if args.baseline else "race"
     report = run_driver(mode)
     if report is None:
         print(json.dumps({"verdict": "FAIL: no report"}))
@@ -179,6 +198,8 @@ def main():
 
     print(json.dumps(report, indent=2))
     outdir = collect(report)
+    if mode == "baseline" and "baseline" in report:
+        print_baseline(report["baseline"])
     verdict = report.get("verdict", "UNKNOWN")
     if verdict == "PASS":
         print(f"[autotest] PASS ({outdir})")

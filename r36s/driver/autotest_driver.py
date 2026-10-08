@@ -8,6 +8,9 @@ exactly as typed. The host only uploads this file and runs it:
     python3 autotest_driver.py            # full run (deploy handled by host)
     python3 autotest_driver.py launch     # only: open the game, confirm, exit
     python3 autotest_driver.py race       # open + drive into a race + sample
+    python3 autotest_driver.py baseline   # same entry, then log per-frame draw
+                                          # stats (RECOMP_PERF_LOG=2), summarise
+                                          # the race frames and quit by hotkey
 
 Reach detection is the game's own log: src/autotest.c wraps FEngHud::Update
 (sub_00100360, once per frame while the race HUD exists) and prints
@@ -16,7 +19,8 @@ Reach detection is the game's own log: src/autotest.c wraps FEngHud::Update
 
 on its first call. The HUD is built with the Player for a race and does not
 exist in the front end, so the line is "the tachometer is now being drawn".
-Until it shows up the driver just mashes A.
+Until it shows up the game mashes A (RECOMP_PAD_MASH, set through env.txt
+for the run); the driver only waits for the line.
 
 Button codes (odroidgo3-joypad / event2, R36S remap; see dArkOSen dtb sw19/sw22):
     A (confirm) = 305 (BTN_EAST, right)   B (back) = 304 (BTN_SOUTH, bottom)
@@ -44,7 +48,18 @@ BTN_SELECT = 704
 BTN_START = 705
 BTN_RT = 313      # accelerate (right trigger)
 
-_deadline = 0.0
+# The menus are driven by the game itself: RECOMP_PAD_MASH (usb_gamepad.c)
+# presses A -- every 7th press Start -- inside the process, the same spec as
+# tools/pc/env.sh, until the HUD line shows up. The driver used to tap A over
+# evdev from here (5/s, 70 ms): python's own latency, and a press shorter than
+# a menu frame (~10 fps on the device) can fall between two pad polls and
+# never be seen. Hold 100 ms of a 200 ms period: every poll sees an edge.
+PAD_MASH = "200,100,7"
+HUD_POLL_S = 1.0
+
+# Printed by src/autotest.c (see the module docstring).
+HUD_LIVE = "[AUTOTEST] HUD live"
+HUD_HOOK_OFF = "FEngHud hook OFF"
 
 
 def log(msg):
@@ -89,8 +104,10 @@ def game_pid():
 
 
 def es_running():
-    rc, _ = sh("pgrep -x emulationstation | head -1")
-    return rc == 0
+    # comm is cut to 15 characters ("emulationstatio"); `pgrep -x` with the
+    # full name never matches, and piping into head hid that.
+    rc, out = sh("pgrep -x emulationstatio | head -1")
+    return out.isdigit()
 
 
 def read_file(path):
@@ -122,6 +139,31 @@ def press(code, hold_ms=150):
     btn(code, 1)
     time.sleep(hold_ms / 1000.0)
     btn(code, 0)
+
+
+ENV_FILE = PORT + "/env.txt"
+ENV_BAK = PORT + "/env.txt.autotest-bak"
+
+
+def env_apply(lines):
+    """Add KEY=VALUE lines to env.txt for this run only. The launcher sources
+    env.txt on every start; the original is kept in env.txt.autotest-bak and
+    put back by env_restore() (and at the start of the next run, if this one
+    died before it could)."""
+    env_restore()
+    orig = read_file(ENV_FILE)
+    with open(ENV_BAK, "w") as f:
+        f.write(orig)
+    with open(ENV_FILE, "w") as f:
+        f.write(orig.rstrip("\n") + "\n# autotest driver (this run only)\n"
+                + "\n".join(lines) + "\n")
+    log("env.txt += " + " ".join(lines))
+
+
+def env_restore():
+    if os.path.exists(ENV_BAK):
+        os.replace(ENV_BAK, ENV_FILE)
+        log("env.txt restored")
 
 
 def exit_game():
@@ -210,10 +252,9 @@ def do_launch():
     return pid
 
 
-def do_race(pid, timeout=180):
-    """Mash A until the game logs that the race HUD is live, then hold RT so
-    the car moves. Tapping starts with the first presented frame; before that
-    the game is still booting and ignores the pad."""
+def do_race(pid, timeout=240, hold_rt=True):
+    """Wait for the game to log that the race HUD is live (it is mashing A
+    itself, see PAD_MASH), then (hold_rt) hold RT so the car moves."""
     log("waiting for the first frame ...")
     end = time.time() + timeout
     while time.time() < end:
@@ -230,31 +271,79 @@ def do_race(pid, timeout=180):
         die("this build cannot see the race HUD (gen lifted without the "
             "sub_00100360 wrap) -- regen and rebuild")
 
-    log(f"frames started -- mashing A every {TAP_PERIOD_S * 1000:.0f} ms "
-        f"until the game logs '{HUD_LIVE}'")
-    taps = 0
+    log(f"frames started -- game is mashing A ({PAD_MASH}); waiting for '{HUD_LIVE}'")
     while time.time() < end:
-        t_tap = time.time()
-        press(BTN_A, TAP_HOLD_MS)
-        taps += 1
-        # The checks fork a shell; do them every few taps so they do not eat
-        # into the tap rate.
-        if taps % CHECK_EVERY == 0:
-            if not game_pid():
-                die("game process gone")
-            rc, line = sh(f"grep -F '{HUD_LIVE}' '{GAME_LOG}' | head -1")
-            if rc == 0 and line:
-                log(f"reached race after {taps} taps: {line}")
+        if not game_pid():
+            die("game process gone")
+        rc, line = sh(f"grep -F '{HUD_LIVE}' '{GAME_LOG}' | head -1")
+        if rc == 0 and line:
+            log(f"reached race: {line}")
+            if hold_rt:
                 log("holding RT (accelerate) 8 s ...")
                 btn(BTN_RT, 1, 8000)
                 btn(BTN_RT, 0)
-                return True
-        # Hold the cadence: sleep only what is left of the period.
-        rest = TAP_PERIOD_S - (time.time() - t_tap)
-        if rest > 0:
-            time.sleep(rest)
+            return True
+        time.sleep(HUD_POLL_S)
     log("timeout waiting for race")
     return False
+
+
+FRAME_RE = re.compile(r"^\[frame\] (\d+) (.*)$")
+BASE_FIELDS = ("ms", "gl", "wait", "swap", "dc", "frag", "calls")
+BASE_FRAMES = 420      # frames after "HUD live" to wait for (race starts ~+220)
+BASE_STEADY = 100      # the last this many frames are the steady-state sample
+
+
+def frames_after_hud():
+    """[frame] lines (RECOMP_PERF_LOG=2) written after the HUD-live line."""
+    out, seen = [], False
+    for line in read_file(GAME_LOG).splitlines():
+        if HUD_LIVE in line:
+            seen = True
+            continue
+        m = FRAME_RE.match(line) if seen else None
+        if m:
+            d = dict(re.findall(r"(\w+)=([\d.]+)", m.group(2)))
+            try:
+                out.append({k: float(d[k]) for k in BASE_FIELDS})
+            except KeyError:
+                pass
+    return out
+
+
+def summarise(frames):
+    """Median / min / max per field, over `frames`."""
+    res = {"frames": len(frames)}
+    for k in BASE_FIELDS:
+        v = [f[k] for f in frames]
+        res[k] = {"p50": quantile(v, 0.5), "min": min(v), "max": max(v)} if v else None
+    return res
+
+
+def do_baseline(timeout=300):
+    """Wait for BASE_FRAMES frames after the HUD line, then summarise: a
+    series (30-frame windows, to show the load -> pre-race -> race ramp) and
+    the steady state (the last BASE_STEADY frames)."""
+    end = time.time() + timeout
+    n = 0
+    while time.time() < end:
+        if not game_pid():
+            die("game process gone while sampling")
+        n = len(frames_after_hud())
+        if n >= BASE_FRAMES:
+            break
+        time.sleep(2)
+    fr = frames_after_hud()
+    log(f"{len(fr)} frames after HUD live")
+    if len(fr) < BASE_FRAMES:
+        return None
+    return {
+        "series": [dict(start=i, **{k: quantile([f[k] for f in fr[i:i + 30]], 0.5)
+                                    for k in BASE_FIELDS})
+                   for i in range(0, len(fr) - 29, 30)],
+        "steady": summarise(fr[-BASE_STEADY:]),
+        "steady_first_frame": len(fr) - BASE_STEADY,
+    }
 
 
 def sample(seconds=10):
@@ -303,6 +392,24 @@ def main():
     log("preconditions ok (ES up, no game)")
     mark("preconditions")
 
+    extra = []
+    if mode != "launch":
+        extra.append(f"RECOMP_PAD_MASH={PAD_MASH}")
+    if mode == "baseline":
+        # One [frame] line per presented frame: draws, fragment draws, GL
+        # calls, GL / wait / swap ms. The game's own switches stay as in env.txt.
+        extra.append("RECOMP_PERF_LOG=2")
+    if extra:
+        env_apply(extra)
+    else:
+        env_restore()
+    try:
+        run(mode, timing, t0, mark)
+    finally:
+        env_restore()
+
+
+def run(mode, timing, t0, mark):
     pid = do_launch()
     mark("launch")
 
@@ -318,6 +425,22 @@ def main():
             rc, out = sh(f"grep -c '\\[fps\\]' '{GAME_LOG}'")
             report["verdict"] = "LAUNCHED"
             report["fps_lines"] = out
+            exit_game_sure()
+            mark("exit")
+        elif mode == "baseline":
+            if not do_race(pid, hold_rt=False):
+                report["verdict"] = "FAIL: did not reach race"
+            else:
+                mark("reach_race")
+                base = do_baseline()
+                mark("baseline")
+                if base is None:
+                    report["verdict"] = "FAIL: too few frames after HUD live"
+                else:
+                    report["baseline"] = base
+                    report["temp_c"] = read_temp()
+                    report["cpu_mhz"] = read_freq()
+                    report["verdict"] = "PASS"
             exit_game_sure()
             mark("exit")
         else:
