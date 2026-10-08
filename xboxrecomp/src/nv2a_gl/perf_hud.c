@@ -119,13 +119,13 @@ int perf_hud_enabled(void)
 
 void perf_hud_update(const PerfFrame *f)
 {
-    static double a_f, a_g, a_w, a_s, a_d, a_c, a_m, min_f = 1e9, max_f;
+    static double a_f, a_g, a_w, a_s, a_fr, a_d, a_c, a_m, min_f = 1e9, max_f;
     static int n;
     int hud = perf_hud_enabled();
 
     if (s_log < 0) {
         const char *e = getenv("RECOMP_PERF_LOG");
-        s_log = e && *e == '1';
+        s_log = e ? atoi(e) : 0;
     }
     if (!hud && !s_log)
         return;
@@ -136,7 +136,8 @@ void perf_hud_update(const PerfFrame *f)
         s_nlines = 0;
         snprintf(s_lines[s_nlines++], sizeof s_lines[0], "FPS:%.0f %.1fMS", fps, f->frame_ms);
         snprintf(s_lines[s_nlines++], sizeof s_lines[0], "GL:%.1f WAIT:%.1f SWAP:%.1f", f->gl_ms, f->wait_ms, f->swap_ms);
-        snprintf(s_lines[s_nlines++], sizeof s_lines[0], "DC:%u CALLS:%u", f->draws, f->gl_calls);
+        snprintf(s_lines[s_nlines++], sizeof s_lines[0], "DC:%u FRAG:%u", f->draws, f->frag);
+        snprintf(s_lines[s_nlines++], sizeof s_lines[0], "CALLS:%u", f->gl_calls);
         if (f->merged)
             snprintf(s_lines[s_nlines++], sizeof s_lines[0], "MERGED:%u", f->merged);
         if (T.cpu_pct >= 0)
@@ -151,20 +152,26 @@ void perf_hud_update(const PerfFrame *f)
             snprintf(s_lines[s_nlines++], sizeof s_lines[0], "T:%.1fC", T.temp_mc / 1000.0);
     }
 
+    if (s_log >= 2) {
+        static unsigned frame_no;
+        fprintf(stderr, "[frame] %u ms=%.1f gl=%.1f wait=%.1f swap=%.1f dc=%u frag=%u calls=%u merged=%u\n",
+                frame_no++, f->frame_ms, f->gl_ms, f->wait_ms, f->swap_ms,
+                f->draws, f->frag, f->gl_calls, f->merged);
+    }
     a_f += f->frame_ms; a_g += f->gl_ms; a_w += f->wait_ms; a_s += f->swap_ms;
-    a_d += f->draws; a_c += f->gl_calls; a_m += f->merged;
+    a_d += f->draws; a_fr += f->frag; a_c += f->gl_calls; a_m += f->merged;
     if (f->frame_ms > 0) {
         if (f->frame_ms < min_f) min_f = f->frame_ms;
         if (f->frame_ms > max_f) max_f = f->frame_ms;
     }
     if (++n >= 120) {
-        if (s_log)
+        if (s_log == 1)
             fprintf(stderr, "[perf] frame=%.2fms(min %.1f max %.1f) fps=%.0f | gl=%.2f wait=%.2f swap=%.2f | "
-                    "dc=%.0f calls=%.0f merged=%.0f | sys=%d%% mem=%dM/%d%% a=%dM g=%dM t=%.1fC\n",
+                    "dc=%.0f frag=%.0f calls=%.0f merged=%.0f | sys=%d%% mem=%dM/%d%% a=%dM g=%dM t=%.1fC\n",
                     a_f / n, min_f, max_f, a_f > 0 ? 1000.0 * n / a_f : 0.0, a_g / n, a_w / n, a_s / n,
-                    a_d / n, a_c / n, a_m / n, T.cpu_pct, T.rss_mb, T.mem_pct, T.arm_mhz, T.gpu_mhz,
+                    a_d / n, a_fr / n, a_c / n, a_m / n, T.cpu_pct, T.rss_mb, T.mem_pct, T.arm_mhz, T.gpu_mhz,
                     T.temp_mc >= 0 ? T.temp_mc / 1000.0 : 0.0);
-        a_f = a_g = a_w = a_s = a_d = a_c = a_m = 0;
+        a_f = a_g = a_w = a_s = a_fr = a_d = a_c = a_m = 0;
         min_f = 1e9;
         max_f = 0;
         n = 0;

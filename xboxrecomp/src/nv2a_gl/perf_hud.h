@@ -12,7 +12,8 @@
  *
  * Besides the HUD, every 120 frames one "[perf]" line goes to stderr with the
  * window averages, min/max frame time and the extra NFSU2 columns, whether or
- * not the HUD is shown (RECOMP_PERF_LOG=1).
+ * not the HUD is shown (RECOMP_PERF_LOG=1). RECOMP_PERF_LOG=2 prints one
+ * "[frame]" line per frame instead, for before/after comparisons.
  */
 #ifndef NV2A_PERF_HUD_H
 #define NV2A_PERF_HUD_H
@@ -25,6 +26,7 @@ typedef struct {
     double wait_ms;      /* GL thread starved, waiting for the game thread */
     double swap_ms;      /* time blocked in present (SwapWindow / KMS wait) */
     unsigned draws;      /* GL draw calls this frame */
+    unsigned frag;       /* ... of them with fewer than 50 indices (the merge candidates) */
     unsigned gl_calls;   /* all GL calls this frame */
     unsigned merged;     /* sub-draws folded into batches (RECOMP_GL_MERGE) */
 } PerfFrame;

@@ -2337,6 +2337,7 @@ static void census_flush(void)
 static uint64_t s_swap_ns, s_cs_draws;
 static uint64_t s_gl_wait_total_ns;   /* GL thread starved; never reset (HUD) */
 static uint64_t s_draws_total;              /* every draw that reached GL, for [fps] */
+static uint64_t s_frag_total;               /* ... of them under 50 indices (docs/07, 09), for the perf HUD */
 static unsigned s_mg_merged_frame;          /* sub-draws folded into batches this frame */
 static void call_stats_frame(void)
 {
@@ -2478,6 +2479,8 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     s_hz_draws++;
     s_cs_draws++;
     s_draws_total++;
+    if (b->index_count < 50)
+        s_frag_total++;
     census_draw(&b->surface, pk.shader_program);
     /* Merge, fast path: a compatible sub-draw appends with no GL calls at
      * all (the batch's program, textures and state are already bound). */
@@ -3025,7 +3028,7 @@ static void gl_flip(void)
      * stats are the previous frame's -- this frame's swap time is not known
      * yet. */
     {
-        static uint64_t t_prev, calls_prev, draws_prev, swap_prev, idle_prev;
+        static uint64_t t_prev, calls_prev, draws_prev, frag_prev, swap_prev, idle_prev;
         uint64_t now = hz_now(), calls = 0;
         uint64_t idle = __atomic_load_n(&s_gl_wait_total_ns, __ATOMIC_RELAXED);
         unsigned k;
@@ -3039,11 +3042,12 @@ static void gl_flip(void)
             pf.gl_ms    = pf.frame_ms - pf.swap_ms - pf.wait_ms;
             if (pf.gl_ms < 0) pf.gl_ms = 0;
             pf.draws    = (unsigned)(s_draws_total - draws_prev);
+            pf.frag     = (unsigned)(s_frag_total - frag_prev);
             pf.gl_calls = (unsigned)(calls - calls_prev);
             pf.merged   = s_mg_merged_frame;
             perf_hud_update(&pf);
         }
-        t_prev = now; calls_prev = calls; draws_prev = s_draws_total; swap_prev = s_swap_ns;
+        t_prev = now; calls_prev = calls; draws_prev = s_draws_total; frag_prev = s_frag_total; swap_prev = s_swap_ns;
         idle_prev = idle;
         s_mg_merged_frame = 0;
         if (perf_hud_enabled() && s && s_drew_any) {
