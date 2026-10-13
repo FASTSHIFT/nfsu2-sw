@@ -15,6 +15,8 @@ Usage:
     r36s/autotest.py --skip-deploy        # binary already deployed
     r36s/autotest.py --deploy-only        # deploy only
     r36s/autotest.py --launch             # driver launch mode (open + exit)
+    r36s/autotest.py --sweep --set rd:EXP_RD=2 --set drop:EXP_DROPFRAG=1
+                                          # ONE launch: switch live knobs per setting
     r36s/autotest.py --baseline           # enter a race, log per-frame draw
                                           # stats, print the steady state, quit
     r36s/autotest.py --host 192.168.3.71
@@ -95,6 +97,7 @@ def deploy():
 
 
 def run_driver(mode, env=(), timeout=600):
+    env = list(env)
     """Upload the driver, launch it DETACHED (nohup, so an ssh drop doesn't kill
     it mid-race), poll the on-device report file until it appears, then pull
     the report + driver log + game log back here. Returns the parsed report."""
@@ -181,6 +184,67 @@ def pull_shot(report, outdir):
         print(f"[screen] ok -> {bmp} (no PIL here, left as BMP)")
 
 
+def pull_sweep_shots(rows, outdir):
+    """Copy the frame each window dumped (row["shot"]) back, and compare every
+    setting's frame with the baseline window before it: the share of pixels
+    that moved, in the road band and in the whole frame minus the HUD. Needs a
+    static scene (the car waits on the grid). Writes <name>.png per window and
+    sets r["d_road"] / r["d_all"]."""
+    try:
+        from PIL import Image
+        import numpy as np
+    except ImportError:
+        print("[shots] PIL / numpy missing, no comparison")
+        return
+    shots = os.path.join(outdir, "shots")
+    os.makedirs(shots, exist_ok=True)
+    base = None
+    for i, r in enumerate(rows):
+        if not r.get("shot"):
+            continue
+        bmp = os.path.join(shots, f"{i:02d}_{r['name']}.bmp")
+        rc = subprocess.run(["sshpass", "-p", PASS, "scp", "-o", "ConnectTimeout=10",
+                             f"ark@{HOST}:{PORT}/shots/{r['shot']}", bmp],
+                            capture_output=True, timeout=60).returncode
+        if rc != 0:
+            continue
+        im = Image.open(bmp).convert("RGB")
+        im.save(bmp[:-4] + ".png")
+        os.remove(bmp)
+        px = np.asarray(im).astype(int)
+        if not r["spec"]:
+            base = px
+            continue
+        if base is None or base.shape != px.shape:
+            continue
+        d = np.abs(px - base).sum(2) > 48
+        h, w = d.shape
+        d[: int(h * 0.30)] = False                  # sky / HUD timer area
+        d[int(h * 0.62):, : int(w * 0.30)] = False  # minimap
+        d[int(h * 0.62):, int(w * 0.70):] = False   # speedometer
+        road = d[int(h * 0.62):int(h * 0.92)]
+        r["d_road"] = 100.0 * road.mean()
+        r["d_all"] = 100.0 * d[int(h * 0.30):].mean()
+
+
+def print_sweep(rows):
+    """One row per window. A setting's d_ms / d_gl / d_wait are against the mean
+    of the two baselines next to it (drift cancels); `screen` is the mean
+    brightness of a frame dumped during it (0 = black)."""
+    print("\n[sweep] median per window; d_* = setting minus the mean of the baselines around it")
+    print("  %-12s %7s %7s %7s %6s %7s | %7s %7s %7s %7s %6s  %s" % (
+        "name", "ms", "gl", "wait", "dc", "calls", "d_ms", "d_gl", "d_wait", "d_calls", "screen", "C  cpu/gpu MHz  knobs"))
+    for r in rows:
+        sm = r["screen_mean"]
+        d = ("%7.1f %7.1f %7.1f %7.0f" % (r["d_ms"], r["d_gl"], r["d_wait"], r["d_calls"])
+             if "d_ms" in r else " " * 7 + " " * 8 + " " * 8 + " " * 8)
+        pic = ("  road %5.1f%% frame %5.1f%%" % (r["d_road"], r["d_all"])) if "d_road" in r else ""
+        print("  %-12s %7.1f %7.1f %7.1f %6.0f %7.0f | %s %6s  %.0f %s/%s  %s%s" % (
+            r["name"], r["ms"], r["gl"], r["wait"], r["dc"], r["calls"], d,
+            "-" if sm is None else f"{sm:.0f}", r.get("temp_c") or 0,
+            r.get("cpu_mhz"), r.get("gpu_mhz"), r["spec"], pic))
+
+
 def print_baseline(b):
     """The race steady state and the load -> race ramp, as a table."""
     st = b["steady"]
@@ -206,6 +270,10 @@ def main():
     ap.add_argument("--baseline", action="store_true",
                     help="per-frame draw/GL stats of the race (RECOMP_PERF_LOG=2), "
                          "summarised on the device")
+    ap.add_argument("--sweep", action="store_true",
+                    help="one launch, then each --set applied live and sampled in place")
+    ap.add_argument("--set", action="append", default=[], metavar="NAME:KNOB=V,KNOB=V",
+                    help="a --sweep setting (knobs.h names, e.g. rd:EXP_RD=2,EXP_RDSEL=1)")
     ap.add_argument("--env", action="append", default=[], metavar="KEY=VAL",
                     help="extra env.txt line for this run only (repeatable)")
     ap.add_argument("--host", default=HOST)
@@ -223,17 +291,25 @@ def main():
     else:
         print("[deploy] skipped (--skip-deploy)")
 
-    mode = "launch" if args.launch else "baseline" if args.baseline else "race"
+    mode = ("launch" if args.launch else "baseline" if args.baseline
+            else "sweep" if args.sweep else "race")
+    for sp in args.set:
+        if not re.fullmatch(r"[a-z0-9_]+:([A-Z0-9_]+=\d+(,[A-Z0-9_]+=\d+)*)?", sp):
+            sys.exit(f"error: bad --set {sp!r} (name:KNOB=V,KNOB=V)")
     for e in args.env:
         if not re.fullmatch(r"[A-Z0-9_]+=[\w.,:/+-]*", e):
             sys.exit(f"error: bad --env {e!r} (KEY=VAL, simple characters only)")
-    report = run_driver(mode, args.env)
+    report = run_driver(mode, list(args.env) + list(args.set), timeout=900 if mode == "sweep" else 600)
     if report is None:
         print(json.dumps({"verdict": "FAIL: no report"}))
         return
 
     print(json.dumps(report, indent=2))
     outdir = collect(report)
+    if mode == "sweep" and "sweep" in report:
+        pull_sweep_shots(report["sweep"], outdir)
+        print_sweep(report["sweep"])
+        pull_shot(report, outdir)
     if mode == "baseline" and "baseline" in report:
         print_baseline(report["baseline"])
         pull_shot(report, outdir)

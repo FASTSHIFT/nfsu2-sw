@@ -238,6 +238,54 @@ static void fatal(const char *msg)
 #endif
 }
 
+/* Quality defaults, as guest globals held by RECOMP_POKE (the runtime rewrites
+ * them every executor tick; nothing in the title writes them). Each one was
+ * checked on the R36S in a single launch with the live POKE knob (r36s/autotest.py
+ * --sweep, docs/10):
+ *   rain             0x3A3FA0 = 0   PrecipitationEnable: Rain::UpdateAndRender
+ *                                   (Xbox sub_0020A570, GC 0x802532B0) forces the
+ *                                   rain intensity to 0 and the rain drawing
+ *                                   (sub_00202B80) returns at once. Covers the
+ *                                   track-scripted rain. Measured: rain doubled
+ *                                   the race frame (188 vs 122 ms), this = 132 ms.
+ *   road reflection  0x3994A0 = 0   EnableRoadSpecular pass: -170 draws (-8%),
+ *                                   no visible change in the picture
+ *                    0x3CC5E8 = 0   DrawCarsReflections (cars mirrored on the road)
+ * What was tried and does NOT change the wet, shiny road: 0x3CD9F8 / 0x3CD9FC
+ * (BaseDampness / SetUberRoadDampness), 0x3CDA00, 0x3CDA08, 0x45B004 (IsRainingAt's
+ * "Chance100", only the timed rain). NFSU2_RAIN / NFSU2_ROAD_REFLECTION (CMake) set
+ * the default, RECOMP_RAIN=1|0 and RECOMP_ROAD_REFLECTION=1|0 override it per run.
+ * A RECOMP_POKE already in the environment is kept and comes after ours. */
+static int env_flag(const char *name, int def)
+{
+    const char *e = getenv(name);
+    return e && *e ? *e != '0' : def;
+}
+
+static void quality_defaults(void)
+{
+    char spec[192] = "";
+    const char *user = getenv("RECOMP_POKE");
+    if (!env_flag("RECOMP_RAIN", NFSU2_RAIN))
+        strcat(spec, "0x3A3FA0:0,");
+    if (!env_flag("RECOMP_ROAD_REFLECTION", NFSU2_ROAD_REFLECTION))
+        strcat(spec, "0x3994A0:0,0x3CC5E8:0,");
+    if (user && *user && strlen(spec) + strlen(user) < sizeof spec)
+        strcat(spec, user);
+    else if (*spec)
+        spec[strlen(spec) - 1] = 0;             /* drop the trailing comma */
+    if (*spec) {
+#ifdef _WIN32
+        char env[256];
+        snprintf(env, sizeof env, "RECOMP_POKE=%s", spec);
+        _putenv(env);
+#else
+        setenv("RECOMP_POKE", spec, 1);
+#endif
+        fprintf(stderr, "[quality] RECOMP_POKE=%s\n", spec);
+    }
+}
+
 static int game_main(void);
 void xbox_guest_pin(int interrupt);   /* win32_compat.c: the Xbox's one CPU */
 void xbox_gil_enter(void);             /* kernel_bridge.c: the guest lock */
@@ -380,6 +428,7 @@ static int game_main(void)
     setenv("RECOMP_QUIET", "1", 0);
 #endif
 
+    quality_defaults();
     game_dir = getenv("NFSU2_GAME_DIR");
     if (!game_dir || !game_dir[0])
         game_dir = NFSU2_DEFAULT_GAME_DIR;

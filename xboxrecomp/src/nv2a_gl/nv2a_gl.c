@@ -1958,29 +1958,80 @@ static void pass_skip_frame(void)
     }
 }
 
-/* Draw-cost experiments (docs/10 §3): is the GL thread's frame time per-draw
- * submission cost or GPU load? Off unless the variables are set; they change
- * the picture and exist only to be measured with the perf HUD / [frame] log.
+/* Draw-cost experiments (docs/10 §3). Live knobs (knobs.h: write KEY=VALUE
+ * lines to /tmp/nfsu2.knobs, re-read every second; RECOMP_KNOB_<NAME>=v sets
+ * the start value). They change the picture and exist only to be measured
+ * with the perf HUD / [frame] log.
  *
- *   RECOMP_GL_EXP_DROPFRAG=1   skip draws with fewer than 50 indices (the merge
- *                              candidates); 2 = skip every draw. Cost that
- *                              follows the draw count shows up here.
- *   RECOMP_GL_EXP_RD=2         GL_RASTERIZER_DISCARD around each draw: vertex
- *                              work and submission stay, all fragment work
- *                              goes. Cost that follows pixels shows up here.
- *   RECOMP_GL_EXP_RD=1         control: the same two calls, but discard is off
- *                              again before the draw (the call overhead only).
+ *   EXP_DROPFRAG=1   skip draws with fewer than 50 indices (the merge
+ *                    candidates); 2 = skip every draw. Cost that follows the
+ *                    draw count shows up here.
+ *   EXP_RD=2         GL_RASTERIZER_DISCARD around each draw: vertex work and
+ *                    submission stay, all fragment work goes. Cost that
+ *                    follows pixels shows up here.
+ *   EXP_RD=1         control: the same two calls, but discard is off again
+ *                    before the draw (the call overhead only).
+ *   EXP_RDSEL=n      limit EXP_RD to: 1 alpha-blended, 2 opaque, 3 under 50
+ *                    indices, 4 50 or more. 0 = every draw.
  */
-static int s_exp_dropfrag = -1, s_exp_rd;
+/* EXP_QUERY=1: for one frame, every draw is first issued a second time with
+ * face culling, depth/stencil test and colour writes off inside an
+ * ANY_SAMPLES_PASSED query. No sample then means nothing of it is on screen:
+ * outside the view volume (x/y/behind the camera -- near/far are clamped, not
+ * clipped) or degenerate. That is what the game's own frustum culling should
+ * already have removed. The frame's totals are printed at the flip. */
+#define EXPQ_MAX 4096
+static GLuint s_expq_id[EXPQ_MAX];
+static struct { uint32_t indices; uint8_t blend; } s_expq_draw[EXPQ_MAX];
+static unsigned s_expq_n;
+static int s_expq_on;           /* armed at a flip, so the frame it covers is whole */
 
-static void exp_init(void)
+static void exp_query_report(void)
 {
-    const char *e = getenv("RECOMP_GL_EXP_DROPFRAG"), *r = getenv("RECOMP_GL_EXP_RD");
-    s_exp_dropfrag = e ? atoi(e) : 0;
-    s_exp_rd = r ? atoi(r) : 0;
-    if (s_exp_dropfrag || s_exp_rd)
-        fprintf(stderr, "  [GL] EXPERIMENT: dropfrag=%d rasterizer-discard=%d\n",
-                s_exp_dropfrag, s_exp_rd);
+    unsigned i, inv = 0, cls[4][2] = { { 0 } };
+    unsigned long long inv_idx = 0, all_idx = 0;
+    if (!s_expq_on) {
+        if (knob(KN_EXP_QUERY))
+            s_expq_on = 1;              /* the next frame is counted from its first draw */
+        return;
+    }
+    s_expq_on = 0;
+    knob_set(KN_EXP_QUERY, 0);
+    if (!s_expq_n)
+        return;
+    for (i = 0; i < s_expq_n; i++) {
+        GLuint any = 1;
+        int c = s_expq_draw[i].indices < 50 ? 0 : s_expq_draw[i].indices < 300 ? 1 : 2;
+        glGetQueryObjectuiv(s_expq_id[i], GL_QUERY_RESULT, &any);
+        all_idx += s_expq_draw[i].indices;
+        cls[c][1]++;
+        if (s_expq_draw[i].blend)
+            cls[3][1]++;
+        if (!any) {
+            inv++;
+            inv_idx += s_expq_draw[i].indices;
+            cls[c][0]++;
+            if (s_expq_draw[i].blend)
+                cls[3][0]++;
+        }
+    }
+    fprintf(stderr, "  [cull] %u draws, %u put no pixel on screen (%.0f%%); indices %llu of %llu (%.0f%%) | "
+            "under 50 idx %u/%u, 50-299 %u/%u, 300+ %u/%u, blended %u/%u\n",
+            s_expq_n, inv, 100.0 * inv / s_expq_n, inv_idx, all_idx,
+            all_idx ? 100.0 * (double)inv_idx / (double)all_idx : 0.0,
+            cls[0][0], cls[0][1], cls[1][0], cls[1][1], cls[2][0], cls[2][1], cls[3][0], cls[3][1]);
+    s_expq_n = 0;
+}
+
+static int exp_rd_applies(const Nv2aRawBatch *b)
+{
+    switch (knob(KN_EXP_RDSEL)) {
+    case 1: return b->regs[0x304 / 4] != 0;
+    case 2: return b->regs[0x304 / 4] == 0;
+    case 3: return b->index_count < 50;
+    case 4: return b->index_count >= 50;
+    default: return 1;
+    }
 }
 
 static void surf_stats_draw(const Nv2aSurface *sf)
@@ -2143,10 +2194,11 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
 
     if (!ready())
         return;
-    if (s_exp_dropfrag < 0)
-        exp_init();
-    if (s_exp_dropfrag == 2 || (s_exp_dropfrag == 1 && b->index_count < 50))
-        return;
+    {
+        int drop = knob(KN_EXP_DROPFRAG);
+        if (drop == 2 || (drop == 1 && b->index_count < 50))
+            return;
+    }
     if (!s_q_on) {                  /* queued draws were counted in q_draw */
         surf_stats_draw(&b->surface);
         if (pass_skipped(&b->surface))
@@ -2466,17 +2518,44 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
          * whole index list from the (write-combined, persistent) ring to find
          * it, ~0.16 us an index, which was most of a draw's driver time
          * (r36s-tools/gpubench drawbench idx: 1536 indices 266 -> 16 us). */
-        if (s_exp_rd) {
+        int rd = knob(KN_EXP_RD);
+        if (rd && !exp_rd_applies(b))
+            rd = 0;
+        if (rd) {
             glEnable(GL_RASTERIZER_DISCARD);
-            if (s_exp_rd == 1)
+            if (rd == 1)
                 glDisable(GL_RASTERIZER_DISCARD);   /* control: calls only */
+        }
+        if (s_expq_on && s_expq_n < EXPQ_MAX) {
+            static int made;
+            if (!made) {
+                glGenQueries(EXPQ_MAX, s_expq_id);
+                made = 1;
+            }
+            glDisable(GL_CULL_FACE);
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_STENCIL_TEST);
+            glDepthMask(0);
+            glColorMask(0, 0, 0, 0);
+            glBeginQuery(GL_ANY_SAMPLES_PASSED, s_expq_id[s_expq_n]);
+            if (b->vertex_count)
+                glDrawRangeElements(mode, 0, b->vertex_count - 1, (GLsizei)n, idx_type,
+                                    (const void *)(uintptr_t)idx_at);
+            else
+                glDrawElements(mode, (GLsizei)n, idx_type, (const void *)(uintptr_t)idx_at);
+            glEndQuery(GL_ANY_SAMPLES_PASSED);
+            s_expq_draw[s_expq_n].indices = b->index_count;
+            s_expq_draw[s_expq_n].blend = r[0x304 / 4] != 0;
+            s_expq_n++;
+            s_st_valid = 0;                     /* put every piece of state back */
+            apply_state(r, b->zeta_va != 0);
         }
         if (b->vertex_count)
             glDrawRangeElements(mode, 0, b->vertex_count - 1, (GLsizei)n, idx_type,
                                 (const void *)(uintptr_t)idx_at);
         else
             glDrawElements(mode, (GLsizei)n, idx_type, (const void *)(uintptr_t)idx_at);
-        if (s_exp_rd == 2)
+        if (rd == 2)
             glDisable(GL_RASTERIZER_DISCARD);
         XTRACE_DRAW_MARK("d:glDrawElements");      /* or glDrawRangeElements */
         XTRACE_DRAW_COUNTER("draw verts", b->vertex_count);
@@ -2610,6 +2689,7 @@ static void gl_flip(void)
     /* knobs DUMP_DRAWS=1: print this frame's draw census (per surface and
      * per program) and clear the request. */
     census_flush();
+    exp_query_report();
     surf_stats_frame();
     if (!s_q_on)
         pass_skip_frame();

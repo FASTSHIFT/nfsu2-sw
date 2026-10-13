@@ -18,7 +18,8 @@ fi
 # MC screens -> UI_Main. A skips the movies; Start confirms the menu.
 # RECOMP_PAD_MASH: "period_ms,hold_ms[,start_every]" -- press A (every Nth press
 # Start) until src/autotest.c logs "[AUTOTEST] HUD live" (the in-race HUD's first
-# update), then stop. Adds to MENU_PAD. MASH=0 turns it off.
+# update), then stop. Replaces MENU_PAD (whose Start at 65 s pauses the race).
+# MASH=0 turns it off and uses MENU_PAD.
 MASH="${MASH:-200,100,7}"   # = PAD_MASH in r36s/driver/autotest_driver.py
 MENU_PAD="3000:a:200,5000:a:200,7000:a:200,9000:a:200,11000:a:200,13000:a:200,15000:start:300,25000:start:300,35000:start:300,45000:a:200,55000:a:200,65000:start:300,75000:a:200,85000:a:200,95000:a:200"
 game_pid() { pgrep -f "${BIN##*/build/}\$" | head -1; }

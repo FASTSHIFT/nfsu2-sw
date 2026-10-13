@@ -10,8 +10,12 @@ set -u
 . "$(dirname "$0")/env.sh"
 DIR="$BUILD/$1"; SECS="$2"; shift 2
 rm -rf "$DIR"; mkdir -p "$DIR"; cd "$DIR"
-MASH_ENV=(); [ "$MASH" != 0 ] && MASH_ENV=(RECOMP_PAD_MASH="$MASH")
-env "${GAME_ENV[@]}" RECOMP_GL_DUMP="$DIR/f,300" RECOMP_PAD_SCRIPT="$MENU_PAD" \
+# With the mash the timed MENU_PAD script is off: it has Start presses at
+# 15/25/35/65 s, and a Start in the race is the pause menu (a PC run found
+# every frame after 65 s paused). MASH=0 brings the script back.
+MASH_ENV=(); PAD="$MENU_PAD"
+[ "$MASH" != 0 ] && { MASH_ENV=(RECOMP_PAD_MASH="$MASH"); PAD=""; }
+env "${GAME_ENV[@]}" RECOMP_GL_DUMP="$DIR/f,300" RECOMP_PAD_SCRIPT="$PAD" \
     "${MASH_ENV[@]}" "${PC_ENV[@]}" "$@" "$BIN" > run.log 2>&1 &
 PID=$!
 T0=$SECONDS; SEEN=

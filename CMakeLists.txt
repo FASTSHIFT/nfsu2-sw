@@ -33,6 +33,15 @@ endif()
 # The Vulkan renderer (xboxrecomp nv2a_vk) instead of OpenGL. On the Switch it
 # links mesa-switch's static NVK (NVK_SDK) and builds nfsu2x-vulkan.nro.
 option(NFSU2_VULKAN "Render with Vulkan instead of OpenGL" OFF)
+
+# Quality defaults baked into the binary (src/main.c holds the matching guest
+# globals with RECOMP_POKE). Both are OFF: rain changes the frame time in the
+# middle of a measurement and costs a lot on the R36S, and the road reflection
+# pass is an extra scene cull + ~300 draws that is hard to see (docs/08 3.1).
+# RECOMP_RAIN=1 / RECOMP_ROAD_REFLECTION=1 in the environment bring them back
+# without a rebuild; these options only change what an unset variable means.
+option(NFSU2_RAIN "Rain on by default" OFF)
+option(NFSU2_ROAD_REFLECTION "Road (and car-on-road) reflection pass on by default" OFF)
 set(XBOXRECOMP_VULKAN ${NFSU2_VULKAN} CACHE BOOL "" FORCE)
 
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
@@ -72,6 +81,13 @@ if(NFSU2_WRAP_FENGHUD STREQUAL "AUTO")
 else()
     set(_wrap_fenghud ${NFSU2_WRAP_FENGHUD})
 endif()
+foreach(_q NFSU2_RAIN NFSU2_ROAD_REFLECTION)
+    if(${_q})
+        target_compile_definitions(${PROJECT_NAME} PRIVATE ${_q}=1)
+    else()
+        target_compile_definitions(${PROJECT_NAME} PRIVATE ${_q}=0)
+    endif()
+endforeach()
 if(_wrap_fenghud)
     target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_WRAP_FENGHUD=1)
 else()

@@ -63,6 +63,8 @@ typedef struct __GLsync *GLsync;
 #define GL_BLEND                          0x0BE2
 #define GL_SCISSOR_TEST                   0x0C11
 #define GL_RASTERIZER_DISCARD             0x8C89
+#define GL_ANY_SAMPLES_PASSED             0x8C2F
+#define GL_QUERY_RESULT                   0x8866
 #define GL_VIEWPORT                       0x0BA2
 #define GL_UNPACK_ALIGNMENT               0x0CF5
 #define GL_UNPACK_ROW_LENGTH              0x0CF2
@@ -201,7 +203,11 @@ X(GLboolean, glUnmapBuffer, (GLenum)) \
     X(void, glVertexAttrib4f, (GLuint, GLfloat, GLfloat, GLfloat, GLfloat)) \
     X(void, glDrawElements, (GLenum, GLsizei, GLenum, const void *)) \
     X(void, glDrawRangeElements, (GLenum, GLuint, GLuint, GLsizei, GLenum, const void *)) \
-    X(void, glDrawArrays, (GLenum, GLint, GLsizei))
+    X(void, glDrawArrays, (GLenum, GLint, GLsizei)) \
+    X(void, glGenQueries, (GLsizei, GLuint *)) \
+    X(void, glBeginQuery, (GLenum, GLuint)) \
+    X(void, glEndQuery, (GLenum)) \
+    X(void, glGetQueryObjectuiv, (GLuint, GLenum, GLuint *))
 
 #define NV2A_GL_DECLARE(ret, name, args) \
     typedef ret (GLAPIENTRY *PFN_##name) args; extern PFN_##name p_##name;
@@ -336,5 +342,9 @@ static inline void nv2a_glClearDepth(double d)
 #define glDrawElements           NV2A_GLCALL(glDrawElements)
 #define glDrawRangeElements      NV2A_GLCALL(glDrawRangeElements)
 #define glDrawArrays             NV2A_GLCALL(glDrawArrays)
+#define glGenQueries             NV2A_GLCALL(glGenQueries)
+#define glBeginQuery             NV2A_GLCALL(glBeginQuery)
+#define glEndQuery               NV2A_GLCALL(glEndQuery)
+#define glGetQueryObjectuiv      NV2A_GLCALL(glGetQueryObjectuiv)
 
 #endif /* NV2A_GL_API_H */

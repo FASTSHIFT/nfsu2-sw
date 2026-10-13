@@ -8,6 +8,9 @@ exactly as typed. The host only uploads this file and runs it:
     python3 autotest_driver.py            # full run (deploy handled by host)
     python3 autotest_driver.py launch     # only: open the game, confirm, exit
     python3 autotest_driver.py race       # open + drive into a race + sample
+    python3 autotest_driver.py sweep NAME:KNOB=V,KNOB=V ...   # ONE launch, then
+                                          # switch the live knobs (/tmp/nfsu2.knobs)
+                                          # per setting and sample each in place
     python3 autotest_driver.py baseline [KEY=VAL ...]   # same entry, then log per-frame draw
                                           # stats (RECOMP_PERF_LOG=2), summarise
                                           # the race frames and quit by hotkey
@@ -60,6 +63,12 @@ HUD_POLL_S = 1.0
 # Frame dumps (RECOMP_GL_DUMP, BMP) so a black or broken picture is noticed: the
 # driver judges "black" on the device, the host only pulls a picture back when
 # it is not.
+# Rain and the road reflection pass are off in the binary itself (src/main.c
+# quality_defaults, CMake NFSU2_RAIN / NFSU2_ROAD_REFLECTION): rain used to start
+# in the middle of a sweep and move every number (125 -> 185 ms between two
+# windows). The game logs what it holds; the driver only checks the line.
+QUALITY_LOG = "[quality] RECOMP_POKE="
+
 SHOTS_DIR = PORT + "/shots"
 SHOT_EVERY = 100        # frames
 BLACK_MEAN = 4.0        # mean channel value (0-255) below this is black
@@ -227,6 +236,11 @@ def read_temp():
     return None
 
 
+def read_gpu_mhz():
+    rc, out = sh("cat /sys/class/devfreq/ff400000.gpu/cur_freq 2>/dev/null")
+    return int(out) // 1000000 if rc == 0 and out.isdigit() else None
+
+
 def read_freq():
     rc, out = sh("cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null")
     return int(out) // 1000 if rc == 0 and out.isdigit() else None
@@ -252,7 +266,10 @@ def do_launch():
     press(BTN_A, 200)
     pid = wait_game(60)
     if not pid:
-        die("game did not appear after A press")
+        # No game: either A did not launch anything (ES's cursor is not on
+        # NFSU2 -- after a reboot it starts at the top) or the game died at once.
+        launched = tail_file(ES_LOG, 6).replace("\n", " | ")
+        die("game did not appear after A press; ES log: " + launched)
     log(f"game running (pid {pid})")
     if not es_launched_nfs2():
         log("WARN: ES log does not confirm NFS2 launch (cursor misplaced?)")
@@ -274,6 +291,8 @@ def do_race(pid, timeout=240, hold_rt=True):
         log("timeout waiting for first frame")
         return False
 
+    if not log_has(QUALITY_LOG):
+        log("WARN: no '[quality] RECOMP_POKE=' line -- rain / road reflection are NOT off in this binary")
     if log_has(HUD_HOOK_OFF):
         die("this build cannot see the race HUD (gen lifted without the "
             "sub_00100360 wrap) -- regen and rebuild")
@@ -397,6 +416,103 @@ def do_baseline(timeout=BASE_TIMEOUT):
     }
 
 
+KNOBS_FILE = "/tmp/nfsu2.knobs"   # the game re-reads it every second (knobs.h)
+SPEC_RE = re.compile(r"[a-z0-9_]+:([A-Z0-9_]+=\d+(,[A-Z0-9_]+=\d+)*)?")  # ints; RESTORE= too
+SW_SETTLE = 40         # frames to wait after a switch (knob reload <= 1 s + effect)
+SW_FRAMES = 80         # frames sampled per setting
+
+
+def split_spec(spec):
+    """"name:KNOB=V,KNOB=V,RESTORE=v" -> (name, knob pairs, restore pairs).
+    A POKE leaves the guest global changed (nothing in the title writes these
+    back), so a spec that pokes names the original value in RESTORE=v and the
+    next baseline window holds it there."""
+    name, _, rest = spec.partition(":")
+    pairs = [p for p in rest.split(",") if p]
+    restore = [p.partition("=")[2] for p in pairs if p.startswith("RESTORE=")]
+    pairs = [p for p in pairs if not p.startswith("RESTORE=")]
+    undo = []
+    if restore:
+        va = next((p for p in pairs if p.startswith("POKE_VA=")), None)
+        if va:
+            undo = [va, "POKE_VAL=" + restore[0]]
+    return name, pairs, undo
+
+
+def set_knobs(pairs):
+    """Replace the knobs file with these KEY=VALUE pairs ([] = defaults)."""
+    with open(KNOBS_FILE, "w") as f:
+        f.write("\n".join(pairs) + "\n")
+
+
+def newest_shot(since):
+    """(file name, mean brightness) of the newest frame dump written after
+    `since`, or (None, None)."""
+    try:
+        files = [os.path.join(SHOTS_DIR, n) for n in os.listdir(SHOTS_DIR)
+                 if n.endswith(".bmp")]
+        files = [f for f in files if os.stat(f).st_mtime >= since]
+        if not files:
+            return None, None
+        f = max(files, key=os.stat)
+        return os.path.basename(f), shot_mean(f)
+    except OSError:
+        return None, None
+
+
+def do_sweep(specs, timeout=900):
+    """After the race scene has settled, apply each spec's knobs in turn and
+    sample SW_FRAMES frames of the same scene. Every setting is flanked by plain
+    baselines (B S1 B S2 B ...) and judged against the mean of the two next to
+    it (d_ms / d_gl): neighbouring windows drift by 5-10 ms on their own
+    (scene, thermals), which a single baseline at the start would mistake for
+    an effect."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if not game_pid():
+            die("game process gone before the sweep")
+        fr = frames_after_hud()
+        if sum(1 for f in fr if f["dc"] - f["frag"] >= RACE_BIG_DRAWS) >= BASE_SETTLE:
+            break
+        time.sleep(2)
+    else:
+        return None
+    out = []
+    order = ["base:"]
+    for sp in specs:
+        order += [sp, "base:"]
+    hold = []                       # restores the previous setting's poke
+    for spec in order:
+        name, pairs, undo = split_spec(spec)
+        set_knobs(pairs or hold)
+        hold = undo if pairs else hold
+        if not pairs:
+            hold = []
+        t_switch = time.time()
+        n0 = len(frames_after_hud())
+        while len(frames_after_hud()) < n0 + SW_SETTLE + SW_FRAMES:
+            if time.time() > end or not game_pid():
+                die(f"game process gone / timeout during '{name}'")
+            time.sleep(1)
+        fr = frames_after_hud()[n0 + SW_SETTLE:n0 + SW_SETTLE + SW_FRAMES]
+        shot, shot_mean_ = newest_shot(t_switch + 6)
+        row = {"name": name, "spec": ",".join(pairs),
+               "screen_mean": shot_mean_, "shot": shot,
+               # a window that ran throttled is not comparable with its neighbours
+               "temp_c": read_temp(), "cpu_mhz": read_freq(), "gpu_mhz": read_gpu_mhz()}
+        row.update({k: quantile([f[k] for f in fr], 0.5) for k in BASE_FIELDS})
+        out.append(row)
+        log("%-12s ms %6.1f gl %6.1f wait %5.1f dc %5.0f calls %6.0f  %s C %s/%s MHz" % (
+            name, row["ms"], row["gl"], row["wait"], row["dc"], row["calls"],
+            row["temp_c"], row["cpu_mhz"], row["gpu_mhz"]))
+    set_knobs(hold)
+    for i, r in enumerate(out):
+        if r["spec"] and 0 < i < len(out) - 1:
+            for k in ("ms", "gl", "wait", "calls"):
+                r["d_" + k] = r[k] - (out[i - 1][k] + out[i + 1][k]) / 2
+    return out
+
+
 def sample(seconds=10):
     fps, temps, freqs = [], [], []
     end = time.time() + seconds
@@ -446,14 +562,13 @@ def main():
     # KEY=VALUE arguments after the mode go into env.txt for this run too
     # (A/B experiments: RECOMP_GL_EXP_RD=2 ...).
     extra = [a for a in sys.argv[2:] if re.fullmatch(r"[A-Z0-9_]+=[\w.,:/+-]*", a)]
-    if mode != "launch":
-        extra.append(f"RECOMP_PAD_MASH={PAD_MASH}")
-    if mode == "baseline":
-        # One [frame] line per presented frame: draws, fragment draws, GL
-        # calls, GL / wait / swap ms. The game's own switches stay as in env.txt.
-        extra.append("RECOMP_PERF_LOG=2")
+    if mode in ("baseline", "sweep"):
+        # frame dumps: the device judges black / not black (screen_report())
         sh(f"rm -rf '{SHOTS_DIR}' && mkdir -p '{SHOTS_DIR}'")
         extra.append(f"RECOMP_GL_DUMP={SHOTS_DIR}/f,{SHOT_EVERY}")
+        extra.append("RECOMP_PERF_LOG=2")
+    if mode != "launch":
+        extra.append(f"RECOMP_PAD_MASH={PAD_MASH}")
     if extra:
         env_apply(extra)
     else:
@@ -465,6 +580,7 @@ def main():
 
 
 def run(mode, timing, t0, mark):
+    sh(f"rm -f '{KNOBS_FILE}'")          # no stale live knobs from an earlier run
     pid = do_launch()
     mark("launch")
 
@@ -480,6 +596,23 @@ def run(mode, timing, t0, mark):
             rc, out = sh(f"grep -c '\\[fps\\]' '{GAME_LOG}'")
             report["verdict"] = "LAUNCHED"
             report["fps_lines"] = out
+            exit_game_sure()
+            mark("exit")
+        elif mode == "sweep":
+            specs = [a for a in sys.argv[2:] if SPEC_RE.fullmatch(a)]
+            if not do_race(pid, hold_rt=False):
+                report["verdict"] = "FAIL: did not reach race"
+            else:
+                mark("reach_race")
+                rows = do_sweep(specs)
+                mark("sweep")
+                if rows is None:
+                    report["verdict"] = "FAIL: the race scene never settled"
+                else:
+                    report["sweep"] = rows
+                    report["screen"] = screen_report()
+                    report["temp_c"] = read_temp()
+                    report["verdict"] = "PASS"
             exit_game_sure()
             mark("exit")
         elif mode == "baseline":

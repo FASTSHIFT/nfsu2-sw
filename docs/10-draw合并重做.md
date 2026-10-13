@@ -107,3 +107,46 @@ R36S_HOST=192.168.10.241 r36s/exp.sh base dropfrag:RECOMP_GL_EXP_DROPFRAG=1 \
 | 4 | 减冗余 GL 调用 | 小 | 比赛里 15k 调用 / 2.2k draw ≈ 7 次/draw，提交 20 us/draw，值得统计但上限有限 |
 
 下一步先做 1（实验成本最低，收益最大），并同时看上游为何是 105 ms。
+
+## 5. 一次启动里切换 knob：sweep（2026-10-13）
+
+反复重启游戏既慢又引入漂移，所以实验都改成运行时切换：
+
+```bash
+R36S_HOST=192.168.10.241 python3 r36s/autotest.py --sweep \
+    --set rd:EXP_RD=2 --set drop:EXP_DROPFRAG=1 \
+    --set spec:POKE_VA=3773600,POKE_VAL=0,RESTORE=1      # POKE 的原值写在 RESTORE
+```
+
+- 只启动一次；进比赛场景并稳定后，按 `B S1 B S2 B ...` 的顺序切换 `/tmp/nfsu2.knobs`，每个窗口 40 帧稳定 + 80 帧取样。每个设置和它前后两个基线的均值比（`d_ms` 等），窗口之间的漂移被抵消。
+- 每个窗口同时记温度、CPU/GPU 频率和一张截图（设备上算亮度判黑屏，非黑才拉回；有 PIL 时还会算与基线截图的像素差，路面带 `d_road`、全画面 `d_all`）。
+- knob（`knobs.h`）：`EXP_DROPFRAG`、`EXP_RD`、`EXP_RDSEL`、`EXP_QUERY`、`POKE_VA/POKE_VAL`、`DUMP_DRAWS`。
+
+## 6. 默认关闭下雨和道路反射
+
+`src/main.c quality_defaults()` 在启动时给 `RECOMP_POKE` 加默认项，CMake 选项 `NFSU2_RAIN` / `NFSU2_ROAD_REFLECTION` 默认 OFF，运行时 `RECOMP_RAIN=1`、`RECOMP_ROAD_REFLECTION=1` 可恢复。日志有一行 `[quality] RECOMP_POKE=...`。
+
+| 地址 | 值 | 含义 | 效果（真机，一次启动内切换） |
+|---|---|---|---|
+| `0x3A3FA0` | 0 | `PrecipitationEnable`（`Rain::UpdateAndRender` = Xbox `sub_0020A570` = GC `0x802532B0`）：雨强度强制 0，雨的绘制直接返回 | 下雨时帧 188 ms -> 132 ms，draw -1100 左右 |
+| `0x3994A0` | 0 | `EnableRoadSpecular`：道路反射 pass | draw 2131 -> 1962 (-8%)，画面无可见变化 |
+| `0x3CC5E8` | 0 | `DrawCarsReflections` | 画面无可见变化 |
+
+走过的弯路：先戳的 `0x45B004`（`IsRainingAt` 的 `Chance100`，GC 里从不被写）只管"按世界时间自动下雨"，赛道设定的雨它管不到；`BaseDampness`/`SetUberRoadDampness`（`0x3CD9F8/0x3CD9FC`）、`0x3CDA00`、`0x3CDA08` 清零后路面像素变化 < 1.5%。**下雨会让一局里的基线从 122 ms 跳到 188 ms，是之前 sweep 数据漂移的原因**，所以这两项必须默认关。
+
+## 7. 视锥剔除生效吗
+
+`EXP_QUERY=1`：下一整帧每个 draw 先在"关背面剔除/深度/模板/颜色写入"下发一次 `ANY_SAMPLES_PASSED` 查询，数没有任何像素的 draw（PC，起跑线，约 2500 draw）：
+
+| 渲染分辨率 | 零像素 draw | 占索引 |
+|---|---|---|
+| 1x | 约 13%（330 个） | 11% |
+| 3x（像素 9 倍） | 5%（120 个） | 7% |
+
+差值约 8%（210 个 draw）是小到不覆盖像素中心的亚像素物体，剩下 5% 才是视野外或退化的 draw。结论：**视锥剔除生效**，剔除这条路上最多再拿 5-13% 的 draw。`culldiv` 只用在车身部件剔除平面里，不是场景的按尺寸剔除。
+
+## 8. 下一步
+
+- 亚像素物体剔除（约 -200 draw，估 -4 ms）；遮挡剔除比例还没量（要"开深度"的查询变体）。
+- 静态批处理合并场景碎片（上限约 -20 ms，改动大）。
+- 上游（游戏线程 + 执行器）约 105-110 ms 是 GL 线程降到 100 以下之后的下限。
