@@ -51,6 +51,7 @@
 
 #include <SDL.h>
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -2023,6 +2024,141 @@ static void exp_query_report(void)
     s_expq_n = 0;
 }
 
+/* EXP_STATIC=1: is a draw the same instance as one in the previous frame?
+ * "Same" = same program, texture, index and vertex count and the same rows
+ * 96-109 of the vertex constants (the rows that differ between repeats of one
+ * mesh, docs/10 9.4). If those rows are a per-object world matrix, a scenery
+ * piece keeps them while the camera moves; if they carry the view too, they
+ * change every frame. Frames are compared as multisets, so a draw that moved
+ * in the frame's order still matches. The log line is printed every 30 frames:
+ *   [static] draws N | same as last frame: all M (x%) <50 idx a/b, 50+ idx c/d
+ *            | rows 96-99 alone: K (y%) */
+#define EXPS_MAX 4096
+typedef struct { uint64_t full, mat, geo; uint8_t frag; } ExpsDraw;
+static ExpsDraw s_exps_cur[EXPS_MAX], s_exps_prev[EXPS_MAX];
+static unsigned s_exps_n, s_exps_pn, s_exps_frames;
+
+static uint64_t exps_mix(uint64_t h, uint64_t v)
+{
+    h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    return h * 0xFF51AFD7ED558CCDull;
+}
+
+static void exp_static_draw(const Nv2aRawBatch *b, uint32_t prog)
+{
+    ExpsDraw *d;
+    uint64_t geo, mat = 1469598103934665603ull, full;
+    int r, k;
+    if (s_exps_n >= EXPS_MAX || !b->vp_consts)
+        return;
+    d = &s_exps_cur[s_exps_n++];
+    if (knob(KN_EXP_STATIC) == 2 && b->index_count >= 50) {
+        /* EXP_STATIC=2: print rows 96-99 of the 1st and the 40th big draw, every frame */
+        static unsigned big, last_frame;
+        if (last_frame != s_exps_frames) { big = 0; last_frame = s_exps_frames; }
+        if (big == 0 || big == 40) {
+            const float (*c)[4] = b->vp_consts;
+            fprintf(stderr, "  [static2] f%u big#%u idx %u | r96 %.4f %.4f %.4f %.4f | r97 %.4f %.4f %.4f %.4f | "
+                    "r98 %.4f %.4f %.4f %.4f | r99 %.4f %.4f %.4f %.4f | r104 %.3f %.3f %.3f\n",
+                    s_exps_frames, big, b->index_count,
+                    c[96][0], c[96][1], c[96][2], c[96][3], c[97][0], c[97][1], c[97][2], c[97][3],
+                    c[98][0], c[98][1], c[98][2], c[98][3], c[99][0], c[99][1], c[99][2], c[99][3],
+                    c[104][0], c[104][1], c[104][2]);
+        }
+        big++;
+    }
+    geo = exps_mix(exps_mix(exps_mix(prog, b->index_count), b->vertex_count), b->regs[0x1B00 / 4]);
+    /* Quantised: the same piece of scenery keeps its rows to 4-5 decimals while
+     * the camera sways (a parked car's frames differ in the 4th decimal), so the
+     * bit patterns never match. Step 1/32 of a unit (EXP_STATIC_STEP overrides
+     * it as a power of two). */
+    for (r = 96; r < 100; r++)
+        for (k = 0; k < 4; k++)
+            mat = exps_mix(mat, (uint64_t)(int64_t)lrintf(((const float (*)[4])b->vp_consts)[r][k] * 32.0f));
+    full = mat;
+    for (r = 100; r < 110; r++)
+        for (k = 0; k < 4; k++)
+            full = exps_mix(full, (uint64_t)(int64_t)lrintf(((const float (*)[4])b->vp_consts)[r][k] * 32.0f));
+    d->geo = geo;
+    d->mat = exps_mix(geo, mat);
+    d->full = exps_mix(geo, full);
+    d->frag = b->index_count < 50;
+}
+
+static int exps_cmp(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* One class of draws of the current and the previous frame: how many of the
+ * current frame's values are also in the previous frame's (as a multiset). */
+static unsigned exps_common(const uint64_t *cur, unsigned n, const uint64_t *prev, unsigned pn)
+{
+    static uint64_t a[EXPS_MAX], p[EXPS_MAX];
+    unsigned i, j = 0, m = 0;
+    memcpy(a, cur, sizeof *a * n);
+    memcpy(p, prev, sizeof *p * pn);
+    qsort(a, n, sizeof *a, exps_cmp);
+    qsort(p, pn, sizeof *p, exps_cmp);
+    for (i = 0; i < n; i++) {
+        while (j < pn && p[j] < a[i])
+            j++;
+        if (j < pn && p[j] == a[i]) {
+            m++;
+            j++;
+        }
+    }
+    return m;
+}
+
+/* Select one value per draw from a frame's list. which: 0 full, 1 matrix only,
+ * 2 full for < 50 indices, 3 full for 50 or more. Returns the count. */
+static unsigned exps_pick(const ExpsDraw *d, unsigned n, int which, uint64_t *out)
+{
+    unsigned i, k = 0;
+    for (i = 0; i < n; i++) {
+        if (which == 2 && !d[i].frag) continue;
+        if (which == 3 && d[i].frag) continue;
+        out[k++] = which == 1 ? d[i].mat : d[i].full;
+    }
+    return k;
+}
+
+static void exp_static_flip(void)
+{
+    static uint64_t cur[EXPS_MAX], prev[EXPS_MAX];
+    unsigned n, pn, all, mat, frag, nfrag, big, nbig;
+    if (!knob(KN_EXP_STATIC)) {
+        s_exps_n = s_exps_pn = 0;
+        return;
+    }
+    if (knob(KN_EXP_STATIC) == 2)
+        s_exps_frames++;
+    if (knob(KN_EXP_STATIC) == 1 && s_exps_pn && s_exps_n && (s_exps_frames++ % 30) == 0) {
+        n = exps_pick(s_exps_cur, s_exps_n, 0, cur);
+        pn = exps_pick(s_exps_prev, s_exps_pn, 0, prev);
+        all = exps_common(cur, n, prev, pn);
+        n = exps_pick(s_exps_cur, s_exps_n, 1, cur);
+        pn = exps_pick(s_exps_prev, s_exps_pn, 1, prev);
+        mat = exps_common(cur, n, prev, pn);
+        n = exps_pick(s_exps_cur, s_exps_n, 2, cur);
+        pn = exps_pick(s_exps_prev, s_exps_pn, 2, prev);
+        nfrag = n;
+        frag = exps_common(cur, n, prev, pn);
+        n = exps_pick(s_exps_cur, s_exps_n, 3, cur);
+        pn = exps_pick(s_exps_prev, s_exps_pn, 3, prev);
+        nbig = n;
+        big = exps_common(cur, n, prev, pn);
+        fprintf(stderr, "  [static] %u draws | same instance as last frame: %u (%.0f%%) | under 50 idx %u/%u, "
+                "50+ idx %u/%u | rows 96-99 alone: %u (%.0f%%)\n",
+                s_exps_n, all, 100.0 * all / s_exps_n, frag, nfrag, big, nbig, mat, 100.0 * mat / s_exps_n);
+    }
+    memcpy(s_exps_prev, s_exps_cur, sizeof(ExpsDraw) * s_exps_n);
+    s_exps_pn = s_exps_n;
+    s_exps_n = 0;
+}
+
 static int exp_rd_applies(const Nv2aRawBatch *b)
 {
     switch (knob(KN_EXP_RDSEL)) {
@@ -2253,6 +2389,8 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     if (b->index_count < 50)
         s_frag_total++;
     census_draw(&b->surface, pk.shader_program);
+    if (knob(KN_EXP_STATIC))
+        exp_static_draw(b, pk.shader_program);
     if (p->prog != s_cur_prog) {
         glUseProgram(p->prog);
         s_cur_prog = p->prog;
@@ -2690,6 +2828,7 @@ static void gl_flip(void)
      * per program) and clear the request. */
     census_flush();
     exp_query_report();
+    exp_static_flip();
     surf_stats_frame();
     if (!s_q_on)
         pass_skip_frame();

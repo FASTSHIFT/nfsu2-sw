@@ -49,6 +49,7 @@ enum {
     KN_EXP_DROPFRAG,    /* experiment: 1 = skip draws under 50 indices, 2 = skip all (0) */
     KN_EXP_RD,          /* experiment: 2 = GL_RASTERIZER_DISCARD around draws, 1 = control (0) */
     KN_EXP_QUERY,       /* experiment: 1 = count this frame's draws that put no pixel on screen, once (0) */
+    KN_EXP_STATIC,      /* experiment: 1 = log how many draws repeat last frame's mesh + matrix rows (0) */
     KN_EXP_RDSEL,       /* ... only for: 1 blended, 2 opaque, 3 < 50 indices, 4 >= 50 (0 = all) */
     KN_COUNT
 };
