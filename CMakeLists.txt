@@ -95,6 +95,23 @@ else()
                    "regen with tools/regen.sh, or -DNFSU2_WRAP_FENGHUD=ON)")
 endif()
 
+# Scenery draw distance (knob PX_PCT, docs/13): src/recomp_manual.c wraps
+# eView::GetPixelSize (sub_001C6900). Same rule as above: the gen dir needs the
+# renamed sub_001C6900_gen body (NFSU2_WRAP_PXSIZE=AUTO looks for it in
+# recomp_funcs.h; ON forces it for a hand-renamed gen copy).
+set(NFSU2_WRAP_PXSIZE "AUTO" CACHE STRING "Wrap eView::GetPixelSize for the PX_PCT knob: AUTO, ON or OFF")
+if(NFSU2_WRAP_PXSIZE STREQUAL "AUTO")
+    file(STRINGS "${NFSU2_GEN_DIR}/recomp_funcs.h" _pxsize_gen
+         REGEX "^void sub_001C6900_gen\\(void\\);" LIMIT_COUNT 1)
+    set(_wrap_pxsize ${_pxsize_gen})
+else()
+    set(_wrap_pxsize ${NFSU2_WRAP_PXSIZE})
+endif()
+if(_wrap_pxsize)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_WRAP_PXSIZE=1)
+else()
+    message(STATUS "draw distance: PX_PCT off (gen has no sub_001C6900_gen; regen with tools/regen.sh, or -DNFSU2_WRAP_PXSIZE=ON)")
+endif()
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 
 # Movies: VP6 decoded by FFmpeg instead of the lifted On2 decoder

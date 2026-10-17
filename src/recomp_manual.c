@@ -19,6 +19,7 @@
  */
 
 #include "platform/xtrace.h"
+#include "platform/knobs.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -975,3 +976,24 @@ void recomp_unimpl(const char *text, uint32_t va)
     }
     if (stop) abort();
 }
+
+#ifdef NFSU2_WRAP_PXSIZE
+/* ── Scenery draw distance (0x001C6900) ──────────────────────
+ *
+ * cdecl eView::GetPixelSize(view, pos, radius): the projected size, in pixels,
+ * of a scenery instance. Its one caller, ScenerySectionHeader::DrawAScenery
+ * (0x001C69C0), skips the instance below 17 px (23 in split screen) and picks
+ * its LOD from the same number, so scaling the result moves the draw distance.
+ * Knob PX_PCT (100 = stock). docs/13. */
+extern void sub_001C6900_gen(void);
+void sub_001C6900(void)
+{
+    int pct;
+    sub_001C6900_gen();
+    pct = knob(KN_PX_PCT);
+    if (pct != 100) {
+        int32_t px = (int32_t)eax;
+        eax = (uint32_t)(int32_t)((int64_t)px * pct / 100);
+    }
+}
+#endif

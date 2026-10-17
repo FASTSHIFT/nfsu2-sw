@@ -55,6 +55,7 @@ enum {
     KN_DUMP_SEQ,        /* a new nonzero value dumps the next presented frame to /tmp/glab_<n>.bmp (0) */
     KN_EXP_NOUNI,       /* experiment, TIMING ONLY (picture breaks): 1 = scan the c[] rows but skip their glUniform4fv (0) */
     KN_CSCAN,           /* 1 = c[] rows found by memcmp against the program's copy, not by the GL thread's row stamps (0) */
+    KN_PX_PCT,          /* scenery on-screen size is scaled by this % before the draw-distance tests (100 = stock; 50 = objects must be twice as big to be drawn) */
     KN_COUNT
 };
 
