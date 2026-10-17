@@ -1,0 +1,29 @@
+--- a/src/video/kmsdrm/SDL_kmsdrmvideo.c	2019-07-25 12:32:36.000000000 +0800
++++ b/src/video/kmsdrm/SDL_kmsdrmvideo.c	2026-10-17 22:26:31.878075007 +0800
+@@ -477,6 +477,26 @@
+         data->cur_mode = connector->modes[0];
+     }
+ 
++    {   /* SDL_KMSDRM_MODE=WxH: use that connector mode instead of the CRTC's
++         * (HDMI TVs boot to their 4K preferred mode; the game wants 640x480..720p) */
++        const char *want = SDL_getenv("SDL_KMSDRM_MODE");
++        int ww = 0, hh = 0;
++        if (want && SDL_sscanf(want, "%dx%d", &ww, &hh) == 2) {
++            int m, best = -1;
++            for (m = 0; m < connector->count_modes; m++) {
++                const drmModeModeInfo *mi = &connector->modes[m];
++                if (mi->hdisplay == ww && mi->vdisplay == hh && !(mi->flags & DRM_MODE_FLAG_INTERLACE) &&
++                    (best < 0 || mi->vrefresh > connector->modes[best].vrefresh))
++                    best = m;
++            }
++            if (best >= 0) {
++                data->cur_mode = connector->modes[best];
++                SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO, "SDL_KMSDRM_MODE: %dx%d@%d", ww, hh, data->cur_mode.vrefresh);
++            } else {
++                SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO, "SDL_KMSDRM_MODE: no %dx%d mode on the connector", ww, hh);
++            }
++        }
++    }
+     SDL_zero(current_mode);
+ 
+     current_mode.w = data->cur_mode.hdisplay;

@@ -1,0 +1,15 @@
+--- a/drawbench.c	2026-10-05 19:32:14.032683286 +0800
++++ b/drawbench.c	2026-10-17 22:50:12.653533739 +0800
+@@ -125,7 +125,11 @@
+     static float consts[16 * 4];
+ 
+     if (!he || !gbm_create_device || fd < 0) { fprintf(stderr, "no EGL/gbm/render node\n"); return 1; }
+-    dpy = eglGetDisplay(gbm_create_device(fd));
++    {   /* this Mali userspace (g2p0) needs the platform entry point to pick GBM */
++        void *(*getpd)(unsigned, void *, const EGLint *) = eglGetProcAddress ? (void *(*)(unsigned, void *, const EGLint *))eglGetProcAddress("eglGetPlatformDisplayEXT") : NULL;
++        void *gbm = gbm_create_device(fd);
++        dpy = getpd ? getpd(0x31D7 /*EGL_PLATFORM_GBM_KHR*/, gbm, NULL) : eglGetDisplay(gbm);
++    }
+     if (!eglInitialize(dpy, &maj, &min)) { fprintf(stderr, "eglInitialize failed\n"); return 1; }
+     eglBindAPI(0x30A0 /*OPENGL_ES_API*/);
+     eglChooseConfig(dpy, cattr, &cfg, 1, &nc);
