@@ -184,6 +184,27 @@ def pull_shot(report, outdir):
         print(f"[screen] ok -> {bmp} (no PIL here, left as BMP)")
 
 
+def pull_traces(rows, outdir):
+    """Copy every recording back and summarise it (who is busy, who waits)."""
+    tdir = os.path.join(outdir, "xtrace")
+    os.makedirs(tdir, exist_ok=True)
+    got = []
+    for r in rows:
+        dst = os.path.join(tdir, os.path.basename(r["file"]))
+        rc = subprocess.run(["sshpass", "-p", PASS, "scp", "-o", "ConnectTimeout=10",
+                             f"ark@{HOST}:{r['file']}", dst], capture_output=True, timeout=180).returncode
+        if rc == 0:
+            got.append(dst)
+        else:
+            print(f"  (could not pull {r['file']})")
+    print(f"[trace] {len(got)} recording(s) in {tdir}")
+    if got:
+        summ = os.path.join(REPO, "tools", "trace_summary.py")
+        out = subprocess.run([sys.executable, summ] + got, capture_output=True, text=True, timeout=900)
+        open(os.path.join(tdir, "summary.txt"), "w").write(out.stdout + out.stderr)
+        print(out.stdout[-6000:])
+
+
 def pull_sweep_shots(rows, outdir):
     """Copy the frame each window dumped (row["shot"]) back, and compare every
     setting's frame with the baseline window before it: the share of pixels
@@ -270,6 +291,9 @@ def main():
     ap.add_argument("--baseline", action="store_true",
                     help="per-frame draw/GL stats of the race (RECOMP_PERF_LOG=2), "
                          "summarised on the device")
+    ap.add_argument("--trace", action="store_true",
+                    help="one launch, an xtrace recording per --set (plus a baseline first and last), "
+                         "copied back and summarised by tools/trace_summary.py")
     ap.add_argument("--sweep", action="store_true",
                     help="one launch, then each --set applied live and sampled in place")
     ap.add_argument("--set", action="append", default=[], metavar="NAME:KNOB=V,KNOB=V",
@@ -292,7 +316,7 @@ def main():
         print("[deploy] skipped (--skip-deploy)")
 
     mode = ("launch" if args.launch else "baseline" if args.baseline
-            else "sweep" if args.sweep else "race")
+            else "sweep" if args.sweep else "trace" if args.trace else "race")
     for sp in args.set:
         if not re.fullmatch(r"[a-z0-9_]+:([A-Z0-9_]+=\d+(,[A-Z0-9_]+=\d+)*)?", sp):
             sys.exit(f"error: bad --set {sp!r} (name:KNOB=V,KNOB=V)")
@@ -306,6 +330,8 @@ def main():
 
     print(json.dumps(report, indent=2))
     outdir = collect(report)
+    if mode == "trace" and "trace" in report:
+        pull_traces(report["trace"], outdir)
     if mode == "sweep" and "sweep" in report:
         pull_sweep_shots(report["sweep"], outdir)
         print_sweep(report["sweep"])

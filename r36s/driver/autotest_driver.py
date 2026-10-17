@@ -11,6 +11,8 @@ exactly as typed. The host only uploads this file and runs it:
     python3 autotest_driver.py sweep NAME:KNOB=V,KNOB=V ...   # ONE launch, then
                                           # switch the live knobs (/tmp/nfsu2.knobs)
                                           # per setting and sample each in place
+    python3 autotest_driver.py trace [NAME:KNOB=V,KNOB=V ...]   # ONE launch, then one
+                                          # xtrace recording (6 s) per setting, in the race
     python3 autotest_driver.py baseline [KEY=VAL ...]   # same entry, then log per-frame draw
                                           # stats (RECOMP_PERF_LOG=2), summarise
                                           # the race frames and quit by hotkey
@@ -262,12 +264,18 @@ def do_launch():
     # would otherwise be taken for this run's and report "reached race" even
     # when the game never started this time.
     sh(f"rm -f '{GAME_LOG}'")
-    log("pressing A to launch")
-    press(BTN_A, 200)
-    pid = wait_game(60)
+    # After the device has sat idle, the first press can be taken by the screen
+    # waking up instead of by ES (seen twice: the game only started on a later
+    # press). So press, wait for the process, and press again.
+    pid = None
+    for attempt in range(1, LAUNCH_TRIES + 1):
+        log(f"pressing A to launch (try {attempt}/{LAUNCH_TRIES})")
+        press(BTN_A, 200)
+        pid = wait_game(LAUNCH_WAIT_S)
+        if pid:
+            break
     if not pid:
-        # No game: either A did not launch anything (ES's cursor is not on
-        # NFSU2 -- after a reboot it starts at the top) or the game died at once.
+        # No game: either A launched nothing or the game died at once.
         launched = tail_file(ES_LOG, 6).replace("\n", " | ")
         die("game did not appear after A press; ES log: " + launched)
     log(f"game running (pid {pid})")
@@ -416,6 +424,12 @@ def do_baseline(timeout=BASE_TIMEOUT):
     }
 
 
+LAUNCH_TRIES = 4
+LAUNCH_WAIT_S = 10
+
+TRACE_DIR = PORT + "/xtrace"
+TRACE_FILE = TRACE_DIR + "/t.pftrace"      # RECOMP_TRACE; every recording replaces it
+TRACE_SECS = 6                             # length of one recording
 KNOBS_FILE = "/tmp/nfsu2.knobs"   # the game re-reads it every second (knobs.h)
 SPEC_RE = re.compile(r"[a-z0-9_]+:([A-Z0-9_]+=\d+(,[A-Z0-9_]+=\d+)*)?")  # ints; RESTORE= too
 SW_SETTLE = 40         # frames to wait after a switch (knob reload <= 1 s + effect)
@@ -513,6 +527,61 @@ def do_sweep(specs, timeout=900):
     return out
 
 
+def usr2(pid):
+    sh(f"kill -USR2 {pid}")
+
+
+def do_trace(specs, pid, timeout=600):
+    """After the race scene has settled: for each setting (plain baseline first
+    and last) apply its knobs, wait SW_SETTLE frames, record TRACE_SECS seconds of
+    xtrace (kill -USR2 starts it, a second one stops it and writes the file) and
+    copy the file to <name>.pftrace. The game is never restarted."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if not game_pid():
+            die("game process gone before the trace")
+        fr = frames_after_hud()
+        if sum(1 for f in fr if f["dc"] - f["frag"] >= RACE_BIG_DRAWS) >= BASE_SETTLE:
+            break
+        time.sleep(2)
+    else:
+        return None
+    out = []
+    order = ["base:"] + list(specs) + ["base_end:"]
+    for spec in order:
+        name, pairs, undo = split_spec(spec)
+        set_knobs(pairs)
+        n0 = len(frames_after_hud())
+        while len(frames_after_hud()) < n0 + SW_SETTLE:
+            if time.time() > end or not game_pid():
+                die(f"game process gone / timeout before '{name}'")
+            time.sleep(1)
+        n1 = len(frames_after_hud())
+        sh(f"rm -f '{TRACE_FILE}'")
+        usr2(pid)                                   # start
+        time.sleep(TRACE_SECS)
+        n2 = len(frames_after_hud())
+        usr2(pid)                                   # stop and write
+        for _ in range(60):                         # the file appears when complete
+            if os.path.exists(TRACE_FILE):
+                break
+            time.sleep(0.5)
+        else:
+            log(f"{name}: no trace file")
+            continue
+        dst = f"{TRACE_DIR}/{name}.pftrace"
+        sh(f"mv '{TRACE_FILE}' '{dst}'")
+        fr = frames_after_hud()[n1:n2]
+        row = {"name": name, "spec": ",".join(pairs), "file": dst, "frames": len(fr),
+               "temp_c": read_temp(), "cpu_mhz": read_freq(), "gpu_mhz": read_gpu_mhz()}
+        row.update({k: quantile([f[k] for f in fr], 0.5) for k in BASE_FIELDS} if fr else {})
+        out.append(row)
+        log("%-10s %3d frames, ms %s gl %s wait %s dc %s  -> %s" % (
+            name, len(fr), row.get("ms"), row.get("gl"), row.get("wait"), row.get("dc"), dst))
+    set_knobs([])
+    return out
+
+
 def sample(seconds=10):
     fps, temps, freqs = [], [], []
     end = time.time() + seconds
@@ -562,7 +631,10 @@ def main():
     # KEY=VALUE arguments after the mode go into env.txt for this run too
     # (A/B experiments: RECOMP_GL_EXP_RD=2 ...).
     extra = [a for a in sys.argv[2:] if re.fullmatch(r"[A-Z0-9_]+=[\w.,:/+-]*", a)]
-    if mode in ("baseline", "sweep"):
+    if mode == "trace":
+        sh(f"rm -rf '{TRACE_DIR}' && mkdir -p '{TRACE_DIR}'")
+        extra += [f"RECOMP_TRACE={TRACE_FILE}", "RECOMP_TRACE_SECS=0", "RECOMP_TRACE_EVENTS=400000"]
+    if mode in ("baseline", "sweep", "trace"):
         # frame dumps: the device judges black / not black (screen_report())
         sh(f"rm -rf '{SHOTS_DIR}' && mkdir -p '{SHOTS_DIR}'")
         extra.append(f"RECOMP_GL_DUMP={SHOTS_DIR}/f,{SHOT_EVERY}")
@@ -596,6 +668,22 @@ def run(mode, timing, t0, mark):
             rc, out = sh(f"grep -c '\\[fps\\]' '{GAME_LOG}'")
             report["verdict"] = "LAUNCHED"
             report["fps_lines"] = out
+            exit_game_sure()
+            mark("exit")
+        elif mode == "trace":
+            specs = [a for a in sys.argv[2:] if SPEC_RE.fullmatch(a)]
+            if not do_race(pid, hold_rt=False):
+                report["verdict"] = "FAIL: did not reach race"
+            else:
+                mark("reach_race")
+                rows = do_trace(specs, pid)
+                mark("trace")
+                if not rows:
+                    report["verdict"] = "FAIL: no trace recorded"
+                else:
+                    report["trace"] = rows
+                    report["screen"] = screen_report()
+                    report["verdict"] = "PASS"
             exit_game_sure()
             mark("exit")
         elif mode == "sweep":
