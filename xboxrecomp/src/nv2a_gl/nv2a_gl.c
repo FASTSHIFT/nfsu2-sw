@@ -130,6 +130,11 @@ static void gl_step_done(const char *what)
         s_new_obj = 0;                    /* the draw that uses it reports too */
 }
 static GLuint        s_vao, s_vbo, s_ibo;
+/* The GL thread's stamp per c[] row: the batch const_gen at which the row last changed
+ * (NULL outside the queue thread: gl_draw_raw then compares with memcmp). */
+static uint32_t      g_row_gen[192];
+static uint32_t      g_blk_gen[12];            /* newest stamp of each 16 rows: clean blocks are skipped whole */
+static const uint32_t *s_const_row_gen;
 static int           s_dump_seq;            /* knob DUMP_SEQ: dump this frame */
 /* Streaming vertex / index buffers (see ring_alloc). */
 typedef struct { GLuint buf; GLenum target; GLsizeiptr cap, off; } GlRing;
@@ -881,6 +886,7 @@ typedef struct {
     int        vpc_valid;       /* vpc holds what this program's "c" was given */
     uint32_t   vpc_gen;         /* ... as of the executor's constant version */
     int        vpc_rows;        /* c[i]'s location is u_c + i: rows can go alone */
+    int        vpc_stamped;     /* vpc was not kept up to date (rows were found by stamps) */
     uint32_t   hash;            /* bucket of (vkey, pkey) */
     int        next;            /* chain in s_prog_head, index + 1 */
     float      vpc[192][4];
@@ -1150,6 +1156,14 @@ static GlProg *prog_get(const Nv2aRawBatch *b, const Nv2aPshKey *pk)
     last = p;
     p->u_c = glGetUniformLocation(p->prog, "c");
     p->vpc_rows = p->u_c >= 0 && glGetUniformLocation(p->prog, "c[191]") == p->u_c + 191;
+    {
+        static int shown;
+        if (shown < 2 && p->u_c >= 0) {
+            shown++;
+            fprintf(stderr, "  [GL] c[] rows addressable one by one: %s (c %d, c[191] %d)\n",
+                    p->vpc_rows ? "yes" : "NO", p->u_c, glGetUniformLocation(p->prog, "c[191]"));
+        }
+    }
     p->u_surf = glGetUniformLocation(p->prog, "u_surf");
     p->u_aa = glGetUniformLocation(p->prog, "u_aa");
     p->u_m = glGetUniformLocation(p->prog, "u_m");
@@ -2658,14 +2672,49 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     aa[0] = b->aa_sx > 0 ? b->aa_sx : 1.0f;
     aa[1] = b->aa_sy > 0 ? b->aa_sy : 1.0f;
     memcpy(m, b->composite, sizeof m);
+    XTRACE_DRAW_MARK("d:uni-prep");
 
     /* 192 constants are 3 KB, and most draws in a row share them: upload
      * only when they changed since this program last got them. */
     if (p->u_c >= 0 && !(p->vpc_valid && p->vpc_gen == b->vp_const_gen)) {
+        const int nouni = knob(KN_EXP_NOUNI);
         /* Same executor version: same contents, no compare needed. */
-        if (!p->vpc_valid || !p->vpc_rows) {
+        const uint32_t *rg = knob(KN_CSCAN) ? NULL : s_const_row_gen;
+        if (s_vab_verify && s_const_row_gen && p->vpc_valid && !p->vpc_stamped) {
+            /* RECOMP_GL_VERIFY=1: every row that really differs from what this program holds must
+             * be one the stamps call new (the reverse, a spare upload, is harmless). Needs no
+             * row-addressable uniforms, so it also runs where the upload is whole (llvmpipe). */
+            static unsigned long checked, bad;
+            int r, miss = 0;
+            for (r = 0; r < 192; r++)
+                if (memcmp(p->vpc[r], b->vp_consts[r], 16) != 0 &&
+                    ((int32_t)(s_const_row_gen[r] - p->vpc_gen) <= 0 || (int32_t)(g_blk_gen[r >> 4] - p->vpc_gen) <= 0))
+                    miss++;
+            checked++;
+            if (miss && bad++ < 8)
+                fprintf(stderr, "  [CSCAN] MISMATCH at draw %lu: %d row(s) changed that the stamps call clean\n", checked, miss);
+            if ((checked & 0x3FFF) == 0)
+                fprintf(stderr, "  [CSCAN] verified %lu draws, %lu mismatches\n", checked, bad);
+        }
+        if (!p->vpc_valid || !p->vpc_rows || (!rg && p->vpc_stamped)) {
             memcpy(p->vpc, b->vp_consts, sizeof p->vpc);
-            glUniform4fv(p->u_c, 192, &b->vp_consts[0][0]);
+            p->vpc_stamped = 0;
+            if (!nouni) glUniform4fv(p->u_c, 192, &b->vp_consts[0][0]);
+        } else if (rg) {
+            /* The GL thread stamped every row with the version it last
+             * changed at: a row is new to this program when that is later than
+             * the version the program got (signed: the counter may wrap). No
+             * compare of 3 KB per draw, and no copy of it (vpc goes stale). */
+            int r = 0;
+            p->vpc_stamped = 1;
+            while (r < 192) {
+                int e;
+                if (!(r & 15) && (int32_t)(g_blk_gen[r >> 4] - p->vpc_gen) <= 0) { r += 16; continue; }
+                if ((int32_t)(rg[r] - p->vpc_gen) <= 0) { r++; continue; }
+                for (e = r + 1; e < 192 && (int32_t)(rg[e] - p->vpc_gen) > 0; e++) { }
+                if (!nouni) glUniform4fv(p->u_c + r, e - r, &b->vp_consts[r][0]);
+                r = e;
+            }
         } else {
             /* Only the rows that changed, as runs: a draw usually changes a
              * matrix or two of the 192, and sending all 3 KB each time was
@@ -2676,13 +2725,15 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
                 if (!memcmp(p->vpc[r], b->vp_consts[r], 16)) { r++; continue; }
                 for (e = r + 1; e < 192 && memcmp(p->vpc[e], b->vp_consts[e], 16); e++) { }
                 memcpy(p->vpc[r], b->vp_consts[r], (size_t)(e - r) * 16);
-                glUniform4fv(p->u_c + r, e - r, &b->vp_consts[r][0]);
+                if (!nouni) glUniform4fv(p->u_c + r, e - r, &b->vp_consts[r][0]);
                 r = e;
             }
         }
+        if (s_vab_verify) { memcpy(p->vpc, b->vp_consts, sizeof p->vpc); p->vpc_stamped = 0; }
         p->vpc_valid = 1;
         p->vpc_gen = b->vp_const_gen;
     }
+    XTRACE_DRAW_MARK("d:uni-c");
     {
         /* The rest, likewise: set only when something differs from what this
          * program already holds. */
@@ -3654,9 +3705,15 @@ static void *q_gl_thread(void *arg)
                 const QRow *r = (const QRow *)(rec + at);
                 memcpy(g_prog[r->idx], r->w, 16);
             }
-            for (i = 0; i < h->nconst; i++, at += sizeof(QRow)) {
-                const QRow *r = (const QRow *)(rec + at);
-                memcpy(g_consts[r->idx], r->w, 16);
+            if (h->nconst) {
+                /* The batch copy follows the rows: its version is the one these rows changed at. */
+                const uint32_t cgen = ((const Nv2aRawBatch *)(rec + at + (size_t)h->nconst * sizeof(QRow)))->vp_const_gen;
+                for (i = 0; i < h->nconst; i++, at += sizeof(QRow)) {
+                    const QRow *r = (const QRow *)(rec + at);
+                    memcpy(g_consts[r->idx], r->w, 16);
+                    g_row_gen[r->idx] = cgen;
+                    g_blk_gen[r->idx >> 4] = cgen;
+                }
             }
             s_regs = g_regs;                    /* what clears/presents read */
             if (h->type == Q_DRAW) {
@@ -3671,7 +3728,9 @@ static void *q_gl_thread(void *arg)
                 bb.attrs = (const float *)(rec + (uintptr_t)bb.attrs);
                 bb.indices = (const uint32_t *)(rec + (uintptr_t)bb.indices);
                 XTRACE_BEGIN_TAG("draw");
+                s_const_row_gen = g_row_gen;
                 gl_draw_raw(&bb);
+                s_const_row_gen = NULL;
                 XTRACE_END_TAG("draw");
             } else if (h->type == Q_CLEAR) {
                 const QClear *c = (const QClear *)(rec + at);

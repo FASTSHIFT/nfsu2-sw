@@ -53,6 +53,8 @@ enum {
     KN_EXP_RDSEL,       /* ... only for: 1 blended, 2 opaque, 3 < 50 indices, 4 >= 50 (0 = all) */
     KN_GL_LEGACY,       /* bit 0: vertex attributes by glVertexAttribPointer, not vertex_attrib_binding (0) */
     KN_DUMP_SEQ,        /* a new nonzero value dumps the next presented frame to /tmp/glab_<n>.bmp (0) */
+    KN_EXP_NOUNI,       /* experiment, TIMING ONLY (picture breaks): 1 = scan the c[] rows but skip their glUniform4fv (0) */
+    KN_CSCAN,           /* 1 = c[] rows found by memcmp against the program's copy, not by the GL thread's row stamps (0) */
     KN_COUNT
 };
 
