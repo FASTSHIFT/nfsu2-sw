@@ -130,6 +130,7 @@ static void gl_step_done(const char *what)
         s_new_obj = 0;                    /* the draw that uses it reports too */
 }
 static GLuint        s_vao, s_vbo, s_ibo;
+static int           s_dump_seq;            /* knob DUMP_SEQ: dump this frame */
 /* Streaming vertex / index buffers (see ring_alloc). */
 typedef struct { GLuint buf; GLenum target; GLsizeiptr cap, off; } GlRing;
 static GlRing s_vring = { 0, GL_ARRAY_BUFFER, 16 << 20, 0 };
@@ -137,6 +138,12 @@ static GlRing s_iring = { 0, GL_ELEMENT_ARRAY_BUFFER, 4 << 20, 0 };
 static int    s_vao_bound;                  /* bind_vao / bind_buf (ring_alloc) */
 static GLuint s_buf_bound[2];               /* ARRAY, ELEMENT_ARRAY */
 static int    ring_persist_init(void *(*getproc)(const char *));
+/* Vertex formats and buffer bindings apart (ES 3.1 / GL 4.3 / ARB_vertex_attrib_binding):
+ * a draw then rebinds one buffer offset instead of re-specifying every attribute
+ * (glVertexAttribPointer x3 a draw). See vab_bind. */
+static void   vab_init(void *(*getproc)(const char *));
+static int    s_vab;                        /* in use */
+static uint64_t s_vab_draws, s_vab_fmt, s_vab_bind;   /* RECOMP_GL_CALL_STATS */
 static const uint32_t *s_regs;          /* the executor's method shadow */
 static uint32_t      s_frame;
 /* Hitch accounting (gl_flip logs frames over 50 ms): per frame, programs
@@ -1272,6 +1279,7 @@ static int ready(void)
     }
     glGenVertexArrays(1, &s_vao);
     glBindVertexArray(s_vao);
+    vab_init(SDL_GL_GetProcAddress);
     glGenBuffers(1, &s_vbo);
     glGenBuffers(1, &s_ibo);
     s_vring.buf = s_vbo;
@@ -1753,6 +1761,224 @@ static uint32_t vertex_runs(const Nv2aRawBatch *b, VRun *run, int *of_run)
     return nrun;
 }
 
+/* ── Vertex attribute binding ─────────────────────────────────────────
+ *
+ * glVertexAttribPointer names a format, a stride AND a buffer offset, and the
+ * offset moves every draw (the ring), so each draw re-specified all of its
+ * attributes: ~3 calls a draw, and a vertex-state revalidation in the Mali
+ * blob. With separate formats the layout (formats + relative offsets + which
+ * binding) is set only when it changes, and a draw rebinds the ring at its own
+ * offset: one glBindVertexBuffer per group of attributes that share a stride
+ * and sit within one stride-run of each other (nearly always: one).
+ *
+ * The fetched addresses are the same as before: for attribute a,
+ *   binding offset + relative offset == the offset glVertexAttribPointer got,
+ *   binding stride == its stride (0 = tightly packed is written out, as
+ *   glBindVertexBuffer has no such rule).
+ * RECOMP_GL_VERIFY=1 reads the state back and compares (vab_verify).
+ * Knob GL_LEGACY=1 (or RECOMP_GL_VAB=0) goes back to glVertexAttribPointer. */
+typedef void (GLAPIENTRY *PFN_vabFormat)(GLuint, GLint, GLenum, GLboolean, GLuint);
+typedef void (GLAPIENTRY *PFN_vabBinding)(GLuint, GLuint);
+typedef void (GLAPIENTRY *PFN_vabBindVB)(GLuint, GLuint, GLintptr, GLsizei);
+typedef void (GLAPIENTRY *PFN_geti_v)(GLenum, GLuint, GLint *);
+typedef void (GLAPIENTRY *PFN_getvaiv)(GLuint, GLenum, GLint *);
+static PFN_vabFormat  p_vabFormat;
+static PFN_vabBinding p_vabBinding;
+static PFN_vabBindVB  p_vabBindVB;
+static PFN_geti_v     p_vabGetIv;           /* RECOMP_GL_VERIFY only */
+static PFN_getvaiv    p_vabGetVAiv;
+static int            s_vab_verify;
+#define VAB_REL_MAX 2047                    /* GL_MAX_VERTEX_ATTRIB_RELATIVE_OFFSET minimum */
+
+typedef struct { GLuint a; GLint size; GLenum type; GLboolean norm; GLuint rel, bind; } VabAttr;
+static struct { int valid, n, nb; VabAttr at[NV2A_RAW_ATTRS]; GLsizei stride[NV2A_RAW_ATTRS]; } s_lay;
+
+static void vab_init(void *(*getproc)(const char *))
+{
+    const char *e = getenv("RECOMP_GL_VAB");
+    const char *ver = (const char *)glGetString(GL_VERSION);
+    int maj = 0, min = 0;
+
+    s_vab = 0;
+    if (e && *e == '0')
+        return;
+    if (!ver)
+        return;
+    if (!strncmp(ver, "OpenGL ES ", 10))
+        sscanf(ver + 10, "%d.%d", &maj, &min);
+    else
+        sscanf(ver, "%d.%d", &maj, &min);
+    if (nv2a_gl_api_es ? !(maj > 3 || (maj == 3 && min >= 1))
+                       : !(maj > 4 || (maj == 4 && min >= 3)))
+        return;
+    p_vabFormat  = (PFN_vabFormat)getproc("glVertexAttribFormat");
+    p_vabBinding = (PFN_vabBinding)getproc("glVertexAttribBinding");
+    p_vabBindVB  = (PFN_vabBindVB)getproc("glBindVertexBuffer");
+    if (!p_vabFormat || !p_vabBinding || !p_vabBindVB)
+        return;
+    s_vab = 1;
+    s_vab_verify = getenv("RECOMP_GL_VERIFY") != NULL;
+    if (s_vab_verify) {
+        p_vabGetIv   = (PFN_geti_v)getproc("glGetIntegeri_v");
+        p_vabGetVAiv = (PFN_getvaiv)getproc("glGetVertexAttribiv");
+        if (!p_vabGetIv || !p_vabGetVAiv)
+            s_vab_verify = 0;
+    }
+    fprintf(stderr, "  [GL] vertex_attrib_binding: on (%s %d.%d)%s\n",
+            nv2a_gl_api_es ? "ES" : "GL", maj, min, s_vab_verify ? ", verifying" : "");
+}
+
+static size_t vab_type_bytes(GLenum t)
+{
+    return t == GL_FLOAT ? 4 : t == GL_SHORT ? 2 : 1;
+}
+
+/* Read the VAO back and compare with what the legacy call would have set:
+ * binding offset + relative offset == pointer offset, same stride, same
+ * format, same buffer. Desktop GL only (RECOMP_GL_VERIFY=1). */
+static void vab_verify(const VabAttr *at, uint32_t n, const GLintptr *want_off,
+                       const GLsizei *want_stride, GLuint buf)
+{
+    static unsigned bad, checked;
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        GLint bind = -1, rel = -1, size = -1, type = -1, norm = -1, off = -1, stride = -1, vb = -1;
+        GLint bo_lo = 0;
+        p_vabGetVAiv(at[i].a, 0x82D4 /*ATTRIB_BINDING*/, &bind);
+        p_vabGetVAiv(at[i].a, 0x82D5 /*RELATIVE_OFFSET*/, &rel);
+        p_vabGetVAiv(at[i].a, 0x8623 /*ARRAY_SIZE*/, &size);
+        p_vabGetVAiv(at[i].a, 0x8625 /*ARRAY_TYPE*/, &type);
+        p_vabGetVAiv(at[i].a, 0x886A /*ARRAY_NORMALIZED*/, &norm);
+        p_vabGetVAiv(at[i].a, 0x889F /*ARRAY_BUFFER_BINDING*/, &vb);
+        p_vabGetIv(0x82D7 /*VERTEX_BINDING_OFFSET*/, (GLuint)bind, &off);
+        p_vabGetIv(0x82D8 /*VERTEX_BINDING_STRIDE*/, (GLuint)bind, &stride);
+        (void)bo_lo;
+        checked++;
+        if ((GLintptr)off + rel != want_off[i] || stride != want_stride[i] ||
+            size != (at[i].size == GL_BGRA ? GL_BGRA : at[i].size) || (GLenum)type != at[i].type ||
+            !!norm != !!at[i].norm || (GLuint)vb != buf) {
+            if (bad++ < 20)
+                fprintf(stderr, "  [VAB] MISMATCH attr %u: off %d+%d (want %lld) stride %d (want %d)"
+                        " size %d (%d) type %x (%x) norm %d (%d) buf %d (%u)\n",
+                        at[i].a, off, rel, (long long)want_off[i], stride, want_stride[i],
+                        size, at[i].size, type, at[i].type, norm, at[i].norm, vb, buf);
+        }
+    }
+    if ((checked & 0xFFFFF) == 0 || (bad && !(bad & (bad - 1)) && bad > 1))
+        fprintf(stderr, "  [VAB] verified %u attributes, %u mismatches\n", checked, bad);
+}
+
+/* Set the attribute formats/bindings (only when the layout changed) and bind
+ * the ring for this draw. Returns 0 if it cannot be expressed (never so far),
+ * leaving the legacy path to do the draw. */
+static int vab_bind(const Nv2aRawBatch *b, GLintptr at, const VRun *run, const int *of_run,
+                    const uint32_t *slot, uint32_t np, GLintptr pack_at)
+{
+    VabAttr cur[NV2A_RAW_ATTRS];
+    GLsizei stride[NV2A_RAW_ATTRS];
+    GLintptr boff[NV2A_RAW_ATTRS], want_off[NV2A_RAW_ATTRS];
+    GLsizei want_stride[NV2A_RAW_ATTRS];
+    const uint8_t *aptr[NV2A_RAW_ATTRS], *gmin[NV2A_RAW_ATTRS], *gmax[NV2A_RAW_ATTRS];
+    int grun[NV2A_RAW_ATTRS];
+    uint32_t a, i, n = 0, nb = 0, g;
+
+    for (a = 0; a < NV2A_RAW_ATTRS; a++) {
+        GLint size;
+        GLenum type;
+        GLboolean norm;
+        GLsizei st;
+        const uint8_t *ptr;
+        if (!(b->attr_present & (1u << a))) {
+            attr_enable(a, 0);
+            continue;
+        }
+        attr_enable(a, 1);
+        if (!(b->attr_direct & (1u << a)))
+            continue;
+        size = (GLint)b->direct[a].size;
+        switch (b->direct[a].type) {
+        case 0:  size = nv2a_gl_api_es ? 4 : GL_BGRA;
+                 type = GL_UNSIGNED_BYTE; norm = GL_TRUE; break;
+        case 1:  type = GL_SHORT; norm = GL_TRUE; break;
+        case 2:  type = GL_FLOAT; norm = GL_FALSE; break;
+        case 4:  type = GL_UNSIGNED_BYTE; norm = GL_TRUE; break;
+        default: type = GL_SHORT; norm = GL_FALSE; break;
+        }
+        st = (GLsizei)b->direct[a].stride;
+        if (!st)                            /* legacy: 0 = tightly packed */
+            st = (GLsizei)((size == (GLint)GL_BGRA ? 4 : size) * (GLint)vab_type_bytes(type));
+        ptr = b->direct[a].ptr;
+        for (g = 0; g < nb; g++)
+            if (grun[g] == of_run[a] && stride[g] == st) {
+                const uint8_t *lo = ptr < gmin[g] ? ptr : gmin[g];
+                const uint8_t *hi = ptr > gmax[g] ? ptr : gmax[g];
+                if ((size_t)(hi - lo) <= VAB_REL_MAX)
+                    break;
+            }
+        if (g == nb) {
+            grun[g] = of_run[a];
+            stride[g] = st;
+            gmin[g] = gmax[g] = ptr;
+            nb++;
+        } else {
+            if (ptr < gmin[g]) gmin[g] = ptr;
+            if (ptr > gmax[g]) gmax[g] = ptr;
+        }
+        cur[n].a = a; cur[n].size = size; cur[n].type = type; cur[n].norm = norm;
+        cur[n].bind = g;
+        aptr[n] = ptr;
+        n++;
+    }
+    for (i = 0; i < n; i++)
+        cur[i].rel = (GLuint)(aptr[i] - gmin[cur[i].bind]);
+    for (g = 0; g < nb; g++)
+        boff[g] = at + run[grun[g]].at + (gmin[g] - run[grun[g]].lo);
+    for (i = 0; i < n; i++) {
+        want_off[i] = at + run[of_run[cur[i].a]].at + (aptr[i] - run[of_run[cur[i].a]].lo);
+        want_stride[i] = stride[cur[i].bind];
+    }
+    if (np) {
+        if (nb >= NV2A_RAW_ATTRS)
+            return 0;
+        g = nb++;
+        stride[g] = (GLsizei)(np * 4 * sizeof(float));
+        boff[g] = at + pack_at;
+        for (i = 0; i < np; i++) {
+            cur[n].a = slot[i]; cur[n].size = 4; cur[n].type = GL_FLOAT; cur[n].norm = GL_FALSE;
+            cur[n].rel = i * 4 * (uint32_t)sizeof(float); cur[n].bind = g;
+            want_off[n] = at + pack_at + (GLintptr)(i * 4 * sizeof(float));
+            want_stride[n] = stride[g];
+            n++;
+        }
+    }
+    {
+        int same = s_lay.valid && s_lay.n == (int)n && s_lay.nb == (int)nb;
+        for (i = 0; same && i < n; i++)
+            same = s_lay.at[i].a == cur[i].a && s_lay.at[i].size == cur[i].size &&
+                   s_lay.at[i].type == cur[i].type && s_lay.at[i].norm == cur[i].norm &&
+                   s_lay.at[i].rel == cur[i].rel && s_lay.at[i].bind == cur[i].bind;
+        for (g = 0; same && g < nb; g++)
+            same = s_lay.stride[g] == stride[g];
+        if (!same) {
+            for (i = 0; i < n; i++) {
+                p_vabFormat(cur[i].a, cur[i].size, cur[i].type, cur[i].norm, cur[i].rel);
+                p_vabBinding(cur[i].a, cur[i].bind);
+            }
+            memcpy(s_lay.at, cur, n * sizeof cur[0]);
+            memcpy(s_lay.stride, stride, nb * sizeof stride[0]);
+            s_lay.n = (int)n; s_lay.nb = (int)nb; s_lay.valid = 1;
+            s_vab_fmt += n * 2;
+        }
+    }
+    for (g = 0; g < nb; g++)
+        p_vabBindVB(g, s_vring.buf, boff[g], stride[g]);
+    s_vab_bind += nb;
+    s_vab_draws++;
+    if (s_vab_verify)
+        vab_verify(cur, n, want_off, want_stride, s_vring.buf);
+    return 1;
+}
+
 static int upload_vertices(const Nv2aRawBatch *b)
 {
     VRun run[NV2A_RAW_ATTRS];
@@ -1804,6 +2030,12 @@ static int upload_vertices(const Nv2aRawBatch *b)
                        4 * sizeof(float));
     }
     ring_done(&s_vring, at, bytes, map, staging);
+
+    if (s_vab && !(knob(KN_GL_LEGACY) & 1)) {
+        if (vab_bind(b, at, run, of_run, slot, np, pack_at))
+            return 1;
+    }
+    s_lay.valid = 0;                        /* legacy calls change the VAO under it */
 
     for (a = 0; a < NV2A_RAW_ATTRS; a++) {
         GLintptr off;
@@ -2284,7 +2516,11 @@ static void call_stats_frame(void)
     fprintf(stderr, "  [GL] calls/frame:");
     for (i = 0; i < n && i < 24; i++)
         fprintf(stderr, " %s %.0f", nv2a_gl_names[order[i]] + 2, nv2a_gl_calls[order[i]] / fr);
+    if (s_vab_draws)
+        fprintf(stderr, " | vertex_attrib_binding: BindVertexBuffer %.0f, formats %.0f (draws %.0f)",
+                s_vab_bind / fr, s_vab_fmt / fr, s_vab_draws / fr);
     fprintf(stderr, "\n");
+    s_vab_bind = s_vab_fmt = s_vab_draws = 0;
     memset(nv2a_gl_calls, 0, sizeof nv2a_gl_calls);
     s_swap_ns = s_cs_draws = 0;
     frames = 0;
@@ -2950,7 +3186,16 @@ static void gl_flip(void)
         }
     }
 
-    if (dump_every && (s_frame % (uint32_t)dump_every) == 0) {
+    {
+        /* Knob DUMP_SEQ=<n>: a new nonzero n dumps this frame to /tmp/glab_<n>.bmp
+         * (A/B comparisons inside one running game, tools/pc/glab.sh). */
+        static int seq_done;
+        int seq = knob(KN_DUMP_SEQ);
+        s_dump_seq = seq && seq != seq_done ? seq : 0;
+        if (s_dump_seq)
+            seq_done = seq;
+    }
+    if ((dump_every && (s_frame % (uint32_t)dump_every) == 0) || s_dump_seq) {
         size_t need = (size_t)s->pw * s->ph * 4;
         if (need > pix_cap) {
             free(pix);
@@ -2969,7 +3214,10 @@ static void gl_flip(void)
                     uint8_t t = pix[k]; pix[k] = pix[k + 2]; pix[k + 2] = t;
                 }
             }
-            snprintf(path, sizeof path, "%s%05u.bmp", dump_prefix, s_frame);
+            if (s_dump_seq)
+                snprintf(path, sizeof path, "/tmp/glab_%d.bmp", s_dump_seq);
+            else
+                snprintf(path, sizeof path, "%s%05u.bmp", dump_prefix, s_frame);
             dump_bmp(path, pix, s->pw, s->ph);
         }
     }
