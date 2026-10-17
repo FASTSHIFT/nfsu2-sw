@@ -1,0 +1,81 @@
+diff --git a/src/main.c b/src/main.c
+index 1a81ec1..c2022b2 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -611,6 +611,7 @@ static void pf_row(long frame,const int counts[12]) {
+         if(have)fprintf(pf_csv,",%ld,%.4f,%.4f,%.4f,%.4f\n",old,g[0],g[1],g[2],g[0]+g[1]+g[2]);
+     }
+     if(!have)fprintf(pf_csv,",,,,,\n");
++    if(frame%60==0)fflush(pf_csv);   /* the launcher kills the process: keep the rows on disk */
+ }
+ 
+ /* Conservative whole-vehicle visibility: a world-space sphere against the six
+@@ -2295,6 +2296,7 @@ int main(int argc, char **argv) {
+     /* M132-R diagnostics. tier: 0 = baseline (old fixed 700 m, no vista),
+        1 = ordinary (fog-derived range, no vista), 2 = full (range + vista). */
+     int tier = 1;   /* production default: ordinary. full is opt-in (M132-R2) */
++    float view_dist_arg = 0.0f;   /* --view-dist M: 0 = default fog-derived 933 m */
+     int sky_profile = N2_SKY_NIGHT;
+     const char *poseshot = NULL; /* --pose-shot PREFIX: freeze the production
+                                     start pose and capture four yaws there */
+@@ -2506,6 +2508,21 @@ int main(int argc, char **argv) {
+             }
+             collision_source=!strcmp(argv[++i],"bun")?WCOLLISION_BUN:WCOLLISION_LEGACY;
+         }
++        else if (!strcmp(argv[i], "--view-dist")) {
++            /* Handheld/low-memory option: draw distance in metres. The ordinary
++               world cutoff is derived from the exp^2 fog (cutoff = sqrt(-ln 1%)
++               / density), so this sets the fog density that puts the 1% point
++               exactly at M, and shrinks the resident neighbourhood to
++               M + cell + safety (the minimum world_resident_policy_valid()
++               accepts). Memory and load time scale with the resident area. */
++            char extra;
++            if (i+1 >= argc || sscanf(argv[i+1], "%f%c", &view_dist_arg, &extra) != 1 ||
++                !(view_dist_arg >= 150.0f && view_dist_arg <= 933.0f)) {
++                fprintf(stderr, "--view-dist requires metres in 150..933 (default 933)\n");
++                return 2;
++            }
++            i++;
++        }
+         else if (!strcmp(argv[i], "--tier") && i+1 < argc) {
+             const char *t = argv[++i];
+             if      (!strcmp(t, "baseline")) tier = 0;
+@@ -3520,7 +3537,11 @@ int main(int argc, char **argv) {
+     unsigned retire_frames = 0, retire_peak_ms = 0, retire_total_ms = 0;
+     WResidentBuildTiming candidate_timing = {0};
+     unsigned finish_frames = 0, finish_peak_ms = 0, finish_total_ms = 0;
+-    const WResidentPolicy resident_policy = {1400.0f, 933.0f, 67.0f, 400.0f};
++    if (view_dist_arg > 0.0f)
++        g_dbg.fog_density = sqrtf(-logf(0.01f)) / view_dist_arg;   /* cutoff == M */
++    const WResidentPolicy resident_policy = view_dist_arg > 0.0f
++        ? (WResidentPolicy){view_dist_arg + 467.0f, view_dist_arg, 67.0f, 400.0f}
++        : (WResidentPolicy){1400.0f, 933.0f, 67.0f, 400.0f};
+     if (world2 && !world2_spawn_set) {
+         const char *stem = !strncmp(trackname,"STREAM",6) ? trackname+6 : trackname;
+         char companion_path[1024], stream_path[1024];
+diff --git a/src/rhi_gl.c b/src/rhi_gl.c
+index 7f90cec..f5164ee 100644
+--- a/src/rhi_gl.c
++++ b/src/rhi_gl.c
+@@ -531,6 +531,21 @@ RhiResult rhi_texture_upload(RhiTexture tex, int32_t face, int32_t level,
+         glTexImage2D(target, level, (GLint)fmt, w, h, 0, fmt, GL_UNSIGNED_BYTE, data);
+     }
+     work_unit_done(active);
++    {   /* OPENUG2_TEXSTAT=1: running total of texture bytes handed to GL (stderr,
++           every 32 MB crossed) -- memory sizing for low-RAM targets. */
++        static int on = -1; static unsigned long long total, next = 32ull << 20;
++        if (on < 0) on = getenv("OPENUG2_TEXSTAT") ? 1 : 0;
++        if (on) {
++            unsigned bpp = t->format == RHI_FORMAT_RGB8 ? 3 : 4;
++            total += format_compressed(t->format) ? size : (unsigned long long)w * h * bpp;
++            if (total >= next) {
++                fprintf(stderr, "[texstat] %llu MB uploaded (last %dx%d level %d fmt %d)\n",
++                        total >> 20, (int)w, (int)h, (int)level, (int)t->format);
++                fflush(stderr);
++                next = (total | ((32ull << 20) - 1)) + 1;
++            }
++        }
++    }
+     return gl_result();
+ }
+ 
