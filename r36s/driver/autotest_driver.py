@@ -362,7 +362,7 @@ BASE_FIELDS = ("ms", "gl", "wait", "swap", "dc", "frag", "calls")
 # run (base2 sampled the pre-race scene with "the last 100 of 420 frames").
 # Draws with 50+ indices are the marker: they are not what RECOMP_GL_EXP_DROPFRAG
 # removes, and not what the draw merging will change.
-RACE_BIG_DRAWS = 600    # dc - frag at or above this = the race scene
+RACE_BIG_DRAWS = 350    # dc - frag at or above this = the race scene (600 before PX_PCT: at 35 % the race has ~450, the pre-race scene ~290)
 BASE_SETTLE = 120       # frames to skip once the race scene shows up: its first
                         # ~100 frames are heavier (dc 2300 -> 2670 -> 2290, frame
                         # time 125 -> 170 -> 122 ms) before it settles
