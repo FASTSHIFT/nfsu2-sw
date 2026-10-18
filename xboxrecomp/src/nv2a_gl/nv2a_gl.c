@@ -2700,7 +2700,9 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     if (!s)
         return;
     s_drew_any = 1;
+    XTRACE_DRAW_MARK("d:surface");
     psh_key(r, &pk);
+    XTRACE_DRAW_MARK("d:psh_key");
     if (s_trace) {
         /* Texture modes not yet done in gl_psh.c: bump, dot product, cube. */
         static uint32_t seen[32];
@@ -2736,19 +2738,50 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     }
     if (!p)
         return;
+    XTRACE_DRAW_MARK("d:prog_get");
     s_hz_draws++;
     s_cs_draws++;
     s_draws_total++;
     if (b->index_count < 50)
         s_frag_total++;
     census_draw(&b->surface, pk.shader_program);
+    if (knob(KN_EXP_MERGESTAT)) {
+        /* How much a merge of consecutive same-state draws could save, by
+         * transform: a run continues while program, the 4 texture VAs, the
+         * surface, the primitive and the blend/alpha/depth/combiner registers
+         * stay the same. xform 0 (pre-transformed) runs need no constants. */
+        static const GlProg *lp;
+        static uint32_t lt[4], ls, lprim, lxf, lreg, lcg, n[3], runs[3], runs_c, frames;
+        uint32_t reg = 2166136261u, k;
+        int same;
+        for (k = 0x300 / 4; k < 0x380 / 4; k++) reg = (reg ^ r[k]) * 16777619u;
+        for (k = 0x260 / 4; k < 0x2A0 / 4; k++) reg = (reg ^ r[k]) * 16777619u;
+        for (k = 0xA60 / 4; k < 0xAA0 / 4; k++) reg = (reg ^ r[k]) * 16777619u;
+        same = p == lp && b->surface.color_va == ls && b->prim == lprim && b->xform == lxf && reg == lreg
+            && !memcmp(lt, b->tex_va, sizeof lt);
+        k = b->xform > 2 ? 2 : b->xform;
+        n[k]++;
+        if (!same) runs[k]++;
+        if (!same || b->vp_const_gen != lcg) runs_c++;   /* ... and the same constants */
+        lcg = b->vp_const_gen;
+        lp = p; memcpy(lt, b->tex_va, sizeof lt); ls = b->surface.color_va; lprim = b->prim;
+        lxf = b->xform; lreg = reg;
+        if (s_frame != frames) {
+            static uint32_t shown;
+            frames = s_frame;
+            if ((++shown % 60) == 0)
+                fprintf(stderr, "  [MERGE] per frame: xform0 %u draws in %u runs, xform1 %u in %u, prog %u in %u; %u runs if constants must match too\n",
+                        n[0] / 60, runs[0] / 60, n[1] / 60, runs[1] / 60, n[2] / 60, runs[2] / 60, runs_c / 60);
+            if ((shown % 60) == 0) memset(n, 0, sizeof n), memset(runs, 0, sizeof runs), runs_c = 0;
+        }
+    }
     if (knob(KN_EXP_STATIC))
         exp_static_draw(b, pk.shader_program);
     if (p->prog != s_cur_prog) {
         glUseProgram(p->prog);
         s_cur_prog = p->prog;
     }
-    XTRACE_DRAW_MARK("d:surface+program");
+    XTRACE_DRAW_MARK("d:useprogram");
 
     {
         uint32_t texs = s_hz_texs;

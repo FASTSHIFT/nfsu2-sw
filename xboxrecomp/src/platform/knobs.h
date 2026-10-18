@@ -59,6 +59,7 @@ enum {
     KN_PX_BIG,          /* PX_PCT leaves instances whose bounding radius (+6) is at least this many units alone: the sky dome, landmark buildings (0 = scale all) */
     KN_PX_STAT,         /* 1: log a histogram of the radii GetPixelSize sees, once (0) */
     KN_NATIVE_OFF,      /* bit mask: run the lifted body instead of the native override (bit 0 = bMulMatrix) (0) */
+    KN_EXP_MERGESTAT,   /* experiment: 1 = log per frame how many draws are pre-transformed and how many runs of them share program/textures/surface/state (0) */
     KN_COUNT
 };
 
