@@ -2336,7 +2336,77 @@ static void onepole_native(void)
         d[i] = (float)acc;
     } while (++i < n);
     MEMF(st) = (float)acc;
+    g_ebp = g_seh_ebp = esp - 4u;       /* the frame it published */
     esp += 4;
+}
+
+/* sub_0027A277: cdecl (obj, int n, const float *src, float *dst): a
+ * feedback comb on a delay line D = obj+0x1C + 4 * obj+0x24, in blocks of 4
+ * (ceil(n / 4) of them), SSE scalar floats, g = obj+0x2C, k = obj+0x30,
+ * K = 0x3700CC (a denormal guard):
+ *   y = g * D[j] + src[j] + K;  dst[j] = y * k + D[j];  then D[j] = y
+ * The four lanes' loads and stores in the original's order (dst could
+ * overlap D: never seen, but then it still matches). Leaves eax/edx/ecx as
+ * the original does. Called directly: replaced by name (_gen). */
+extern void sub_0027A277_gen(void);
+static void comb_native(void)
+{
+    uint32_t o = MEM32(esp + 4), n = MEM32(esp + 8), s = MEM32(esp + 12), d = MEM32(esp + 16);
+    uint32_t end = d + n * 4u, D = MEM32(o + 0x1C) + MEM32(o + 0x24) * 4u, sx = s;
+    const float K = MEMF(0x003700CCu);
+
+    if (d < end) {
+        sx = s + 8u;
+        do {
+            float x0, x1, x2, x3;
+            x0 = MEMF(o + 0x2C) * MEMF(D);      x0 = x0 + MEMF(sx - 8);
+            x1 = MEMF(o + 0x2C) * MEMF(D + 4);  x1 = x1 + MEMF(sx - 4);
+            x2 = MEMF(o + 0x2C) * MEMF(D + 8);  x2 = x2 + MEMF(sx);
+            x3 = MEMF(D + 12) * MEMF(o + 0x2C); x3 = x3 + MEMF(sx + 4);
+            x0 = x0 + K; MEMF(d)      = x0 * MEMF(o + 0x30) + MEMF(D);
+            x1 = x1 + K; MEMF(d + 4)  = x1 * MEMF(o + 0x30) + MEMF(D + 4);
+            x2 = x2 + K; MEMF(d + 8)  = x2 * MEMF(o + 0x30) + MEMF(D + 8);
+            x3 = x3 + K; MEMF(d + 12) = x3 * MEMF(o + 0x30) + MEMF(D + 12);
+            MEMF(D) = x0; MEMF(D + 4) = x1; MEMF(D + 8) = x2; MEMF(D + 12) = x3;
+            d += 16u; sx += 16u; D += 16u;
+        } while (d < end);
+        edx = sx;
+    } else
+        edx = MEM32(o + 0x1C);
+    eax = D;
+    ecx = o;
+    g_ebp = g_seh_ebp = esp - 4u;       /* the frame it published */
+    esp += 4;
+}
+
+void sub_0027A277(void)
+{
+    int mode = native_mode_mix();
+    uint32_t n = MEM32(esp + 8);
+    if (mode == 0)
+        sub_0027A277_gen();
+    else if (mode == 2 && n <= 16384) {
+        /* Both outputs: dst and the delay line. */
+        static unsigned long calls, bad;
+        static uint8_t kd[65536 + 16], kD[65536 + 16], md[65536 + 16], mD[65536 + 16];
+        uint32_t o = MEM32(esp + 4), d = MEM32(esp + 16), sp = esp;
+        uint32_t D = MEM32(o + 0x1C) + MEM32(o + 0x24) * 4u, bytes = (n + 3u) / 4u * 16u;
+        uint32_t r_eax, r_ecx, r_edx;
+        memcpy(kd, XBOX_PTR(d), bytes); memcpy(kD, XBOX_PTR(D), bytes);
+        comb_native();
+        r_eax = eax; r_ecx = ecx; r_edx = edx;
+        memcpy(md, XBOX_PTR(d), bytes); memcpy(mD, XBOX_PTR(D), bytes);
+        memcpy(XBOX_PTR(d), kd, bytes); memcpy(XBOX_PTR(D), kD, bytes);
+        esp = sp;
+        sub_0027A277_gen();
+        calls++;
+        if ((memcmp(md, XBOX_PTR(d), bytes) || memcmp(mD, XBOX_PTR(D), bytes)
+             || r_eax != eax || r_ecx != ecx || r_edx != edx) && bad++ < 20)
+            fprintf(stderr, "[native] sub_0027A277 comb mismatch (call %lu, n %u)\n", calls, n);
+        if (calls == 1 || (calls & 0x3FF) == 0)
+            fprintf(stderr, "[native] sub_0027A277 comb: %lu calls, %lu mismatches\n", calls, bad);
+    } else
+        comb_native();
 }
 
 /* sub_0027B5B5: cdecl (obj, int n, float *buf, int16_t *out), returns n:
