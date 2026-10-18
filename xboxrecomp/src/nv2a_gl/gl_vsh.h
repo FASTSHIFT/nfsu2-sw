@@ -14,6 +14,9 @@ int nv2a_gl_vsh_program(const uint32_t (*prog)[4], uint32_t slots,
 extern int nv2a_shader_vk;
 /* Nonzero: emit GLSL ES 3.00 (the GL renderer on an OpenGL ES context). */
 extern int nv2a_shader_es;
+/* 1: the vertex constants are a std140 block "VC" (binding 0) instead of a
+ * plain uniform array (RECOMP_GL_UBO, nv2a_gl.c). Set before the first shader. */
+extern int nv2a_shader_ubo;
 
 /* Declarations and helpers every vertex shader starts with. */
 const char *nv2a_gl_vsh_prelude(void);

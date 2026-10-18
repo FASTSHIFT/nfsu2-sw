@@ -143,6 +143,8 @@ static GlRing s_iring = { 0, GL_ELEMENT_ARRAY_BUFFER, 4 << 20, 0 };
 static int    s_vao_bound;                  /* bind_vao / bind_buf (ring_alloc) */
 static GLuint s_buf_bound[2];               /* ARRAY, ELEMENT_ARRAY */
 static int    ring_persist_init(void *(*getproc)(const char *));
+static int    s_ubo;                        /* RECOMP_GL_UBO (ubo_init) */
+static void   ubo_init(void *(*getproc)(const char *));
 /* Vertex formats and buffer bindings apart (ES 3.1 / GL 4.3 / ARB_vertex_attrib_binding):
  * a draw then rebinds one buffer offset instead of re-specifying every attribute
  * (glVertexAttribPointer x3 a draw). See vab_bind. */
@@ -881,6 +883,7 @@ typedef struct {
     Nv2aPshKey pkey;
     GLuint     prog;
     GLint      u_c, u_surf, u_aa, u_m, u_vpoff, u_xform, u_bgra;
+    int        c_block;         /* RECOMP_GL_UBO: the program reads the VC block */
     GLint      u_t[4], u_tscale, u_c0, u_c1, u_fc0, u_fc1, u_fogcolor, u_afunc, u_aref;
     uint32_t   used;
     int        vpc_valid;       /* vpc holds what this program's "c" was given */
@@ -1155,6 +1158,15 @@ static GlProg *prog_get(const Nv2aRawBatch *b, const Nv2aPshKey *pk)
     s_prog_head[bucket] = (int)(p - s_prog) + 1;
     last = p;
     p->u_c = glGetUniformLocation(p->prog, "c");
+    p->c_block = 0;
+    if (s_ubo) {
+        GLuint bi = glGetUniformBlockIndex(p->prog, "VC");
+        if (bi != GL_INVALID_INDEX) {
+            glUniformBlockBinding(p->prog, bi, 0);
+            p->c_block = 1;
+        }
+        p->u_c = -1;
+    }
     p->vpc_rows = p->u_c >= 0 && glGetUniformLocation(p->prog, "c[191]") == p->u_c + 191;
     {
         static int shown;
@@ -1308,6 +1320,7 @@ static int ready(void)
     }
     s_buf_bound[0] = s_vring.buf;
     s_buf_bound[1] = s_iring.buf;
+    ubo_init(SDL_GL_GetProcAddress);         /* before the first shader */
     if (nv2a_kms_init(s_win)) {  /* RECOMP_KMS_PRESENT: page flips, no swap */
         s_buf_bound[0] = s_buf_bound[1] = 0; /* it bound its own objects */
         tex_bind_forget();
@@ -1684,6 +1697,96 @@ static void ring_done(GlRing *g, GLintptr at, GLsizeiptr size, void *ptr,
         glUnmapBuffer(g->target);
     else if (fallback)
         glBufferSubData(g->target, at, size, fallback);
+}
+
+/* RECOMP_GL_UBO=1: the 192 vertex constants live in a uniform block that
+ * every program shares (binding 0), fed from a ring of 3 KB slots. A new
+ * constant version costs one copy and one glBindBufferRange, for whatever
+ * program draws next -- instead of glUniform4fv into each program's own
+ * default block, which the Mali blob then copies again at the draw (with
+ * the uploads skipped, glDrawElements went 28 -> 24 us). Persistent and
+ * fenced like the vertex rings when they are; else orphan + unsynchronized
+ * maps. */
+static GLuint     s_ubo_buf;
+static uint8_t   *s_ubo_map;
+static GLsizeiptr s_ubo_cap = 8 << 20, s_ubo_off;
+static GLint      s_ubo_align = 256;
+static GLsync     s_ubo_fence[RING_SEGS];
+static int        s_ubo_seg;
+static uint32_t   s_ubo_gen;                /* vp_const_gen in the bound slot; 0 = none */
+static unsigned long s_ubo_uploads;
+static void ubo_init(void *(*getproc)(const char *))
+{
+    const char *e = getenv("RECOMP_GL_UBO");
+    s_ubo = e && *e == '1';
+    nv2a_shader_ubo = s_ubo;
+    if (!s_ubo)
+        return;
+    glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &s_ubo_align);
+    if (s_ubo_align < 16) s_ubo_align = 16;
+    glGenBuffers(1, &s_ubo_buf);
+    glBindBuffer(GL_UNIFORM_BUFFER, s_ubo_buf);
+    if (s_persist) {
+        const GLbitfield fl = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+        PFN_glBufferStorageEXT storage = (PFN_glBufferStorageEXT)getproc("glBufferStorageEXT");
+        while (glGetError() != GL_NO_ERROR) { }
+        if (storage) {
+            storage(GL_UNIFORM_BUFFER, s_ubo_cap, NULL, fl);
+            s_ubo_map = (uint8_t *)glMapBufferRange(GL_UNIFORM_BUFFER, 0, s_ubo_cap, fl);
+            if (glGetError() != GL_NO_ERROR)
+                s_ubo_map = NULL;
+        }
+        if (!s_ubo_map) {                    /* an immutable store cannot be re-specified */
+            /* (the immutable one is left behind: one buffer, once) */
+            glGenBuffers(1, &s_ubo_buf);
+            glBindBuffer(GL_UNIFORM_BUFFER, s_ubo_buf);
+        }
+    }
+    if (!s_ubo_map)
+        glBufferData(GL_UNIFORM_BUFFER, s_ubo_cap, NULL, GL_STREAM_DRAW);
+    fprintf(stderr, "  [GL] vertex constants in a uniform block (RECOMP_GL_UBO): %ld KB ring, %s, align %d\n",
+            (long)(s_ubo_cap >> 10), s_ubo_map ? "persistent" : "mapped per upload", s_ubo_align);
+}
+static void ubo_upload(const float (*c)[4])
+{
+    const GLsizeiptr size = 192 * 16, seg = s_ubo_cap / RING_SEGS;
+    GLintptr at = (s_ubo_off + s_ubo_align - 1) & ~(GLintptr)(s_ubo_align - 1);
+    if (s_ubo_map) {
+        int end;
+        if (at + size > s_ubo_cap)
+            at = 0;
+        end = (int)((at + size - 1) / seg);
+        while (s_ubo_seg != end) {
+            int s = s_ubo_seg;
+            if (!s_ubo_fence[s])
+                s_ubo_fence[s] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+            s = (s + 1) % RING_SEGS;
+            s_ubo_seg = s;
+            if (s_ubo_fence[s]) {
+                glClientWaitSync(s_ubo_fence[s], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+                glDeleteSync(s_ubo_fence[s]);
+                s_ubo_fence[s] = 0;
+            }
+        }
+        memcpy(s_ubo_map + at, c, (size_t)size);
+    } else {
+        void *dst;
+        glBindBuffer(GL_UNIFORM_BUFFER, s_ubo_buf);
+        if (at + size > s_ubo_cap) {
+            glBufferData(GL_UNIFORM_BUFFER, s_ubo_cap, NULL, GL_STREAM_DRAW);
+            at = 0;
+        }
+        dst = glMapBufferRange(GL_UNIFORM_BUFFER, at, size, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+        if (dst) {
+            memcpy(dst, c, (size_t)size);
+            glUnmapBuffer(GL_UNIFORM_BUFFER);
+        } else {
+            glBufferSubData(GL_UNIFORM_BUFFER, at, size, c);
+        }
+    }
+    s_ubo_off = at + size;
+    glBindBufferRange(GL_UNIFORM_BUFFER, 0, s_ubo_buf, at, size);
+    s_ubo_uploads++;
 }
 
 /* Which vertex attribute arrays are enabled in s_vao (only this file
@@ -2674,6 +2777,10 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     memcpy(m, b->composite, sizeof m);
     XTRACE_DRAW_MARK("d:uni-prep");
 
+    if (p->c_block && b->vp_consts && b->vp_const_gen != s_ubo_gen) {
+        ubo_upload(b->vp_consts);              /* RECOMP_GL_UBO: shared by every program */
+        s_ubo_gen = b->vp_const_gen;
+    }
     /* 192 constants are 3 KB, and most draws in a row share them: upload
      * only when they changed since this program last got them. */
     if (p->u_c >= 0 && !(p->vpc_valid && p->vpc_gen == b->vp_const_gen)) {

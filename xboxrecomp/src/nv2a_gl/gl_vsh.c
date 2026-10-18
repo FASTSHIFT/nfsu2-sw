@@ -293,6 +293,19 @@ static const char s_vk_prelude[] =
 
 int nv2a_shader_vk;
 int nv2a_shader_es;
+int nv2a_shader_ubo;
+
+/* src with its c[] declaration made a uniform block (nv2a_shader_ubo). */
+static const char *ubo_decl(const char *src, char *buf, size_t cap)
+{
+    static const char plain[] = "uniform vec4 c[192];";
+    const char *m = nv2a_shader_ubo ? strstr(src, plain) : NULL;
+    if (!m)
+        return src;
+    snprintf(buf, cap, "%.*slayout(std140) uniform VC { vec4 c[192]; };%s",
+             (int)(m - src), src, m + sizeof plain - 1);
+    return buf;
+}
 
 /* OpenGL ES 3.00: no BGRA vertex format, so D3DCOLOR attributes arrive as
  * (B, G, R, A) and are put right here, per attribute, by the u_bgra mask.
@@ -353,16 +366,18 @@ static const char *gl_prelude(void);
 
 const char *nv2a_gl_vsh_prelude(void)
 {
-    static char es[8192];
+    static char es[8192], es_ubo[8448], gl_ubo[8448];
     if (nv2a_shader_vk)
         return s_vk_prelude;
     if (!nv2a_shader_es)
-        return gl_prelude();
+        return gl_ubo[0] ? gl_ubo : (nv2a_shader_ubo ? ubo_decl(gl_prelude(), gl_ubo, sizeof gl_ubo) : gl_prelude());
     if (!es[0]) {
         /* The desktop prelude minus its version line and inputs. */
         const char *body = strstr(gl_prelude(), "uniform vec4 c[192];");
         snprintf(es, sizeof es, "%s%s", s_es_head, body ? body : "");
     }
+    if (nv2a_shader_ubo)
+        return es_ubo[0] ? es_ubo : ubo_decl(es, es_ubo, sizeof es_ubo);
     return es;
 }
 

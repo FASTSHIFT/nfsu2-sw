@@ -34,6 +34,9 @@ typedef uint64_t      GLuint64;
 typedef struct __GLsync *GLsync;
 
 #define GL_MAP_PERSISTENT_BIT             0x0040
+#define GL_UNIFORM_BUFFER                 0x8A11
+#define GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT 0x8A34
+#define GL_INVALID_INDEX                  0xFFFFFFFFu
 #define GL_MAP_COHERENT_BIT               0x0080
 #define GL_SYNC_GPU_COMMANDS_COMPLETE     0x9117
 #define GL_SYNC_FLUSH_COMMANDS_BIT        0x00000001
@@ -197,6 +200,9 @@ X(GLboolean, glUnmapBuffer, (GLenum)) \
     X(GLsync, glFenceSync, (GLenum, GLbitfield)) \
     X(GLenum, glClientWaitSync, (GLsync, GLbitfield, GLuint64)) \
     X(void, glDeleteSync, (GLsync)) \
+    X(GLuint, glGetUniformBlockIndex, (GLuint, const GLchar *)) \
+    X(void, glUniformBlockBinding, (GLuint, GLuint, GLuint)) \
+    X(void, glBindBufferRange, (GLenum, GLuint, GLuint, GLintptr, GLsizeiptr)) \
     X(void, glVertexAttribPointer, (GLuint, GLint, GLenum, GLboolean, GLsizei, const void *)) \
     X(void, glEnableVertexAttribArray, (GLuint)) \
     X(void, glDisableVertexAttribArray, (GLuint)) \
@@ -335,6 +341,9 @@ static inline void nv2a_glClearDepth(double d)
 #define glFenceSync              NV2A_GLCALL(glFenceSync)
 #define glClientWaitSync         NV2A_GLCALL(glClientWaitSync)
 #define glDeleteSync             NV2A_GLCALL(glDeleteSync)
+#define glGetUniformBlockIndex   NV2A_GLCALL(glGetUniformBlockIndex)
+#define glUniformBlockBinding    NV2A_GLCALL(glUniformBlockBinding)
+#define glBindBufferRange        NV2A_GLCALL(glBindBufferRange)
 #define glVertexAttribPointer    NV2A_GLCALL(glVertexAttribPointer)
 #define glEnableVertexAttribArray NV2A_GLCALL(glEnableVertexAttribArray)
 #define glDisableVertexAttribArray NV2A_GLCALL(glDisableVertexAttribArray)
