@@ -988,12 +988,161 @@ void recomp_unimpl(const char *text, uint32_t va)
 extern void sub_001C6900_gen(void);
 void sub_001C6900(void)
 {
-    int pct;
+    int pct, big;
+    float r = MEMF(esp + 0xC);          /* cdecl (view, pos, radius + 6) */
     sub_001C6900_gen();
+    if (knob(KN_PX_STAT)) {
+        /* Radii seen, in powers of two, per 40000 calls. */
+        static unsigned long n[16], total, round;
+        int b = 0;
+        float v = r;
+        while (v >= 2.0f && b < 15) { v *= 0.5f; b++; }
+        n[b]++;
+        if (++total == 40000) {
+            int i;
+            fprintf(stderr, "  [PX] radius histogram (#%lu, 40000 calls):", ++round);
+            for (i = 0; i < 16; i++)
+                if (n[i]) fprintf(stderr, " <%d:%lu", 2 << i, n[i]);
+            fprintf(stderr, "\n");
+            memset(n, 0, sizeof n);
+            total = 0;
+        }
+    }
     pct = knob(KN_PX_PCT);
-    if (pct != 100) {
+    big = knob(KN_PX_BIG);
+    if (pct != 100 && !(big > 0 && r >= (float)big)) {
         int32_t px = (int32_t)eax;
         eax = (uint32_t)(int32_t)((int64_t)px * pct / 100);
     }
+}
+#endif
+#ifdef NFSU2_NATIVE_MATMUL
+/* ── bMulMatrix (0x002213EA), native ─────────────────────────
+ *
+ * stdcall (out, a, b), 4x4 floats, out = a * b row by row:
+ *   out[i] = ((a[i].x * b[0] + a[i].y * b[1]) + a[i].z * b[2]) + a[i].w * b[3]
+ * The lifted SSE goes through the thread-local xmm registers and four MEM32s
+ * per vector; it was 8.5 % of the game thread in a race (perf, R36S). Same
+ * operations in the same order, no FMA (x86 has none), all rows read before
+ * any is written (out may be a or b). xmm0-5 end as the original leaves them.
+ * RECOMP_MATMUL_VERIFY=1 also runs the lifted body and counts differences. */
+extern void sub_002213EA_gen(void);
+__attribute__((optimize("fp-contract=off")))
+void sub_002213EA(void)
+{
+    static int verify = -1;
+    uint32_t out = MEM32(esp + 4), a = MEM32(esp + 8), b = MEM32(esp + 0xC);
+    const volatile float *A = (const volatile float *)XBOX_PTR(a);
+    const volatile float *B = (const volatile float *)XBOX_PTR(b);
+    float bm[16], r[16], t2[4], t3[4];
+    int i, j;
+    if (knob(KN_NATIVE_OFF) & 1) {
+        sub_002213EA_gen();
+        return;
+    }
+    for (i = 0; i < 16; i++)
+        bm[i] = B[i];
+    for (i = 0; i < 4; i++) {
+        float x = A[4 * i], y = A[4 * i + 1], z = A[4 * i + 2], w = A[4 * i + 3];
+        for (j = 0; j < 4; j++) {
+            float s = x * bm[j];
+            float u = y * bm[4 + j];
+            float v = z * bm[8 + j];
+            float q;
+            s = s + u;
+            q = w * bm[12 + j];
+            s = s + v;
+            s = s + q;
+            r[4 * i + j] = s;
+            if (i == 3) { t2[j] = v; t3[j] = q; }
+        }
+    }
+    if (verify < 0) {
+        const char *e = getenv("RECOMP_MATMUL_VERIFY");
+        verify = e && *e == '1';
+    }
+    if (verify) {
+        static unsigned long calls, bad;
+        sub_002213EA_gen();               /* pops its own arguments */
+        calls++;
+        if (memcmp((const void *)XBOX_PTR(out), r, sizeof r) != 0 && bad++ < 8)
+            fprintf(stderr, "  [MATMUL] MISMATCH at call %lu\n", calls);
+        if ((calls & 0x3FFFF) == 0)
+            fprintf(stderr, "  [MATMUL] verified %lu calls, %lu mismatches\n", calls, bad);
+        return;
+    }
+    memcpy((void *)XBOX_PTR(out), r, sizeof r);
+    for (j = 0; j < 4; j++) {
+        xmm2.f[j] = r[j]; xmm3.f[j] = r[4 + j];
+        xmm4.f[j] = r[8 + j]; xmm5.f[j] = r[12 + j];
+        xmm0.f[j] = t2[j]; xmm1.f[j] = t3[j];
+    }
+    ecx = out;
+    eax = out;
+    esp += 16;                            /* ret 12 */
+}
+#endif
+#ifdef NFSU2_NATIVE_FTOL
+/* ── _ftol2 (0x002A68EC), native ─────────────────────────────
+ *
+ * MSVC's float -> int64 helper: st(0) -> edx:eax truncated toward zero,
+ * popped. It does fistp (round to nearest) and then corrects by the sign of
+ * the difference, which the lifted x87 emulation does with floor() and
+ * fmod() per call (585 call sites, 5 % of the game thread in a race). The
+ * correction makes the result trunc(x); out of range or NaN gives the
+ * integer indefinite 0x8000000000000000, as fistp does. ecx ends as the
+ * original leaves it. Only the default rounding mode is done natively.
+ * Knob NATIVE_OFF bit 1 runs the lifted body; RECOMP_FTOL_VERIFY=1 runs
+ * both and compares. */
+extern void sub_002A68EC_gen(void);
+void sub_002A68EC(void)
+{
+    static int verify = -1;
+    double *st = recomp_fp_base();
+    int top = recomp_fp_top_ld();
+    double x = st[top];
+    uint32_t r_eax, r_edx, r_ecx = ecx;
+    int64_t res;
+    if ((knob(KN_NATIVE_OFF) & 2) || ((g_fp_control_word >> 10) & 3) != 0) {
+        sub_002A68EC_gen();
+        return;
+    }
+    if (!isfinite(x) || x >= 9223372036854775808.0 || x < -9223372036854775808.0) {
+        res = INT64_MIN;
+    } else {
+        double rn = rint(x);             /* what fistp stored */
+        res = (int64_t)trunc(x);
+        if (rn != 0.0 && rn != -9223372036854775808.0) {   /* fistp's 0 / INT64_MIN skip the fix-up */
+            float d = (float)(x - rn);
+            uint32_t db;
+            memcpy(&db, &d, 4);
+            r_ecx = x < 0 || (x == 0 && signbit(x)) ? (db ^ 0x80000000u) + 0x7FFFFFFFu
+                                                     : db + 0x7FFFFFFFu;
+        }
+    }
+    r_eax = (uint32_t)(uint64_t)res;
+    r_edx = (uint32_t)((uint64_t)res >> 32);
+    if (verify < 0) {
+        const char *e = getenv("RECOMP_FTOL_VERIFY");
+        verify = e && *e == '1';
+    }
+    if (verify) {
+        static unsigned long calls, bad;
+        int top_after;
+        sub_002A68EC_gen();
+        top_after = recomp_fp_top_ld();
+        calls++;
+        if ((eax != r_eax || edx != r_edx || ecx != r_ecx || top_after != ((top + 1) & 7)) && bad++ < 8)
+            fprintf(stderr, "  [FTOL] MISMATCH x=%.17g: lifted %08X:%08X ecx %08X, native %08X:%08X ecx %08X\n",
+                    x, edx, eax, ecx, r_edx, r_eax, r_ecx);
+        if ((calls & 0xFFFFF) == 0)
+            fprintf(stderr, "  [FTOL] verified %lu calls, %lu mismatches\n", calls, bad);
+        return;
+    }
+    recomp_fp_top_st((top + 1) & 7);      /* fistp's pop */
+    eax = r_eax;
+    edx = r_edx;
+    ecx = r_ecx;
+    esp += 4;                             /* ret */
 }
 #endif

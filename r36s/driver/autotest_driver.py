@@ -363,6 +363,11 @@ BASE_FIELDS = ("ms", "gl", "wait", "swap", "dc", "frag", "calls")
 # Draws with 50+ indices are the marker: they are not what RECOMP_GL_EXP_DROPFRAG
 # removes, and not what the draw merging will change.
 RACE_BIG_DRAWS = 350    # dc - frag at or above this = the race scene (600 before PX_PCT: at 35 % the race has ~450, the pre-race scene ~290)
+RACE_AFTER = 250        # ... or this many frames after HUD live: at PX_PCT 10 the race can be under 350
+
+
+def is_race(i, f):
+    return f["dc"] - f["frag"] >= RACE_BIG_DRAWS or i >= RACE_AFTER
 BASE_SETTLE = 120       # frames to skip once the race scene shows up: its first
                         # ~100 frames are heavier (dc 2300 -> 2670 -> 2290, frame
                         # time 125 -> 170 -> 122 ms) before it settles
@@ -405,7 +410,7 @@ def do_baseline(timeout=BASE_TIMEOUT):
         if not game_pid():
             die("game process gone while sampling")
         fr = frames_after_hud()
-        race = [i for i, f in enumerate(fr) if f["dc"] - f["frag"] >= RACE_BIG_DRAWS]
+        race = [i for i, f in enumerate(fr) if is_race(i, f)]
         if len(race) >= BASE_SETTLE + BASE_STEADY:
             break
         time.sleep(2)
@@ -486,7 +491,7 @@ def do_sweep(specs, timeout=900):
         if not game_pid():
             die("game process gone before the sweep")
         fr = frames_after_hud()
-        if sum(1 for f in fr if f["dc"] - f["frag"] >= RACE_BIG_DRAWS) >= BASE_SETTLE:
+        if sum(1 for i, f in enumerate(fr) if is_race(i, f)) >= BASE_SETTLE:
             break
         time.sleep(2)
     else:
@@ -541,7 +546,7 @@ def do_trace(specs, pid, timeout=600):
         if not game_pid():
             die("game process gone before the trace")
         fr = frames_after_hud()
-        if sum(1 for f in fr if f["dc"] - f["frag"] >= RACE_BIG_DRAWS) >= BASE_SETTLE:
+        if sum(1 for i, f in enumerate(fr) if is_race(i, f)) >= BASE_SETTLE:
             break
         time.sleep(2)
     else:

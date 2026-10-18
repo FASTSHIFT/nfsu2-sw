@@ -112,6 +112,31 @@ if(_wrap_pxsize)
 else()
     message(STATUS "draw distance: PX_PCT off (gen has no sub_001C6900_gen; regen with tools/regen.sh, or -DNFSU2_WRAP_PXSIZE=ON)")
 endif()
+# Native bMulMatrix (sub_002213EA, src/recomp_manual.c): needs the lifted body
+# renamed sub_002213EA_gen, same rule as the two wraps above.
+set(NFSU2_NATIVE_MATMUL "AUTO" CACHE STRING "Native bMulMatrix: AUTO, ON or OFF")
+if(NFSU2_NATIVE_MATMUL STREQUAL "AUTO")
+    file(STRINGS "${NFSU2_GEN_DIR}/recomp_funcs.h" _matmul_gen
+         REGEX "^void sub_002213EA_gen\\(void\\);" LIMIT_COUNT 1)
+    set(_native_matmul ${_matmul_gen})
+else()
+    set(_native_matmul ${NFSU2_NATIVE_MATMUL})
+endif()
+if(_native_matmul)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_NATIVE_MATMUL=1)
+endif()
+# Native _ftol2 (sub_002A68EC): same rule.
+set(NFSU2_NATIVE_FTOL "AUTO" CACHE STRING "Native _ftol2: AUTO, ON or OFF")
+if(NFSU2_NATIVE_FTOL STREQUAL "AUTO")
+    file(STRINGS "${NFSU2_GEN_DIR}/recomp_funcs.h" _ftol_gen
+         REGEX "^void sub_002A68EC_gen\\(void\\);" LIMIT_COUNT 1)
+    set(_native_ftol ${_ftol_gen})
+else()
+    set(_native_ftol ${NFSU2_NATIVE_FTOL})
+endif()
+if(_native_ftol)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_NATIVE_FTOL=1)
+endif()
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 
 # Movies: VP6 decoded by FFmpeg instead of the lifted On2 decoder
