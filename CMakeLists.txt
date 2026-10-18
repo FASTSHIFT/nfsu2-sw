@@ -53,7 +53,10 @@ set(GAME_SOURCES
     src/recomp_manual.c
     src/autotest.c
     src/switch_nx.c
+    src/switch_saltynx.c
     src/text_patch.c
+    src/movie_crop.c
+src/nic.c
 )
 
 if(WIN32)
@@ -95,60 +98,6 @@ else()
                    "regen with tools/regen.sh, or -DNFSU2_WRAP_FENGHUD=ON)")
 endif()
 
-# Scenery draw distance (knob PX_PCT, docs/13): src/recomp_manual.c wraps
-# eView::GetPixelSize (sub_001C6900). Same rule as above: the gen dir needs the
-# renamed sub_001C6900_gen body (NFSU2_WRAP_PXSIZE=AUTO looks for it in
-# recomp_funcs.h; ON forces it for a hand-renamed gen copy).
-set(NFSU2_WRAP_PXSIZE "AUTO" CACHE STRING "Wrap eView::GetPixelSize for the PX_PCT knob: AUTO, ON or OFF")
-if(NFSU2_WRAP_PXSIZE STREQUAL "AUTO")
-    file(STRINGS "${NFSU2_GEN_DIR}/recomp_funcs.h" _pxsize_gen
-         REGEX "^void sub_001C6900_gen\\(void\\);" LIMIT_COUNT 1)
-    set(_wrap_pxsize ${_pxsize_gen})
-else()
-    set(_wrap_pxsize ${NFSU2_WRAP_PXSIZE})
-endif()
-if(_wrap_pxsize)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_WRAP_PXSIZE=1)
-else()
-    message(STATUS "draw distance: PX_PCT off (gen has no sub_001C6900_gen; regen with tools/regen.sh, or -DNFSU2_WRAP_PXSIZE=ON)")
-endif()
-# Native bMulMatrix (sub_002213EA, src/recomp_manual.c): needs the lifted body
-# renamed sub_002213EA_gen, same rule as the two wraps above.
-set(NFSU2_NATIVE_MATMUL "AUTO" CACHE STRING "Native bMulMatrix: AUTO, ON or OFF")
-if(NFSU2_NATIVE_MATMUL STREQUAL "AUTO")
-    file(STRINGS "${NFSU2_GEN_DIR}/recomp_funcs.h" _matmul_gen
-         REGEX "^void sub_002213EA_gen\\(void\\);" LIMIT_COUNT 1)
-    set(_native_matmul ${_matmul_gen})
-else()
-    set(_native_matmul ${NFSU2_NATIVE_MATMUL})
-endif()
-if(_native_matmul)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_NATIVE_MATMUL=1)
-endif()
-# Contrast ramp rebuild throttle (sub_000A3FA0, knob RAMP_EPS): same rule.
-set(NFSU2_WRAP_RAMP "AUTO" CACHE STRING "Wrap the contrast ramp rebuild: AUTO, ON or OFF")
-if(NFSU2_WRAP_RAMP STREQUAL "AUTO")
-    file(STRINGS "${NFSU2_GEN_DIR}/recomp_funcs.h" _ramp_gen
-         REGEX "^void sub_000A3FA0_gen\\(void\\);" LIMIT_COUNT 1)
-    set(_wrap_ramp ${_ramp_gen})
-else()
-    set(_wrap_ramp ${NFSU2_WRAP_RAMP})
-endif()
-if(_wrap_ramp)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_WRAP_RAMP=1)
-endif()
-# Native _ftol2 (sub_002A68EC): same rule.
-set(NFSU2_NATIVE_FTOL "AUTO" CACHE STRING "Native _ftol2: AUTO, ON or OFF")
-if(NFSU2_NATIVE_FTOL STREQUAL "AUTO")
-    file(STRINGS "${NFSU2_GEN_DIR}/recomp_funcs.h" _ftol_gen
-         REGEX "^void sub_002A68EC_gen\\(void\\);" LIMIT_COUNT 1)
-    set(_native_ftol ${_ftol_gen})
-else()
-    set(_native_ftol ${NFSU2_NATIVE_FTOL})
-endif()
-if(_native_ftol)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_NATIVE_FTOL=1)
-endif()
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 
 # Movies: VP6 decoded by FFmpeg instead of the lifted On2 decoder
@@ -261,7 +210,13 @@ if(NINTENDO_SWITCH)
     set(NFSU2_SWITCH_APP_NAME "NFS Underground 2 (Xbox recomp)" CACHE STRING
         "Title shown in the homebrew menu")
     set(NFSU2_SWITCH_AUTHOR "nfsu2-xbox" CACHE STRING "Author shown in the homebrew menu")
-    set(NFSU2_SWITCH_VERSION "0.3" CACHE STRING "Version shown in the homebrew menu")
+    # The release lives here, not in the cache: a cached default stays at
+    # whatever the build directory was first configured with (the 0.4.5 NRO
+    # said 0.4.3). -DNFSU2_SWITCH_VERSION_OVERRIDE=x sets another one.
+    set(NFSU2_SWITCH_VERSION "0.5.13")
+    if(NFSU2_SWITCH_VERSION_OVERRIDE)
+        set(NFSU2_SWITCH_VERSION "${NFSU2_SWITCH_VERSION_OVERRIDE}")
+    endif()
     set(NFSU2_SWITCH_ICON "${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.jpg" CACHE FILEPATH
         "256x256 JPEG icon (libnx default when empty)")
 

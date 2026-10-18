@@ -18,6 +18,7 @@
 #include <switch.h>
 
 #include <fcntl.h>
+#include <malloc.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -28,6 +29,10 @@
 #include <unistd.h>
 
 #include "apu_xaudio2.h"
+
+/* switch_saltynx.c: the frame rate for Status Monitor through SaltyNX. */
+void switch_saltynx_start(void);
+void switch_saltynx_stop(void);
 
 #define NFSU2_SWITCH_DIR "sdmc:/switch/nfsu2x"
 
@@ -240,14 +245,25 @@ void xbox_perf_sample(void);
 uint32_t nv2a_gl_program_count(void);
 int   mcpx_apu_frames_per_second(void);
 float mcpx_apu_utilization(void);
+void  xbox_vblank_report(double dt, char *buf, size_t n);   /* kernel_bridge.c */
 
 static void perf_report(void)
 {
     static uint32_t last_frames, last_seen;
     uint32_t f = nv2a_gl_frame_count();
-    fprintf(stderr, "[perf] %.1f fps, textures %llu MB, %u shader programs\n",
+    char vb[128];
+    xbox_vblank_report(10.0, vb, sizeof vb);
+    fprintf(stderr, "[perf] %.1f fps, textures %llu MB, %u shader programs, %s\n",
             (f - last_frames) / 10.0,
-            (unsigned long long)(nv2a_gl_texture_bytes() >> 20), nv2a_gl_program_count());
+            (unsigned long long)(nv2a_gl_texture_bytes() >> 20), nv2a_gl_program_count(), vb);
+    {
+        /* A slow-down that builds up over a long session (2026-10-05:
+         * heavy stutter after ~30 min until the game is restarted) would
+         * show here as a heap that keeps growing. */
+        struct mallinfo mi = mallinfo();
+        fprintf(stderr, "[perf] heap %u MB in use, %u MB free in the arena\n",
+                (unsigned)(mi.uordblks >> 20), (unsigned)(mi.fordblks >> 20));
+    }
     /* 1500 frames/s is real time; below it, movies (clocked by DirectSound's
      * play cursor) run slow. */
     fprintf(stderr, "[perf] APU %d frames/s (1500 = real time), frame thread %.0f%% busy\n",
@@ -752,6 +768,7 @@ static void loader_start(void) { }
 #endif
 
 static int s_prof_all;          /* RECOMP_NX_PROFILE=2 */
+static u64 s_prof_after;        /* RECOMP_NX_PROFILE_AFTER=<s>: ticks since boot */
 
 /* ── Sampling profiler (RECOMP_NX_PROFILE=1) ──────────────────────────
  *
@@ -809,6 +826,10 @@ static void prof_thread(void *arg)
         u64 now;
         svcSleepThread(1000000ull);
         now = armGetSystemTick();
+        if (now - s_t0 < s_prof_after) {             /* RECOMP_NX_PROFILE_AFTER */
+            t_flush = now;
+            continue;
+        }
         if (now - t_list > freq / 10) {             /* who is busy */
             u64 span = now - t_list;
             uintptr_t entry;
@@ -884,6 +905,10 @@ static void prof_start(void)
     if (!e || (*e != '1' && *e != '2'))
         return;
     s_prof_all = *e == '2';
+    /* Sample only from <s> seconds after boot: a problem that starts late
+     * in a long session (the 1 kHz file grows ~1 MB per 10 s). */
+    if ((e = getenv("RECOMP_NX_PROFILE_AFTER")) && atoi(e) > 0)
+        s_prof_after = (u64)atoi(e) * armGetSystemTickFreq();
     /* 0x2A: above every game and host thread, so it runs on time. */
     if (R_FAILED(threadCreate(&t, prof_thread, NULL, NULL, 0x4000, 0x2A, -2))
         || R_FAILED(threadStart(&t))) {
@@ -892,6 +917,241 @@ static void prof_start(void)
     }
     fprintf(stderr, "[prof] sampling busy threads at 1 kHz into prof.bin (NRO base %p)\n",
             (void *)&_start);
+}
+
+/* ── Clocks ───────────────────────────────────────────────────────
+ *
+ * NFSU2_CPU_MHZ / NFSU2_GPU_MHZ / NFSU2_MEM_MHZ in nfsu2x_env.txt: run the
+ * CPU, GPU and memory at that clock (the closest the hardware lists, never
+ * above the request; capped at 1785 / 921.6 / 1600 MHz). Unset = the
+ * system's (CPU 1020 MHz in every official profile that has a usable GPU).
+ * The CPU is what limits this port: the game thread, the pushbuffer
+ * executor and the GL/Vulkan thread are all CPU-bound. Through clkrst
+ * (8.0.0+) or pcv, as sys-clk does; the old rates come back on exit. The
+ * system resets clocks on dock/undock, after sleep and when the game comes
+ * back from the HOME menu, so a thread applies them again every second
+ * while the game has focus, and every 250 ms for 5 s after any focus,
+ * dock or performance-mode change (applet hook). It runs at a high priority:
+ * at the lowest (0x3F) the busy guest threads (0x3B) on its core starved it
+ * and the clocks stayed at the system's after HOME. More heat and battery:
+ * opt-in.
+ *
+ * Clock managers (sys-clk "sys:clk", Horizon OC "hoc:clk") set clocks
+ * themselves -- Horizon OC puts stock rates back every tick when the game has
+ * no profile -- and fighting them every second froze consoles (issue #25).
+ * So: when one is running, the NFSU2_*_MHZ lines are ignored (the manager's
+ * profile rules; NFSU2_CLOCK_FORCE=1 overrides); a rate already at or above
+ * the request is left alone, at boot and later (never lower someone else's
+ * overclock); and a module that is put back more than 5 times in 30 s with
+ * no dock/focus/sleep change in between is given up to whoever does it. */
+static struct {
+    const char *env, *name;
+    PcvModule mod;
+    PcvModuleId id;
+    u32 cap_hz, want_hz, old_hz, set_hz;
+    int open, fights;
+    u64 fight_t0;
+    ClkrstSession s;
+} s_clk[3] = {
+    { "NFSU2_CPU_MHZ", "CPU", PcvModule_CpuBus, PcvModuleId_CpuBus, 1785000000u },
+    { "NFSU2_GPU_MHZ", "GPU", PcvModule_GPU,    PcvModuleId_GPU,    921600000u },
+    { "NFSU2_MEM_MHZ", "memory", PcvModule_EMC, PcvModuleId_EMC,    1600000000u },
+};
+static int s_clk_rst = -1;                 /* 1 clkrst, 0 pcv, -1 not up */
+static volatile int s_clk_stop;
+static Thread s_clk_thread;
+static int s_clk_thread_up;
+static UEvent s_clk_wake;
+static AppletHookCookie s_clk_hook;
+
+static Result clk_get(int i, u32 *hz)
+{
+    return s_clk_rst ? clkrstGetClockRate(&s_clk[i].s, hz) : pcvGetClockRate(s_clk[i].mod, hz);
+}
+
+static Result clk_set(int i, u32 hz)
+{
+    return s_clk_rst ? clkrstSetClockRate(&s_clk[i].s, hz) : pcvSetClockRate(s_clk[i].mod, hz);
+}
+
+/* The highest listed rate not above want (want itself when there is no list). */
+static u32 clk_pick(int i, u32 want)
+{
+    u32 rates[64], best = 0;
+    s32 n = 0;
+    PcvClockRatesListType type;
+    Result rc = s_clk_rst
+        ? clkrstGetPossibleClockRates(&s_clk[i].s, rates, 64, &type, &n)
+        : pcvGetPossibleClockRates(s_clk[i].mod, rates, 64, &type, &n);
+    if (R_FAILED(rc) || n <= 0 || type != PcvClockRatesListType_Discrete)
+        return want;
+    for (s32 k = 0; k < n; k++)
+        if (rates[k] <= want && rates[k] > best)
+            best = rates[k];
+    return best ? best : want;
+}
+
+/* Is another process serving this name? (sys-clk's own check: registering
+ * it fails with "already registered".) Any other refusal counts as no. */
+static int clk_service_running(const char *name)
+{
+    Handle h;
+    Result rc = smRegisterService(&h, smEncodeName(name), false, 1);
+    if (R_SUCCEEDED(rc)) {
+        smUnregisterService(smEncodeName(name));
+        svcCloseHandle(h);
+        return 0;
+    }
+    return rc == MAKERESULT(21, 4);       /* sm: AlreadyRegistered */
+}
+
+static void clk_restore(void)
+{
+    int i;
+    if (s_clk_rst < 0)
+        return;
+    s_clk_stop = 1;
+    appletUnhook(&s_clk_hook);
+    ueventSignal(&s_clk_wake);
+    if (s_clk_thread_up) {
+        threadWaitForExit(&s_clk_thread);
+        threadClose(&s_clk_thread);
+        s_clk_thread_up = 0;
+    }
+    for (i = 0; i < 3; i++)
+        if (s_clk[i].set_hz && s_clk[i].old_hz)
+            clk_set(i, s_clk[i].old_hz);
+    for (i = 0; i < 3; i++)
+        if (s_clk[i].open)
+            clkrstCloseSession(&s_clk[i].s);
+    if (s_clk_rst)
+        clkrstExit();
+    else
+        pcvExit();
+    s_clk_rst = -1;
+}
+
+/* Runs on the thread that pumps applet messages (SDL's event loop). */
+static void clk_hook(AppletHookType hook, void *param)
+{
+    (void)param;
+    if (hook == AppletHookType_OnFocusState || hook == AppletHookType_OnOperationMode
+        || hook == AppletHookType_OnPerformanceMode || hook == AppletHookType_OnResume)
+        ueventSignal(&s_clk_wake);
+}
+
+static void clk_keeper(void *arg)
+{
+    unsigned logged = 0, fast = 0;
+    u64 freq = armGetSystemTickFreq();
+    (void)arg;
+    while (!s_clk_stop) {
+        if (R_SUCCEEDED(waitSingle(waiterForUEvent(&s_clk_wake),
+                                   fast ? 250000000ull : 1000000000ull)))
+            fast = 20;
+        else if (fast)
+            fast--;
+        if (s_clk_stop || appletGetFocusState() != AppletFocusState_InFocus)
+            continue;
+        for (int i = 0; i < 3; i++) {
+            u32 hz = 0;
+            u64 now;
+            if (!s_clk[i].set_hz || R_FAILED(clk_get(i, &hz)) || hz == s_clk[i].set_hz)
+                continue;
+            if (hz > s_clk[i].set_hz) {
+                printf("[clock] %s raised to %u MHz by someone else: left to them\n",
+                       s_clk[i].name, hz / 1000000u);
+                s_clk[i].set_hz = 0;
+                continue;
+            }
+            /* The system's own resets come with an applet event (fast > 0);
+             * a reset without one is another program setting clocks. */
+            now = armGetSystemTick();
+            if (!fast) {
+                if (!s_clk[i].fights || now - s_clk[i].fight_t0 > 30 * freq) {
+                    s_clk[i].fights = 0;
+                    s_clk[i].fight_t0 = now;
+                }
+                if (++s_clk[i].fights > 5) {
+                    printf("[clock] %s keeps going back to %u MHz: another clock tool "
+                           "is running, leaving %s to it\n", s_clk[i].name, hz / 1000000u,
+                           s_clk[i].name);
+                    s_clk[i].set_hz = 0;
+                    continue;
+                }
+            }
+            clk_set(i, s_clk[i].set_hz);
+            if (logged++ < 8)
+                printf("[clock] %s was reset to %u MHz, back to %u MHz\n", s_clk[i].name,
+                       hz / 1000000u, s_clk[i].set_hz / 1000000u);
+        }
+    }
+}
+
+static void clk_apply(void)
+{
+    int i, any = 0;
+    for (i = 0; i < 3; i++) {
+        const char *e = getenv(s_clk[i].env);
+        double mhz = e ? atof(e) : 0;
+        s_clk[i].want_hz = mhz > 0 ? (u32)(mhz * 1e6 + 0.5) : 0;
+        if (s_clk[i].want_hz > s_clk[i].cap_hz)
+            s_clk[i].want_hz = s_clk[i].cap_hz;
+        any |= s_clk[i].want_hz != 0;
+    }
+    if (!any)
+        return;
+    {
+        const char *f = getenv("NFSU2_CLOCK_FORCE");
+        const char *tool = clk_service_running("hoc:clk") ? "Horizon OC"
+                         : clk_service_running("sys:clk") ? "sys-clk" : NULL;
+        if (tool && !(f && *f == '1')) {
+            printf("[clock] %s is running: NFSU2_*_MHZ ignored, set clocks in its "
+                   "profile (NFSU2_CLOCK_FORCE=1 overrides)\n", tool);
+            return;
+        }
+    }
+    if (hosversionAtLeast(8, 0, 0) && R_SUCCEEDED(clkrstInitialize()))
+        s_clk_rst = 1;
+    else if (R_SUCCEEDED(pcvInitialize()))
+        s_clk_rst = 0;
+    else {
+        printf("[clock] neither clkrst nor pcv is available: clocks unchanged\n");
+        return;
+    }
+    for (i = 0; i < 3; i++) {
+        u32 hz = 0, now = 0;
+        Result rc;
+        if (!s_clk[i].want_hz)
+            continue;
+        if (s_clk_rst) {
+            if (R_FAILED(rc = clkrstOpenSession(&s_clk[i].s, s_clk[i].id, 3))) {
+                printf("[clock] %s: no clkrst session (0x%X)\n", s_clk[i].name, rc);
+                continue;
+            }
+            s_clk[i].open = 1;
+        }
+        clk_get(i, &s_clk[i].old_hz);
+        hz = clk_pick(i, s_clk[i].want_hz);
+        if (s_clk[i].old_hz >= hz) {
+            printf("[clock] %s already at %u MHz (asked %u): left alone\n", s_clk[i].name,
+                   s_clk[i].old_hz / 1000000u, s_clk[i].want_hz / 1000000u);
+            continue;
+        }
+        rc = clk_set(i, hz);
+        clk_get(i, &now);
+        if (R_SUCCEEDED(rc))
+            s_clk[i].set_hz = now ? now : hz;
+        printf("[clock] %s %u -> %u MHz (asked %u)%s\n", s_clk[i].name,
+               s_clk[i].old_hz / 1000000u, now / 1000000u, s_clk[i].want_hz / 1000000u,
+               R_FAILED(rc) ? " -- refused" : "");
+    }
+    atexit(clk_restore);
+    ueventCreate(&s_clk_wake, true);
+    appletHook(&s_clk_hook, clk_hook, NULL);
+    if (R_SUCCEEDED(threadCreate(&s_clk_thread, clk_keeper, NULL, NULL, 0x4000, 0x2C, -2))
+        && R_SUCCEEDED(threadStart(&s_clk_thread)))
+        s_clk_thread_up = 1;
 }
 
 void switch_boot(void)
@@ -927,12 +1187,36 @@ void switch_boot(void)
                         : "applet mode: launch via a game title (hold R) for full memory",
                (unsigned long)(total >> 20), (unsigned long)(used >> 20));
     }
+    clk_apply();
+    switch_saltynx_start();
     loader_start();
     prof_start();
 }
 
+void switch_error_dialog(const char *msg, const char *details)
+{
+    AppletType at = appletGetAppletType();
+    Result rc;
+    log_flush(1);
+    if (at == AppletType_Application || at == AppletType_SystemApplication) {
+        ErrorApplicationConfig c;
+        rc = errorApplicationCreate(&c, msg, details);
+        if (R_SUCCEEDED(rc))
+            rc = errorApplicationShow(&c);
+    } else {
+        ErrorSystemConfig c;
+        rc = errorSystemCreate(&c, msg, details);
+        if (R_SUCCEEDED(rc))
+            rc = errorSystemShow(&c);
+    }
+    if (R_FAILED(rc))
+        fprintf(stderr, "[switch] error applet failed (0x%X)\n", rc);
+}
+
 void switch_shutdown(void)
 {
+    switch_saltynx_stop();
+    clk_restore();
     log_flush(1);
     socketExit();
 }

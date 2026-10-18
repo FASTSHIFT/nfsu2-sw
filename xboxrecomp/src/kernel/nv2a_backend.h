@@ -40,6 +40,7 @@ typedef struct {
     uint32_t pitch;             /* bytes per row */
     uint32_t bytes_per_pixel;   /* 2 or 4 */
     uint32_t aa_sx, aa_sy;      /* 1 or 2 each */
+    uint32_t clip_x, clip_y;    /* clip rectangle origin, real pixels */
 } Nv2aSurface;
 
 /* A texture as the title programmed it. uv in Nv2aVertex are in texels. */
@@ -143,6 +144,12 @@ typedef struct {
      * changes whenever any of them does (never 0). */
     float           attr_const[NV2A_RAW_ATTRS][4];
     uint32_t        attr_const_gen;
+    /* Vertex-memory epoch: changes at every semaphore release and trap
+     * (after which the title may reuse buffers the GPU has finished with)
+     * and around every inline-array batch. Two batches with equal epochs
+     * and equal direct[] pointers read the same vertex bytes, so a back end
+     * may reuse what it uploaded for the first (instancing). */
+    uint32_t        vtx_epoch;
 } Nv2aRawBatch;
 
 /* Resolve a DMA offset the title programmed (texture, surface) to a guest VA. */
@@ -165,6 +172,11 @@ typedef struct {
 /* draw_raw takes attributes in their stored format (Nv2aRawBatch.attr_direct).
  * RECOMP_GL_DIRECT=0 turns it off at run time. */
 #define NV2A_BACKEND_RAW_DIRECT 0x1u
+
+/* Optional, set by the game project: sees every raw batch just before the
+ * back end gets it and may change it. attrs is rb->attrs, writable; an
+ * attribute moved from attr_direct to attrs[] must have its bit cleared. */
+extern void (*nv2a_raw_batch_hook)(Nv2aRawBatch *rb, float *attrs);
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts
  * submitting work; the executor must also be enabled (RECOMP_PB_EXEC). */

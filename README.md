@@ -1,13 +1,113 @@
-# Need for Speed: Underground 2 — Xbox static recompilation
+<div align="center">
 
-The Xbox (NTSC-U) release of NFSU2, lifted to C with
-[xboxrecomp](https://github.com/sp00nznet/xboxrecomp) and built for Linux and
-Nintendo Switch homebrew (libnx NRO).
+<img src="https://cdn2.steamgriddb.com/logo/4b29fa4efe4fb7bc667c7b301b74d52d.png" alt="Need for Speed: Underground 2" width="520">
 
-No game data is included. You need your own copy of the disc, extracted
-(`default.xbe`, `NFSUNDER/`, ...).
+### Xbox static recompilation for Nintendo Switch and Linux
 
-## Layout
+The original Xbox (NTSC-U) release of **Need for Speed: Underground 2**, lifted
+instruction by instruction to C and running natively, with no emulator.
+
+![Switch](https://img.shields.io/badge/Nintendo%20Switch-homebrew-E60012?logo=nintendoswitch&logoColor=white)
+![Linux](https://img.shields.io/badge/Linux-x86__64-FCC624?logo=linux&logoColor=black)
+![Vulkan](https://img.shields.io/badge/Vulkan-1.3-AC162C?logo=vulkan&logoColor=white)
+![OpenGL](https://img.shields.io/badge/OpenGL-renderer-5586A4?logo=opengl&logoColor=white)
+![Version](https://img.shields.io/badge/version-0.5.10-blue)
+
+[Features](#-features) · [Playing on Switch](#-playing-on-switch) · [Building](#%EF%B8%8F-building) · [Configuration](#%EF%B8%8F-configuration) · [Status](#-status)
+
+</div>
+
+---
+
+> [!IMPORTANT]
+> **No game data is included.** You need your own copy of the Xbox disc,
+> extracted (`default.xbe`, `NFSUNDER/`, ...).
+
+## ✨ Features
+
+- 🏁 **Native code**: the whole game runs as recompiled C, built with
+  [xboxrecomp](https://github.com/sp00nznet/xboxrecomp)
+- 🎮 **Two renderers**: Vulkan (NVK on Switch) and OpenGL, with render scaling
+  up to 4x
+- 📺 **Widescreen 16:9** by default, using the game's own wide mode
+- 🪞 **Car reflections** (Vulkan), switchable in the game's
+  **Options → Video → Car Reflections**; Off also skips the six reflection
+  passes the game draws every race frame
+- 🔍 **Resolution Scale** in **Options → Video** (Vulkan): 1x, 1.5x
+  (default), 2x, 2.5x, applied at once
+- 🖼️ **Cleaner picture** (Vulkan): mipmaps with trilinear and anisotropic
+  filtering, mipmapped car reflections, FXAA, square pixels in 16:9 races
+  (1280x720 at 1.5x); **Anti-Aliasing**, **Anisotropic** (Off-16x) and
+  **Square Pixels** in **Options → Video**
+- 🎬 **Full-screen movies** decoded with FFmpeg (VP6)
+- 🔊 **Audio** through an emulated Xbox APU, with 5.1 downmixed to stereo
+- 👥 **Two-player split screen**, with Joy-Con pairs or one sideways Joy-Con
+  per player
+- 📳 **Rumble** on Switch HD rumble and SDL controllers, strength set in
+  **Options → Gameplay → Vibration** (Off, 10%-100%)
+- 🔤 **Switch wording** in the menus (Start → `+`, no Xbox Live or hard-disk
+  names)
+- 💾 Saves stay next to the game in `game/UDATA`; the **Options → Audio**
+  volumes (the Xbox game never saved them) are kept in `nfsu2x_options.txt`
+
+## 🕹️ Playing on Switch
+
+1. Copy the NRO to `sdmc:/switch/nfsu2x/` (`nfsu2x-vulkan.nro` for the Vulkan
+   build).
+2. Copy the **extracted** disc (not the ISO) to `sdmc:/switch/nfsu2x/game/`.
+3. Start it with **title takeover**: hold **R** while launching any game.
+   Applet mode leaves too little memory.
+
+```
+sdmc:/switch/nfsu2x/
+├── nfsu2x-vulkan.nro
+├── nfsu2x_env.txt      optional settings, KEY=VALUE per line
+├── nfsu2x_options.txt  written by the in-game options the port adds and
+│                       the Audio volumes
+└── game/
+    ├── default.xbe
+    └── ...
+```
+
+Buttons map by label (Switch A = Xbox A). Settings go in `nfsu2x_env.txt`
+(see [Configuration](#%EF%B8%8F-configuration)) and the log is written to the
+same folder.
+
+## 🛠️ Building
+
+<details open>
+<summary><b>1. Lift the XBE to C</b></summary>
+
+```sh
+# Writes NFSU2_GEN_DIR (default /root/nfsu2x/gen)
+NFSU2_XBE=/path/to/game/default.xbe NFSU2_GEN_DIR=/path/to/gen tools/regen.sh
+```
+
+</details>
+
+<details open>
+<summary><b>2a. Linux</b> (SDL2 + OpenGL or Vulkan)</summary>
+
+```sh
+cmake -S . -B build -G Ninja -DNFSU2_GEN_DIR=/path/to/gen   # add -DNFSU2_VULKAN=ON for Vulkan
+cmake --build build
+NFSU2_GAME_DIR=/path/to/game build/nfsu2_recomp
+```
+
+</details>
+
+<details open>
+<summary><b>2b. Nintendo Switch</b> (devkitA64, switch-sdl2, switch-mesa)</summary>
+
+```sh
+NFSU2_GEN_DIR=/path/to/gen NFSU2_GAME_SRC=/path/to/game switch/build.sh
+# Vulkan build (needs mesa-switch NVK and glslang for Switch)
+VULKAN=1 JOBS=6 NFSU2_GEN_DIR=/path/to/gen switch/build.sh
+```
+
+</details>
+
+### Project layout
 
 | Path | What |
 |---|---|
@@ -15,38 +115,25 @@ No game data is included. You need your own copy of the disc, extracted
 | `src/recomp_manual.c` | hand-written overrides of lifted functions |
 | `src/switch_nx.c` | Switch log device, env file, exception handler, loading screen |
 | `config/seed_functions.json` | entry points the static pass cannot see |
-| `xboxrecomp/` | the toolkit (MIT), vendored with this port's changes: NV2A OpenGL renderer, SDL audio, Switch platform layer, translator fixes |
+| `xboxrecomp/` | the toolkit (MIT), vendored with this port's changes: NV2A renderers (Vulkan, OpenGL), SDL audio, Switch platform layer, translator fixes |
 | `tools/regen.sh` | XBE → lifted C (`gen/`, never committed) |
 | `switch/build.sh` | Switch NRO build + SD-card staging |
 
-## Build
-
-```sh
-# 1. Lift the XBE to C (writes NFSU2_GEN_DIR, default /root/nfsu2x/gen)
-NFSU2_XBE=/path/to/game/default.xbe NFSU2_GEN_DIR=/path/to/gen tools/regen.sh
-
-# 2a. Linux (SDL2 + OpenGL)
-cmake -S . -B build -G Ninja -DNFSU2_GEN_DIR=/path/to/gen
-cmake --build build
-NFSU2_GAME_DIR=/path/to/game build/nfsu2_recomp
-
-# 2b. Nintendo Switch (devkitA64, switch-sdl2, switch-mesa)
-NFSU2_GEN_DIR=/path/to/gen NFSU2_GAME_SRC=/path/to/game switch/build.sh
-```
-
-On the Switch the NRO reads the **extracted** disc from
-`sdmc:/switch/nfsu2x/game/`. Launch it with title takeover (hold R on a game)
-for full memory. Runtime switches go in `sdmc:/switch/nfsu2x/nfsu2x_env.txt`
-(`KEY=VALUE` per line), and the log is written to `sdmc:/switch/nfsu2x/`.
-
-## Environment variables
+## ⚙️ Configuration
 
 On Linux these are ordinary environment variables. On the Switch they go in
 `sdmc:/switch/nfsu2x/nfsu2x_env.txt`, one `KEY=VALUE` per line (`#` starts a
 comment). Anything left out runs at its default, which is the fastest normal
-configuration. Most of the list is for debugging.
+configuration. Most of the list is for debugging, so the sections below are folded.
 
-### Build and code generation
+```ini
+# sdmc:/switch/nfsu2x/nfsu2x_env.txt
+RECOMP_GL_SCALE=1.5
+RECOMP_WIDESCREEN=0
+```
+
+<details>
+<summary><b>Build and code generation</b></summary>
 
 | Variable | Meaning |
 |---|---|
@@ -65,7 +152,10 @@ configuration. Most of the list is for debugging.
 | `NVK_SDK`, `GLSLANG_DIR` | `switch/build.sh` with `VULKAN=1`: mesa-switch NVK install and Switch glslang. |
 | `FFMPEG_DIR` | `switch/build.sh`: LGPL VP6-only FFmpeg for the movies (`tools/build_ffmpeg_vp6.sh`). |
 
-### Game and host
+</details>
+
+<details>
+<summary><b>Game and host</b></summary>
 
 | Variable | Meaning |
 |---|---|
@@ -73,14 +163,19 @@ configuration. Most of the list is for debugging.
 | `NFSU2_GL=0` | Use the executor's CPU renderer instead of the GPU renderer. |
 | `NFSU2_APU=0` | With `RECOMP_AC97_READY=plain`: no emulated APU (no sound). |
 | `NFSU2_SIM_STEPS` | Longest game-time step per frame, in 1/60 s (default 6 = 100 ms; 3 = the original 50 ms cap, which slows races below 20 fps). |
+| `NFSU2_FPS_CAP=30` | Keep the game's 30 fps cap in races and the open world (default: uncapped, up to 60 fps). |
 | `NFSU2_NATIVE_VP6` | Movie decoder: 1 = FFmpeg (default when built with it), 0 = the lifted decoder, 2 = both and compare. |
+| `NFSU2_MOVIE_FLASH=1` | Keep the opening trailer's white flash frames (shown black by default). |
 | `NFSU2_SWITCH_TEXT` | Switch wording in the menus (Start → +, no Xbox Live/hard-disk names): 1 on (Switch default), 0 off. |
 | `NFSU2_EXIT_TRACE=1` | Print the guest state at exit. |
 | `RECOMP_WIDESCREEN=0` | Tell the game the TV is 4:3 (default 16:9). |
 | `RECOMP_CMDLINE` | Command line handed to the title (e.g. `+map intro`). |
 | `HOME`, `XDG_DATA_HOME` | Linux: fallback save directory (`$XDG_DATA_HOME/xboxrecomp`, else `~/.local/share/xboxrecomp`) when none is configured. NFSU2's own saves go to `<game>/UDATA`. |
 
-### Switch (Horizon)
+</details>
+
+<details>
+<summary><b>Switch (Horizon)</b></summary>
 
 | Variable | Meaning |
 |---|---|
@@ -95,7 +190,10 @@ configuration. Most of the list is for debugging.
 | `RECOMP_NX_JOYCON_ROTATE=0` | Don't rotate the sideways Joy-Con stick. |
 | `RECOMP_GUEST_ONE_CORE` | 1 = pin guest threads to one core, 2 = guest threads only (interrupts float). |
 
-### Scheduling and kernel
+</details>
+
+<details>
+<summary><b>Scheduling and kernel</b></summary>
 
 | Variable | Meaning |
 |---|---|
@@ -114,12 +212,15 @@ configuration. Most of the list is for debugging.
 | `XBOX_LOG_LEVEL` | Kernel log level (0 errors … trace). |
 | `RECOMP_KERNEL_LOG_BUDGET` | Kernel calls logged before the log goes quiet. |
 
-### Graphics (GL and Vulkan renderers)
+</details>
+
+<details>
+<summary><b>Graphics (GL and Vulkan renderers)</b></summary>
 
 | Variable | Meaning |
 |---|---|
 | `RECOMP_PB_EXEC` | Execute the NV2A pushbuffer (default 1; the title draws through it). |
-| `RECOMP_GL_SCALE` | Render resolution multiple, 0.5..4 (fractions allowed). |
+| `RECOMP_GL_SCALE` | Render resolution multiple, 0.5..4 (fractions allowed). Vulkan: only until Options → Video → Resolution Scale is changed (default there 1.5x). |
 | `RECOMP_GL_THREAD=1` | GL renderer: GL calls on their own thread. |
 | `RECOMP_GL_DIRECT=0` | Convert every vertex to float4 instead of uploading it as stored. |
 | `RECOMP_GL_DXT=0` | Decode DXT textures on the CPU instead of uploading them compressed. |
@@ -132,6 +233,13 @@ configuration. Most of the list is for debugging.
 | `RECOMP_GL_TRACE=1` | Shader sources and compile/link errors. |
 | `RECOMP_GL_FINISH=1` | Wait for the GPU after every operation (finds the call that hangs it). |
 | `RECOMP_FPS_LOG=1` | Presented frames per 10 s. |
+| `RECOMP_VK_MIPS=0` | Vulkan: no mipmaps (distant textures shimmer, the old look). |
+| `RECOMP_VK_ANISO` | Vulkan: anisotropic filtering, 1..16 (default 16; 1 = off). |
+| `RECOMP_VK_LOD_BIAS` | Vulkan: mip bias, negative = sharper (default -0.25). |
+| `RECOMP_VK_FXAA=0` | Vulkan: no FXAA (plain scaled blit to the screen). |
+| `RECOMP_VK_SQUARE=0` | Vulkan: in 16:9, no extra 4/3 columns for square pixels (races 960x720 instead of 1280x720 at 1.5x). |
+| `RECOMP_GL_SCALE_X` | Vulkan: a different horizontal scale (absolute; Resolution Scale keeps the ratio). |
+| `RECOMP_VK_CUBE=0` | Vulkan: no cube maps (car reflections off), whatever Options → Video says. |
 | `RECOMP_VK_HEADLESS=1` | Vulkan on Linux: no window (also implied by `SDL_VIDEODRIVER=offscreen`). |
 | `RECOMP_VK_VALIDATION=1` | Vulkan on Linux: Khronos validation layer. |
 | `RECOMP_VK_TRACE=<n>` | Vulkan: name every step of the first n draws/clears/flips. |
@@ -141,7 +249,10 @@ configuration. Most of the list is for debugging.
 | `RECOMP_FFP_TRACE`, `RECOMP_SKIP_TRACE`, `RECOMP_TRACE_FLIP=<n>`, `RECOMP_PB_EXEC_VERBOSE`, `RECOMP_PB_UNHANDLED_ALL`, `RECOMP_PB_SCAN`, `RECOMP_NV2A_TRACE`, `RECOMP_RASTER_TEST`, `RECOMP_FIND_NAN`, `RECOMP_FIND_QUAD` | Pushbuffer / NV2A debugging traces. |
 | `RECOMP_FMV_HOST`, `RECOMP_FMV_DUMP=<prefix>` | Host-side movie player (off) and movie frame dumps. |
 
-### Audio
+</details>
+
+<details>
+<summary><b>Audio</b></summary>
 
 | Variable | Meaning |
 |---|---|
@@ -156,7 +267,10 @@ configuration. Most of the list is for debugging.
 | `RECOMP_APU_TRACE=1` | Front-end methods and a per-second voice summary (disturbs the audio itself). |
 | `RECOMP_APU_RING_STATS=1` | Stale ring-voice reads every 10 s (Linux; always on in the Switch `[perf]` report). |
 
-### Input
+</details>
+
+<details>
+<summary><b>Input</b></summary>
 
 | Variable | Meaning |
 |---|---|
@@ -171,7 +285,10 @@ configuration. Most of the list is for debugging.
 | `RECOMP_RUMBLE=0` | No rumble. |
 | `RECOMP_RUMBLE_TRACE=1`, `RECOMP_INPUT_DIAG=1`, `RECOMP_KEY_TRACE=1`, `RECOMP_USB_TRACE=1` | Input debugging traces. |
 
-### Debugging
+</details>
+
+<details>
+<summary><b>Debugging</b></summary>
 
 | Variable | Meaning |
 |---|---|
@@ -188,9 +305,24 @@ configuration. Most of the list is for debugging.
 | `RECOMP_TRACE_ARGS=<n>`, `RECOMP_TRACE_DEREF=1`, `RECOMP_TRACE_BUDGET`, `RECOMP_TRACE_PROFILE=1` | Function-entry traces (functions chosen at regen) and a call profile. |
 | `RECOMP_FORCE_RETURN` | Read but currently has no effect. |
 
-## Status
+</details>
+## 🚦 Status
 
-- Linux: boot, movies, profile, Main Menu, Quick Race and Career, with audio.
-- Switch hardware: boot, movies, profile load/create, Main Menu, races.
+| Platform | State |
+|---|---|
+| 🐧 Linux | Boot, movies, profile, Main Menu, Quick Race and Career, with audio |
+| 🎮 Switch hardware | Boot, movies, profile load/create, Main Menu, races |
 
-`CLAUDE.md` holds the detailed engineering notes.
+Still open: cube maps on OpenGL (Vulkan has them: car reflections), bump/dot-product texture modes, fixed-function
+lighting.
+
+## 📚 More
+
+- [`CLAUDE.md`](CLAUDE.md): detailed engineering notes
+- [`PERF_NOTES.md`](PERF_NOTES.md): performance work and measurements
+- [`VULKAN_NOTES.md`](VULKAN_NOTES.md): the Vulkan renderer
+
+<div align="center">
+<sub>Need for Speed and Underground are trademarks of Electronic Arts. This is
+an unofficial fan project, not affiliated with or endorsed by EA or Microsoft.</sub>
+</div>

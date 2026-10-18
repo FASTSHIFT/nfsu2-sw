@@ -9,6 +9,10 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
 
 ## Rules
 
+- **Renderer work goes into Vulkan only** (nv2a_vk.c, user's call
+  2026-10-06). Don't spend time on nv2a_gl: no new features or fixes there.
+  Shared shader code (gl_psh.c/gl_vsh.c) may get VK-only paths
+  (`nv2a_shader_vk`); keep the GL output unchanged.
 - Never commit game data (disc, `default.xbe`, `switch_sd/`) or generated C
   (`gen/`). Ask before committing or pushing anything.
 - The Switch build reads the **unpacked** disc at `sdmc:/switch/nfsu2x/game/`,
@@ -167,6 +171,28 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   profile 71.6% of the APU thread in that wait, APU 1124-1480 frames/s ->
   audio stutter. voice_lock now sets its bits atomically, without d->lock
   (the handover remains only for apu_mixer_play).
+- **Light line along the top and left edge** (open world/races, some
+  weather; fixed 2026-10-02, GL and VK): the glow passes draw a clip-space
+  full-screen triangle, and D3D's viewport offset is 320.53125/240.53125, so
+  its edge sat at 0.53125 > GL's pixel centre 0.5 -> row/column 0 of the
+  glow accumulator (0x82C17280) were never rewritten, and the composite
+  added that stale edge to screen row/column 1. NV2A snaps screen positions
+  to 1/16 px by truncation (xemu roundScreenCoords): `nv2a_snap` in
+  gl_vsh.c's nv2a_clip.
+  Came back with RECOMP_GL_SCALE > 1 (fixed 2026-10-05): the snap is in
+  title pixels, but real pixel 0's centre is at 0.5/k there, so the 0.5
+  edge still missed it. `u_surf.w` = 0.5 - 0.5*w/pw shifts positions so
+  each title pixel's first real centre sits on i + 0.5. A/B at 2x: real
+  row/column 1 mean 170 vs 30 without, flat with.
+  At k >= 2 no constant shift fits every edge (fixed 2026-10-19, v0.5.13,
+  VK only): square pixels at 1.5x store 2x columns, and an edge on a whole
+  title pixel landed on the centre of the last real column it should cover
+  -> the motion blur's 320x240 copies (0x82EBA380/0x82F05400 ring) lost
+  their last column, and the blur pulled black in at the right of the
+  screen, stronger with speed (Carbon had it too). NV2A_SNAP_VK_GLSL now
+  moves each position by the smallest d that gives 1x coverage (0 where
+  possible, half-pixel edges keep 0.5 - 0.5/k). `RECOMP_VK_DUMP_ALL=1`
+  dumps every surface next to each RECOMP_GL_DUMP frame.
 - prof.bin sample times are 16 bits of 10 ms and wrap every 655 s;
   prof_report.py unwraps them (--time on long runs was empty before).
 - **Files:** no `open()` on directories (`XBOX_DIR_FD` sentinel); FAT can't
@@ -199,6 +225,16 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   (`xbox_nx_pad_rumble`: left = low band 160 Hz, right = high band 320 Hz,
   handheld + player 1), SDL rumble on Linux. Only changes are sent.
   `RECOMP_RUMBLE=0` off, `RECOMP_RUMBLE_TRACE=1` logs each change.
+  Strength: Options -> Gameplay -> Vibration Off/10%..100% (2026-10-11,
+  recomp_manual.c sub_000CEA00 wrapper, same row recipe as Video; scales
+  both motors in usb_gamepad_output via `usb_gamepad_rumble_pct`; saved as
+  vibration=<pct> in nfsu2x_options.txt). Texts (text_patch.c s_always):
+  "Keyboard Configuration" -> Vibration, Crowds/High/Medium/Refresh/World
+  Detail/Particle System/Game Filters/Wheel Options x2/Wheel Configuration
+  -> 10%..100% (each hash only in the 28 string tables). Linux path: Main
+  Menu (after the profile OK, b is harmless) right x6 -> a (Options opens
+  on Audio) -> right x2 (Gameplay) -> a -> down x7; FE input lags a few s
+  under lavapipe, so space presses 2-5 s apart.
 - **Render scale:** `RECOMP_GL_SCALE=<k>` (0.5..4, fractions like 1.5 ok;
   nv2a_gl.c and nv2a_vk.c) stores every surface at that multiple, rounded
   (`GlSurf/VkSurf.pw/ph`; `w/h` stay the title's pixels
@@ -217,15 +253,35 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   (root ports 1 and 2), routed by the ED's function address; pad 2 is
   plugged/unplugged as host pad 1 (Switch No2, SDL's second pad) comes and
   goes, after pad 1 is addressed. Switch: player 1 = handheld + No1, player 2
-  = No2; `RECOMP_NX_JOYCON=single` = one sideways Joy-Con per player
+  = No2, but with No2 empty handheld and No1 are two players -- without the
+  controller applet a second Joy-Con pair joining a handheld console lands in
+  No1 (it used to be player 1 too: "+ on the second pair does nothing").
+  Log `[NX] pads: player 1 = ...; player 2 = ...` on every change; `RECOMP_NX_JOYCON=single` = one sideways Joy-Con per player
   (`RECOMP_NX_JOYCON_ROTATE=0` if the stick comes out turned twice).
   `RECOMP_USB_PADS=1` = one pad; `RECOMP_USB_PORT2` moves pad 2.
   `RECOMP_PAD2_SCRIPT` scripts pad 2 (and keeps it plugged); log `PADn: step`.
   NFSU2: Main Menu -> right -> "2 Player Split-Screen"; at car select the
   players are whoever presses **Start** first ("Player One/Two Press START",
-  A does not count). Linux 2026-09-30: split-screen race starts with both
-  HUDs, but the GL renderer draws the 3D world black in split screen (open).
+  A does not count). **Black 3D in split screen (fixed 2026-10-01, GL and
+  VK):** each player's view is drawn with SET_SURFACE_CLIP = its 640x240
+  half, the HUD with 640x480. Surfaces were keyed by (address, clip size),
+  so every clip change rebuilt -- and cleared -- the back buffer; and the
+  clip was not a scissor. Now a surface is clip origin + size and only
+  grows, draws are scissored to the clip (like xemu), and a render target
+  sampled as a smaller texture gets its texcoords scaled (`rt_scale`).
   Menu dumps run ~60 frames/s: RECOMP_GL_DUMP=<p>,61 is about one a second.
+- **Audio volumes not kept (issue #21, fixed 2026-10-13, recomp_manual.c
+  sub_00076A70 wrapper):** the Xbox game never saves them. The six
+  sliders are floats in the options object 0x406CA0 (block at 0x406CE8:
+  menu music +0x08, game music +0x0C, speech +0x04, sfx +0x10, tires
+  +0x18, engine +0x14; a static constructor fills them after boot), and
+  the profile writer sub_001371B0 copies the object around that block.
+  Now menu_music=/game_music=/speech=/sfx=/tires=/engine= (0..1) in
+  nfsu2x_options.txt, put back at the first sub_00076A70 call (profile
+  apply, sub_00141070), saved when a slider changes one. Log
+  `[options] volumes ... (restored)`. Linux path to Audio: Main Menu right
+  x6 -> a -> a; Profile Manager is left of Options (Save = right x2, two
+  Yes/No boxes that default to No).
 - Buttons map by label (Switch A = Xbox A); `RECOMP_PAD_LAYOUT=position`
   swaps to Xbox positions. Y opens the in-game Help box, closed with B.
 
@@ -296,6 +352,143 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   (w < 0) got z = 0 instead of ~w and skewed depth across the eye plane;
   now clamped only when w > 0. Found on lavapipe by reading one pixel back
   after every draw (GL vs VK, same frame) -- an ad-hoc probe, not in tree.
+- **Black loading screen main menu -> Career / Quick Race (fixed
+  2026-10-01, GL and VK):** nv2a_pb_exec_method wrote methods of every
+  subchannel into the 3D register shadow. The loading screen's draws then
+  had culling on (cull FRONT, front CW -- the menu car's state; menu 2D
+  draws have it off), and its quads are CW, so all were culled. Likely
+  culprit: NV062 SET_OFFSET_SOURCE = 0x0308 = SET_CULL_FACE_ENABLE from a
+  blit (not traced per method). The old swapped VK winding had hidden it.
+  Only subchannel 0 goes into the shadow now.
+- **Instancing (2026-10-05, nv2a_vk.c, `RECOMP_VK_INSTANCE=0` off, `=2`
+  alternates per frame for A/B dumps):** ~25-30% of race draws repeat the
+  previous one with only the transform constants changed. The first is
+  recorded up to vkCmdDrawIndexed and held (`s_pend`); repeats append their
+  192 constants behind it in the ring (binding 6, `c[nv2a_ib + i]`,
+  nv2a_ib = gl_InstanceIndex * 192, up to 16); any other draw/clear/flip
+  issues it with the count. "Repeat" = no register change except the
+  upload windows/per-draw methods (executor dirty blocks), same program,
+  vertex pointers, indices, textures, and same `Nv2aRawBatch.vtx_epoch`
+  (bumped at semaphore releases, traps, inline batches). Drag start line on
+  lavapipe: 1790 -> 1250 draw calls, 21.2 -> 24.5 fps; A/B frames identical
+  but the timer digits; validation clean. `RECOMP_DRAW_STATS=1` logs
+  `[vk] per frame: draws -> draw calls`.
+- **Car reflections = cube maps (2026-10-06, Vulkan only):** car paint and
+  glass use texture mode 3 (CUBE_MAP) on stage 1 (shader program 0x01061),
+  which read black before. SET_TEXTURE_FORMAT bit 2 = cube; faces +X..-Z
+  follow each other, each with its mip chain, padded to 128 bytes. Menu:
+  static 256x256 cube from disc (0x812E7200). Races: a dynamic 128x128
+  cube (0x83095680) the title renders as six 128x128 surfaces (face stride
+  0x10000) every frame; nv2a_vk assembles it from those surfaces with
+  vkCmdBlitImage when a face's `VkSurf.gen` changed (`cube_from_surfaces`).
+  gl_psh.c emits samplerCube + texture(tN, vTN.xyz) only for VK; GL still
+  black. Lavapipe menu/race frames show reflections, validation clean.
+- **Options -> Video -> Car Reflections On/Off, Resolution Scale (2026-10-08,
+  recomp_manual.c, `s_rows`):** the Xbox Video screen (sub_000CE8D0) only had the
+  Screen Size slider; rows are appended, built like the Gameplay
+  rows (0x54 bytes, sub_0012AF20, sub_0015B2E0) with a copy of the
+  Speedometer Units vtable (0x34EFD0) in xbox_ContiguousAlloc memory: its
+  handler/refresh (sub_000B5140/sub_000B51A0) are wrapped and act only for
+  that vtable. Label = PC's unused "Car Reflection Detail" (0x8FE9288E),
+  renamed "Car Reflections" by text_patch.c's s_always on every build
+  (Switch wording stays gated). Off = `nv2a_vk_cube_maps` 0 (cube stages
+  sample black) + no cube-face passes: the PC update-rate scheduler
+  sub_0009B720 rewrites the six EnvMap views' active bytes (+8, pointers
+  at 0x3F2AD0) every frame from a schedule at 0x39CE20, so the wrapper
+  clears them after it (clearing once at setup did nothing). Drag line on
+  lavapipe: 126 -> 0 cube-face draws, ~1240 -> ~1145 draw calls a frame.
+  Resolution Scale (Vulkan builds only): 1x/1.5x/2x/2.5x, default 1.5x,
+  `nv2a_vk_scale_pct`; at the next flip nv2a_vk.c `rescale_surfaces`
+  rebuilds every surface at the new stored size, blitting its pixels over
+  (kept render targets don't go black; `gen` bumped so cubes refill), and
+  drops the depth buffers. RECOMP_GL_SCALE only rules until the row is
+  changed (no `scale=` saved). Texts: PC-only strings renamed in every
+  language by text_patch.c s_always ("Car Geometry Detail" -> label,
+  "Road Reflection Detail"/"Motion Blur"/"Level Of Detail"/"Widescreen" ->
+  1x/1.5x/2x/2.5x; each hash only in the 28 string tables on disc, not in
+  code). Options load at boot (main.c `nfsu2_options_load`).
+  Stored in nfsu2x_options.txt (`reflections=0/1`, `scale=<percent>`,
+  sdmc:/switch/nfsu2x/ or the working directory), not the profile.
+  Validation clean toggling and over 12 rescales.
+- **Picture quality from NFSU1 0.2.5 (2026-10-09, nv2a_vk.c, Vulkan only):**
+  textures had one level (maxLod 0): the guest's level count (format
+  [19:16]) is honoured, DXT uploads the title's levels, decoded formats get
+  GPU blits (gen_mips); MIN 3..6 samplers are trilinear + anisotropic
+  (16x, LOD bias -0.25); dynamic reflection cubes mipmapped; present is
+  one FXAA 3.11 draw. RECOMP_VK_MIPS / _ANISO / _LOD_BIAS / _FXAA.
+  Square pixels (per-axis scale, u_snap_y in gl_vsh.c's VK block): in
+  widescreen, surfaces with aa_sx 1 get 4/3 the columns (race back buffer
+  640x480 at 1.5x -> 1280x720 instead of 960x720); the front end's
+  1280x480 (aa 2x1) is left alone. RECOMP_VK_SQUARE=0 off,
+  RECOMP_GL_SCALE_X sets the horizontal scale outright. Also from
+  NFSU1: nv2a_pb_exec_run (constant/ARRAY_ELEMENT16 runs in one loop, the
+  survey only under RECOMP_PB_SCAN), swizzle tables, textures decoded
+  straight into the ring, vertex input re-sent only on change. Merged by
+  taking NFSU1's nv2a_vk.c and re-adding NFSU2's stored_size/
+  rescale_surfaces/nv2a_vk_scale_pct and nv2a_vk_cube_maps.
+  Options -> Video rows (recomp_manual.c s_rows, Vulkan build only):
+  Anti-Aliasing Off/On (nv2a_vk_fxaa), Anisotropic Off/2x/4x/8x/16x
+  (nv2a_vk_aniso; level in sampler key bits 20..24), Square Pixels Off/On
+  (nv2a_vk_square, applied at the next flip by rescale_surfaces); saved as
+  fxaa=/aniso=/square= in nfsu2x_options.txt; env switches still force
+  each off. Labels from PC-only strings (text_patch.c s_always): "Full
+  Screen Anti-Aliasing", "Horizon Fog", "Depth Of Field" -> labels, "Car
+  Shadow"/"Light Trails"/"Light Glow" -> 4x/8x/16x (each hash only in the
+  28 string tables, 0 refs in the XBE). The Video screen's colour-
+  calibration panel (FE objects ColorCal_Logo/ColorCal_Blurb/
+  Colour_Calibration_Backing) covered list rows 5+: hidden after the
+  screen is built (sub_00118CE0). Menu path on Linux: Main Menu -> right
+  until Options (last, no wrap) -> a -> right (Video) -> a.
+- **Neon through the car (issue #32, 0.5.5-0.5.8, fixed 2026-10-14):**
+  Square Pixels widened surfaces by AA mode (aa_sx 1 -> 4/3 columns), but
+  depth_get keys depth by zeta *and* stored size. The garage draws the car
+  into the 1280x480 aa 2x1 back buffer and the neon into a 1280-wide target
+  without AA on the same Z -> different stored widths -> the neon got an
+  empty depth buffer. Now the 4/3 is by width only (w < 1280). Square
+  Pixels Off on the console confirmed it. The renderer also starts at the
+  option's scale (nv2a_vk_scale_pct, 1.5x default) instead of 1x + a
+  rescale at the first flip. Square Pixels also gives surfaces >= 1280
+  wide 2/3 of the scale (2026-10-18): the 1280x480 aa 2x1 front end was
+  1920x720 at 1.5x, now 1280x720 like the races (FlatOut 2: by aa_sx). Console save with the neon 240SX:
+  /root/nfsu2x/game_neon (Career -> Resume Career -> right x2 -> car select).
+- **Races/open world uncapped (2026-10-14, v0.5.9, recomp_manual.c
+  sub_002F22F0 wrapper):** NFSU2 sets D3D's presentation interval
+  (0x2F76FC) to 2 there; Present (sub_002EB4B0/002EB6A0) packs it into the
+  flip NOP trap word, (bits << 5) | 1 (bits 1/2/3 = 1/2/4 vblanks, 8 =
+  immediate when late), and sub_002F2080 case 1 schedules the flip that many
+  vblanks after the last. The PGRAPH wrapper rewrites the interval in
+  TRAPPED_DATA to 1 -> up to 60 fps. `NFSU2_FPS_CAP=30` keeps the title's.
+  Log `[fps] flip interval 2 -> 1 vblank (uncapped)`. Console confirmed.
+  Scripted camera sequences (NIS: race intro, entering/leaving shops)
+  step per frame and ran 2x fast uncapped (fixed 2026-10-19, v0.5.13):
+  the sequence object 0x38DBA0 has three "playing" slots +0x10/+0x28/+0x40
+  (sub_0003F540/sub_0003F760; found by diffing .data over a race intro);
+  while one is set the title's interval stays (`nis_playing`, log
+  `[fps] camera sequence playing/over`, NFSU2_NIS_CAP=0 off). Race intro
+  checked on Linux; shops on the console.
+- **Renderer optimisations from PR #26 (2026-10-18, v0.5.12, nv2a_vk.c):**
+  (1) draws with the alpha test off/ALWAYS use a fragment shader without its
+  discard (`nv2a_gl_psh_no_alpha_test`, PipeKey.nat, made on first use;
+  vkpipes.bin records it in the old pad word) -> early Z; RECOMP_VK_NAT=0.
+  (2) `pass_barrier`: full barrier only after copies/clears/blits (and at
+  each command buffer start), an attachment/fragment barrier when the pass
+  depends on earlier draws, none otherwise; RECOMP_VK_SYNC=0 = every pass.
+  Race on lavapipe: 21 full -> 4 full + 11 gfx + 6 skipped per frame.
+  (3) present on a worker thread (Switch default, RECOMP_VK_ASYNC_PRESENT=0
+  off): NVK waits for the GPU inside vkQueuePresentKHR; present_drain()
+  before any queue/swapchain call. (4) uniform blocks/constants reused by
+  exact bytes within a command buffer, descriptors pushed only for changed
+  bindings (present_fxaa's push resets that); RECOMP_VK_STATE_CACHE=0.
+  Descriptor writes ~11.3k -> ~1.9k a frame. RECOMP_DRAW_STATS=1 shows all.
+  Console: renders correctly; fps A/B not measured yet.
+- **Off-screen batches skipped in the executor** (2026-10-05, nv2a_pb_exec.c,
+  `RECOMP_CULL=0` off, `RECOMP_CULL_CHECK=1` verifies each rejection with
+  the CPU interpreter, `RECOMP_CULL_TRACE=1` per program): the box of
+  attribute 0 through the transform at 8 corners; vertex programs are
+  sliced to what oPos.xyw needs and typed (affine / linear-fractional), the
+  XDK form (dp4 rows + rcc + mul + mad) evaluated directly. Only ~5% of the
+  drag-line draws (the "half draw nothing" are occluded, not off screen);
+  ~0.4 us/draw on x86.
 - **Eden cannot run NVK** (2026-09-29): instance, device, swapchain (only
   IMMEDIATE; FIFO creation hangs) and command recording work, but no GPU
   submission ever completes -- vktest's first fence times out (also with
@@ -346,6 +539,10 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   filter as float32 plus its registers once a second; v0F4 = menu music.
   Still open: `cvtss2si` is lifted as a truncating cast (x86 rounds), 41
   sites -- not this bug, but wrong.
+- **Engine/speech only on the left (fixed 2026-10-03):** the stubbed-EP
+  mixdown (apu_dsp.c) sent even bins left, odd right, so the EA mixer's
+  C/LFE voice v0F5 (bins 2/3: engine, speech) was centre -> left only.
+  Centre, LFE and I3DL2 (bin 10) now go to both sides at -3 dB (`s_downmix`).
 - APU IRQ 5 was raised on Windows only (`#if _WIN32` in apu_core.c) -> no
   DirectSound voice ever started elsewhere.
 - NFSU2 mixes in software (EA engine, thread `sub_00274CA0`) into three 50 ms
@@ -402,12 +599,32 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   sub_0026144D reports). Planes are bottom-up, Y stride +0x1B8 / UV +0x1BC,
   offsets +0x21C/+0x220/+0x224, 48/24-pixel border (left unfilled).
   `NFSU2_NATIVE_VP6=0` lifted decoder, `=2` both + compare (Linux: 2100
-  frames bit-exact). FFmpeg is a minimal **LGPL** build, vp6 decoder only
+  frames bit-exact). The YUV -> A8R8G8B8 row converter `sub_0025ECB4`
+  (MMX tables at 0x3D0810/1010/1810, called by sub_0025F0B7 per row) stays
+  after FFmpeg; native in recomp_manual.c since 2026-10-01 (bit-exact,
+  RECOMP_NATIVE=0 / RECOMP_NATIVE_CHECK=1). FFmpeg is a minimal **LGPL** build, vp6 decoder only
   (`tools/build_ffmpeg_vp6.sh switch|linux` -> /root/nfsu2x/ffmpeg-vp6-*;
   CMake `-DNFSU2_FFMPEG_DIR`, switch/build.sh `FFMPEG_DIR`). devkitPro's
   switch-ffmpeg is `--enable-gpl` -- don't link it. Log: `[movie] VP6: n
   frames, x ms average`. Linux x86 (plain C): ~1 ms/frame.
-- (Before the FFmpeg decoder) movie decoding ran on the game thread: MMX IDCT `sub_0026EB34`, MC
+- Movies: ealogo, THX_LOGO, PSA, FMVOpening (trailer before Press Start);
+  names logged by the sub_00129610 wrapper (`[movie] MOVIES\\...`). In 16:9
+  src/movie_crop.c (via `nv2a_raw_batch_hook`, executor -> GL/VK) scales
+  the player's quad (clip x +-1, vertex program, 0.675 of the width) by
+  1/0.675 so every movie fills the screen (since 2026-10-05; before, only
+  FMVOpening). The disc has 28 MVhd streams (ZZDATA0-2); only FMVOpening is
+  letterboxed, the rest are full 4:3 and lose ~65 rows top/bottom (user's
+  choice: crop, not stretch). Quads not at x +-1 are left alone.
+  NFSU2_MOVIE_CROP=0 off, NFSU2_MOVIE_TRACE=1 logs movie draws.
+- **White flashes in FMVOpening** (2026-10-06): the trailer cuts between
+  its clips with 1-3 flat white frames (luma ~235, in the VP6 data itself;
+  no white between the movies on Linux). movie_vp6.c shows a frame whose
+  middle half is all luma >= 200 as luma 16 (title's buffers only, FFmpeg's
+  reference untouched). `NFSU2_MOVIE_FLASH=1` keeps them; off in
+  NFSU2_NATIVE_VP6=2. `RECOMP_VK_CUBE=0` turns the car reflections off.
+- **Version** (CMakeLists.txt `NFSU2_SWITCH_VERSION`) is a plain variable
+  since 0.5: as a CACHE default the 0.4.5 NRO still said 0.4.3.
+- (Before the FFmpeg decoder) movie decoding ran on the game thread: MMX IDCT `sub_0026EB34`, YUV->RGB
   `sub_0025ECB4`, `sub_0026FBB1` (Linux perf of the movies). The translator
   keeps registers of MMX *leaf* functions in shadowing C locals
   (`_localize_leaf_registers`, `recomp_leaf_ld_*`/`st_*`; 21 functions,
@@ -554,6 +771,90 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   the jp branch). RECOMP_NATIVE=0 off, RECOMP_NATIVE_CHECK=1 runs both:
   0 mismatches in 8.4M + 3.1M calls over a Linux race. ~40% of the
   culling calls carry a matrix.
+- **FPS drop at some map points (2026-10-01; easiest: Quick Race -> Drag ->
+  Coastal Express start line):** a long sightline, ~2300 draws a frame (vs
+  ~930 once the camera moves, ~1500 in circuit races), about half of them
+  0 samples (behind walls / off screen; game culling, not ours:
+  RECOMP_NATIVE=0 gives the same counts). Game thread, executor and GL
+  thread all ~2x per frame. The track is locked in the test profile: the
+  console save (005213381338) is in /root/nfsu2x/game_drag (symlinks + own
+  UDATA). Path: Main Menu a, right x2 (Drag) a, right x3 a, a x5; without
+  throttle the car stays at the line = static, repeatable scene.
+  `sub_002213EA` (SSE 4x4 matrix multiply, stdcall out = a * b; twice per
+  object from sub_000A2EA0) was 15-18% of the game thread: every xmm
+  register is TLS. Native in recomp_manual.c (no FMA contraction, same sum
+  order; 0 mismatches in 7.3M calls); in-run A/B at the start line: main
+  thread 6.42 -> 5.42 ms/frame on x86. Also: calls to *wrapped* overrides
+  (sub_X around sub_X_gen) were emitted as RECOMP_ICALL_SAFE (trace write +
+  dispatch binary search per call, sub_0009A330 included); the lifter now
+  calls the wrapper directly (`Lifter.wrapped_functions`, test in
+  test_manual_call_dispatch.py). The renderer side (per-draw cost) is still
+  ~2x there.
+- **More native leaves (2026-10-02, src/recomp_manual.c, Linux race perf
+  of the main thread):** `sub_002A68EC` = MSVC `_ftol2` (589 call sites,
+  top self time 4.4%), `sub_000A3CA0` (colour grade LUT, 64x64 x2, rebuilt
+  every race frame by sub_000A3FA0 when its params at 0x39D304 change; ~10x
+  faster), `sub_0004BC20` (point x 4x3 matrix), `sub_0004B260` (sine of a
+  16-bit angle, result on the x87 stack), `sub_001C6900` (sphere/plane
+  fade, int via cvttss2si), `sub_000113A0` (4x4 copy). All exact incl.
+  registers, g_fp_cc, g_ebp/g_seh_ebp, xmm0; RECOMP_NATIVE_CHECK=1: 0
+  mismatches (millions of calls each). Gotcha: `fcomp; test ah,5; jp`
+  jumps when C0 == C2, i.e. on >= or unordered (the "if (v < K)" idiom).
+  Then: `sub_001C3430` (max edge function, 3/4-gon), `sub_0004C6E0` (2D
+  overlap with margin), `sub_001C65D0` (int16 rows -> floats),
+  `sub_002EEA80` (D3D's SSE 4x4 multiply, xmm0-5 as left), `sub_0004B940`
+  (t = b * a, per-element sum order generated from the disassembly, then
+  sub_000113A0). On x86 the small leaves only gain ~30% (TLS is cheap
+  there); integer code that calls back into lifted code (sub_000ACB30 mesh
+  submit, sub_000AD7D0) is not worth it. Remaining by self time:
+  sub_001C69C0 (big, branchy), sub_002EC140 / sub_002E8D40 (D3D).
+- **Missing function 0x000930D0** (thiscall method after int3 padding,
+  called every race frame, never lifted): every Linux race logged ~10k
+  `[ICALL] Failed to resolve VA 0x000930D0` (each with a trace dump) and
+  skipped it; one run then fell to 4 fps. Seeded in
+  config/seed_functions.json (full regen: exactly one function added).
+- **LTO (2026-10-02):** CMake `NFSU2_LTO=ON` (+ `NFSU2_LTO_JOBS`) puts the
+  lifted code and recomp_manual.c through LTO; `LTO=1 bash switch/build.sh`
+  builds in `<build dir>-lto` and stages `nfsu2x[-vulkan]-lto.nro` next to
+  the normal NRO. Cheap: ~3 min, ~2 GB. On its own it inlines almost
+  nothing (1.3k of 63k direct calls): lifted functions exceed -O2's
+  max-inline-insns-auto. Declared `inline` + slow modes moved to a cold
+  noinline helper, `_ftol2` (sub_002A68EC) is inlined into all but 12 of
+  its 581 sites. x86 main-menu idle: LTO 0.92 vs 0.95 ms/frame median,
+  inside the +-15% noise. Linux LTO race in check mode clean. Console A/B
+  pending. Thread pointer: GCC calls __aarch64_read_tp once per function
+  (mrs tpidrro_el0 + ldr), so TLS is not a per-access cost.
+- **Vblank was slow (fixed 2026-10-02, kernel_bridge.c):** the tick was
+  `now + 16 ms` checked on the timer thread's 10 ms wait -- late, drifting,
+  ~46 Hz -- and NFSU2 flips every 2nd vblank: Linux races ran at 23 fps.
+  Now 59.94 Hz drift-free on a us clock, the timer thread wakes when it is
+  due (kernel_vblank_wait_ms): Linux race 23 -> 30 fps. `[fps]`/`[perf]`
+  lines show `vblank N Hz` (dips to ~50 Hz only at loading stalls, with
+  the old FLIP_STALL 250 ms timeouts). No VRR needed: D3D's flip queue
+  (sub_002F2080) flips a frame that missed its vblank as soon as it is
+  queued (immediate-when-late flag), so frame times are not quantised --
+  an adaptive vblank hold was tried and never triggered (trace: retires
+  8 ms after a vblank, no vblank between).
+- **Clocks (switch_nx.c, opt-in):** NFSU2_CPU_MHZ / NFSU2_GPU_MHZ /
+  NFSU2_MEM_MHZ via clkrst (8.0+) or pcv: highest listed rate <= the
+  request, caps 1785 / 921.6 / 1600, old rates restored on exit (atexit +
+  switch_shutdown), re-applied every second while focused (dock/sleep
+  reset them). Log `[clock] CPU 1020 -> 1785 MHz`. HOME and back left the
+  system's clocks (2026-10-08, NFSU2 + Carbon): the keeper thread ran at
+  0x3F and busy guest threads (0x3B) starved it; now 0x2C, plus an applet
+  hook (focus/dock/perf mode/resume) that re-checks every 250 ms for 5 s.
+  Issue #25 (2026-10-13): Horizon OC (service "hoc:clk", sys-clk fork,
+  same TID 00FF0000636C6BFF) puts stock rates back every tick when the game
+  has no profile -> clock fight, console froze after ~11 min. Now: if
+  hoc:clk or sys:clk is registered (smRegisterService fails with 0x815)
+  the NFSU2_*_MHZ lines are ignored (NFSU2_CLOCK_FORCE=1 overrides); a
+  rate already >= the request is never lowered (boot or keeper); >5 resets
+  in 30 s without an applet event = give that module up.
+- **Draw merging is not possible as is:** RECOMP_MERGE_STATS (removed
+  again) over a race: 0% of draws have state identical to the previous
+  one; ~45% differ only in vertex-program constants (per-object matrices),
+  11-15% in constants + vertex arrays. Merging would need instancing with
+  per-draw constants in the shaders.
 - **Race hitches (Eden, `[hitch]` lines: frames > 50 ms with programs
   compiled / textures uploaded and their time):**
   - race start: ~40 programs compiled in two frames (~40 ms each in Mesa,
@@ -617,5 +918,5 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   slow (APU clock losing time + decoder cost); APU clock fixed and confirmed
   at 1500 frames/s, decoder speed-up awaiting a hardware test.
 - Audio plays on Linux (2026-09-29); Switch audio awaiting a test.
-- Open: cube maps, bump/dot-product texture modes (dependent AR/GB done),
+- Open: cube maps on GL (done on VK), bump/dot-product texture modes (dependent AR/GB done),
   fixed-function lighting, APU performance on Switch.

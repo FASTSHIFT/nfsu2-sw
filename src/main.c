@@ -34,6 +34,10 @@
 /* libnx lives in switch_nx.c: <switch.h> and the Win32 vocabulary collide. */
 void switch_boot(void);
 void switch_shutdown(void);
+void switch_error_dialog(const char *msg, const char *details);
+#elif !defined(_WIN32)
+int SDL_ShowSimpleMessageBox(uint32_t flags, const char *title, const char *message,
+                             void *window);
 #endif
 
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
@@ -233,8 +237,12 @@ static void *load_file(const char *path, size_t *out_size)
 static void fatal(const char *msg)
 {
     fprintf(stderr, "[FATAL] %s\n", msg);
-#ifdef _WIN32
+#if defined(_WIN32)
     MessageBoxA(NULL, msg, "NFSU2 recomp", MB_ICONERROR);
+#elif defined(__SWITCH__)
+    switch_error_dialog(msg, NULL);
+#else
+    SDL_ShowSimpleMessageBox(0x10, "NFSU2 recomp", msg, NULL);
 #endif
 }
 
@@ -294,6 +302,7 @@ void xbox_gil_mark_main(void);
 void nfsu2_text_patch_init(void);    /* text_patch.c: Switch button names */
 void xbox_nx_spread_thread(void);   /* win32_compat.c: off the guest core (Linux: */
                                     /* RECOMP_GUEST_ONE_CORE), spread (Switch) */
+void nfsu2_options_load(void);      /* recomp_manual.c: Options -> Video rows */
 
 #ifdef __SWITCH__
 #include <pthread.h>
@@ -499,6 +508,12 @@ static int game_main(void)
         xbox_OhciInit();
     }
 
+    /* The NIC the title's XNET library drives (src/nic.c). */
+    {
+        extern void nfsu2_nic_init(void);
+        nfsu2_nic_init();
+    }
+
     /* The GPU renderer (NFSU2_GL=0 falls back to the executor's CPU one). */
     {
         const char *gl = getenv("NFSU2_GL");
@@ -515,6 +530,7 @@ static int game_main(void)
 
     xbox_kernel_init();
     nfsu2_text_patch_init();
+    nfsu2_options_load();
     {
         const char *save_dir = getenv("NFSU2_SAVE_DIR");
         if (!save_dir || !save_dir[0])
