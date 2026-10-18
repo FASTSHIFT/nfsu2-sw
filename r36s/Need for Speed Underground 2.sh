@@ -94,6 +94,12 @@ export RECOMP_KMS_PRESENT=1
 export RECOMP_GL_SURF_STATS=1
 # Optional overrides without editing this file: nfs8/env.txt, KEY=VALUE lines.
 [ -f "$GAMEDIR/env.txt" ] && set -a && . "$GAMEDIR/env.txt" && set +a
+# NFSU2_CPU_MAX=<kHz> in env.txt replaces the 1209600 cap above (1296000,
+# 1512000: faster until the 70C trip throttles; restored on exit like it).
+case "${NFSU2_CPU_MAX:-}" in
+  ""|*[!0-9]*) ;;                       # unset or not a number: keep the cap
+  *) sudo sh -c "echo $NFSU2_CPU_MAX > /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq" ;;
+esac
 # 4:3 panel: tell the game the TV is 4:3 instead of letterboxing 16:9.
 export RECOMP_WIDESCREEN=0
 # Periodic kernel/GPU summaries: noise on an SD card log.
