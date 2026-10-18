@@ -60,6 +60,7 @@ enum {
     KN_PX_STAT,         /* 1: log a histogram of the radii GetPixelSize sees, once (0) */
     KN_NATIVE_OFF,      /* bit mask: run the lifted body instead of the native override (bit 0 = bMulMatrix) (0) */
     KN_EXP_MERGESTAT,   /* experiment: 1 = log per frame how many draws are pre-transformed and how many runs of them share program/textures/surface/state (0) */
+    KN_RAMP_EPS,        /* contrast ramp (sub_000A3FA0) rebuilt only when a parameter moved more than this x 1e-4 since the last build (20; 0 = stock: any change) */
     KN_COUNT
 };
 

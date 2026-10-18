@@ -1146,3 +1146,39 @@ void sub_002A68EC(void)
     esp += 4;                             /* ret */
 }
 #endif
+#ifdef NFSU2_WRAP_RAMP
+/* ── Contrast ramp rebuild (0x000A3FA0) ──────────────────────
+ *
+ * cdecl (i): if the screen filter's parameters for channel i (4 floats at
+ * 0x39D304 + 16 i) differ from the ones it was last built with (0x3E8BF0 +
+ * 16 i), rebuild the ramp texture on the CPU (sub_000A3CA0, ~7 % of the game
+ * thread in a race, plus the GL thread re-uploads it). sub_0009BD70 eases the
+ * parameters toward their targets every frame, so they almost never compare
+ * equal and the ramp is rebuilt every frame. Knob RAMP_EPS (x 1e-4): skip the
+ * rebuild while every parameter is within that of the built one; the drift is
+ * not lost, the next rebuild uses the current values. The ramp is 8-bit, so
+ * 20 (0.002, half an LSB of the x256 scale) is below what it can show. */
+extern void sub_000A3FA0_gen(void);
+void sub_000A3FA0(void)
+{
+    static unsigned long calls, rebuilt;
+    int eps = knob(KN_RAMP_EPS);
+    if ((++calls % 3000) == 0)
+        fprintf(stderr, "  [RAMP] %lu calls, %lu rebuilds (RAMP_EPS %d)\n", calls, rebuilt, eps);
+    if (eps > 0) {
+        uint32_t o = MEM32(esp + 4) << 4;
+        float e = (float)eps * 1e-4f;
+        int k, near = 1;
+        for (k = 0; k < 4 && near; k++) {
+            float d = MEMF(0x39D304 + o + 4 * k) - MEMF(0x3E8BF0 + o + 4 * k);
+            near = d <= e && d >= -e;
+        }
+        if (near) {
+            esp += 4;                   /* ret: the caller reloads eax */
+            return;
+        }
+    }
+    rebuilt++;
+    sub_000A3FA0_gen();
+}
+#endif

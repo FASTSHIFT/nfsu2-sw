@@ -125,6 +125,18 @@ endif()
 if(_native_matmul)
     target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_NATIVE_MATMUL=1)
 endif()
+# Contrast ramp rebuild throttle (sub_000A3FA0, knob RAMP_EPS): same rule.
+set(NFSU2_WRAP_RAMP "AUTO" CACHE STRING "Wrap the contrast ramp rebuild: AUTO, ON or OFF")
+if(NFSU2_WRAP_RAMP STREQUAL "AUTO")
+    file(STRINGS "${NFSU2_GEN_DIR}/recomp_funcs.h" _ramp_gen
+         REGEX "^void sub_000A3FA0_gen\\(void\\);" LIMIT_COUNT 1)
+    set(_wrap_ramp ${_ramp_gen})
+else()
+    set(_wrap_ramp ${NFSU2_WRAP_RAMP})
+endif()
+if(_wrap_ramp)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_WRAP_RAMP=1)
+endif()
 # Native _ftol2 (sub_002A68EC): same rule.
 set(NFSU2_NATIVE_FTOL "AUTO" CACHE STRING "Native _ftol2: AUTO, ON or OFF")
 if(NFSU2_NATIVE_FTOL STREQUAL "AUTO")

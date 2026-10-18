@@ -13,6 +13,7 @@
 | vertex_attrib_binding | knob `GL_LEGACY=0` 打开 | 调用数 -43%，帧时间不变（vertices 阶段反而 +1.4 µs） | 关 |
 | c[] 放共享 UBO | env `RECOMP_GL_UBO=1` | 冷机 A/B：85.5/80.2 vs 76.3/76.2 ms，**更慢** | 关 |
 | 原生 bMulMatrix / _ftol2 | knob `NATIVE_OFF` 位 0/1 回退 | 与 lifted 逐次比对 0 差异；GL 线程瓶颈时帧时间差在噪声内 | 开（需 gen 里 `_gen` 体） |
+| 对比度 ramp 少重建 | knob `RAMP_EPS`（×1e-4，默认 20；0 = 原版） | 行驶中 `sub_000A3CA0` 从游戏线程 ~7% 降到不在前列（§6.1） | 开 |
 | 半分辨率 | env `RECOMP_GL_SCALE=0.5` | 冷机单对：72.0 vs 77.8 ms | 未启用 |
 
 噪声：同一设置的相邻窗口差 ±4 ms；温度过 70 ℃（第一个被动温控点）后 CPU 在 1200/1008 MHz 之间跳，每 draw 的驱动耗时随之 29→35 µs。小于 5 ms 的差值都要多轮交替才能下结论。
@@ -96,14 +97,22 @@ PX 10 下每帧 ~800 个 draw **全部是 xform 2（顶点程序）**，HUD 也�
 
 - `bMulMatrix`（`sub_002213EA`，4x4 SSE 乘法，游戏线程 8.5%）、`_ftol2`（`sub_002A68EC`，585 个调用点，lifted 版每次走 floor/fmod）。
 - 与 lifted 体逐次比对：PC 1022 万 + 设备 183 万次矩阵乘、PC 1678 万 + 设备 734 万次 ftol，0 差异（`RECOMP_MATMUL_VERIFY=1` / `RECOMP_FTOL_VERIFY=1`）。
-- 需要 gen 目录里把原函数改名为 `_gen`（`tools/regen.sh` 按 `extern ... _gen` 自动做；手工改名的 gen 要带 `-DNFSU2_NATIVE_MATMUL=ON -DNFSU2_NATIVE_FTOL=ON -DNFSU2_WRAP_PXSIZE=ON`）。
+- 需要 gen 目录里把原函数改名为 `_gen`（`tools/regen.sh` 按 `extern ... _gen` 自动做；手工改名的 gen 要带 `-DNFSU2_NATIVE_MATMUL=ON -DNFSU2_NATIVE_FTOL=ON -DNFSU2_WRAP_PXSIZE=ON -DNFSU2_WRAP_RAMP=ON`）。
 - 帧时间上看不出来：GL 线程是瓶颈时游戏线程省下的时间被等待吃掉。PX 10 之后 `wait` 开始出现（GL 线程会等游戏线程），这部分才会显出来。
+
+### 6.1 屏幕滤镜的对比度 ramp
+
+PX 10 下行驶时 GL 线程开始等游戏线程（`wait` 10-22 ms），游戏线程 perf 第一名是 `sub_000A3CA0`（进程样本 2.2%，约游戏线程 7%）：
+- 调用链：`sub_000AC6F0`（0x3994C8 = 滤镜开关）→ `sub_0009BD70`（每帧把滤镜参数往目标缓动）→ `sub_000A3FA0` → `sub_000A3CA0`（在 CPU 上逐 texel 生成 ramp 纹理，每个 texel 4 次 _ftol2）。
+- `sub_000A3FA0` 本来就有缓存：参数（0x39D304 + 16 i）与上次生成时（0x3E8BF0 + 16 i）完全相等才跳过。但缓动让参数每帧都差一点点，所以几乎每帧重建，GL 线程还要重新上传这张纹理。
+- 改法（`src/recomp_manual.c`）：参数与上次生成的差都 ≤ RAMP_EPS×1e-4 时跳过；不更新缓存，漂移累计超过阈值就重建。默认 0.002，小于 ramp 8 位输出的一个台阶。
+- 行驶中 perf：`sub_000A3CA0` 和它带出的 `_ftol2` 都掉出前列，游戏线程样本 29.7% → 27.2%。起跑线上参数不动，本来就不重建，帧时间无差别。截图色调正常。
 
 ## 7. 复现
 
 ```bash
-# 设备构建（gen 里 sub_001C6900 / sub_002213EA / sub_002A68EC 已改名 _gen）
-NFSU2_GEN_DIR=$PWD/build/gen-hud EXTRA_CMAKE="-DNFSU2_WRAP_FENGHUD=ON -DNFSU2_WRAP_PXSIZE=ON -DNFSU2_NATIVE_MATMUL=ON -DNFSU2_NATIVE_FTOL=ON" bash r36s/build.sh
+# 设备构建（gen 里 sub_001C6900 / sub_002213EA / sub_002A68EC / sub_000A3FA0 已改名 _gen）
+NFSU2_GEN_DIR=$PWD/build/gen-hud EXTRA_CMAKE="-DNFSU2_WRAP_FENGHUD=ON -DNFSU2_WRAP_PXSIZE=ON -DNFSU2_NATIVE_MATMUL=ON -DNFSU2_NATIVE_FTOL=ON -DNFSU2_WRAP_RAMP=ON" bash r36s/build.sh
 # 同一次启动里交替比较
 python3 -u r36s/autotest.py --host 192.168.10.241 --sweep --set a:PX_PCT=35 --set b:PX_PCT=10,PX_BIG=200
 # 每 draw 阶段
