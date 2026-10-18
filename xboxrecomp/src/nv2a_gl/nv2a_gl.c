@@ -55,6 +55,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>                   /* idx_narrow */
+#endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -182,6 +185,9 @@ static int    s_active_unit = -1;
 static GLuint s_bound[4];
 static int    s_bound_known;
 static void tex_bind_forget(void) { s_active_unit = -1; s_bound_known = 0; }
+/* Bumped when a texture object is deleted or a surface created: bind_stage's
+ * per-stage memo of "this stage's texture is GL texture n" is void then. */
+static uint32_t s_tex_gen = 1;
 static void active_unit(int i)
 {
     if (s_active_unit != i) {
@@ -257,6 +263,8 @@ typedef struct {
     GLuint   ds_on;                     /* depth renderbuffer attached now */
     uint32_t used;
     uint32_t aa_sx, aa_sy;
+    uint64_t clr_sig;                   /* colour: the clear that was the last write (0: a draw, or unknown) */
+    uint64_t zclr_sig;                  /* the same for ds, the surface's own depth buffer */
 } GlSurf;
 
 /* Depth buffers belong to the title's zeta address, not to a colour surface:
@@ -269,10 +277,12 @@ typedef struct {
     uint32_t va, pw, ph;
     GLuint   rb;
     uint32_t used;
+    uint64_t clean_sig;                 /* the clear that was the last write (0: a draw, or unknown) */
 } GlDepth;
 
 #define GL_MAX_DEPTH 16
 static GlDepth s_depth[GL_MAX_DEPTH];
+static GlDepth *s_cur_depth;            /* surf_bind's shared buffer (NULL: the surface's own) */
 static int     s_shared_z = -1;         /* RECOMP_GL_SHARED_Z=0: old behaviour */
 
 /* RECOMP_GL_SCALE: render resolution multiple (0.5..4, fractions allowed).
@@ -296,11 +306,16 @@ static int     s_drew_any;              /* the title has drawn something */
 
 static int s_watch_hit;
 
+/* The live surfaces' addresses (0: slot empty), packed: surf_find runs once
+ * a draw and once per texture stage, and walking s_surf itself touched a
+ * cache line per slot (1.3% of the GL thread on the R36S). */
+static uint32_t s_surf_va[GL_MAX_SURF];
+
 static GlSurf *surf_find(uint32_t va)
 {
     int i;
     for (i = 0; i < GL_MAX_SURF; i++)
-        if (s_surf[i].fbo && s_surf[i].va == va)
+        if (s_surf_va[i] == va && va)
             return &s_surf[i];
     return NULL;
 }
@@ -337,7 +352,9 @@ static GlSurf *surf_get(uint32_t va, uint32_t w, uint32_t h,
     }
     memset(s, 0, sizeof *s);
     s_new_obj = 1;
+    s_tex_gen++;                        /* a texture address may now be this surface */
     s->va = va; s->w = w; s->h = h; s->used = s_frame;
+    s_surf_va[s - s_surf] = va;
     s->aa_sx = aa_sx; s->aa_sy = aa_sy;
     {
         double k = s_scale, m = (double)(w > h ? w : h);
@@ -391,6 +408,7 @@ static GLuint depth_get(uint32_t va, uint32_t pw, uint32_t ph, int *fresh)
         if (s_depth[i].rb && s_depth[i].va == va
             && s_depth[i].pw == pw && s_depth[i].ph == ph) {
             s_depth[i].used = s_frame;
+            s_cur_depth = &s_depth[i];
             return s_depth[i].rb;
         }
         if (!victim || (victim->rb && (!s_depth[i].rb || s_depth[i].used < victim->used)))
@@ -407,6 +425,8 @@ static GLuint depth_get(uint32_t va, uint32_t pw, uint32_t ph, int *fresh)
     s_new_obj = 1;
     *fresh = 1;
     d->va = va; d->pw = pw; d->ph = ph; d->used = s_frame;
+    d->clean_sig = 0;
+    s_cur_depth = d;
     glGenRenderbuffers(1, &d->rb);
     glBindRenderbuffer(GL_RENDERBUFFER, d->rb);
     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, (GLsizei)pw, (GLsizei)ph);
@@ -440,6 +460,7 @@ static GlSurf *surf_bind(const Nv2aSurface *sf, uint32_t zeta_va)
         const char *e = getenv("RECOMP_GL_SHARED_Z");
         s_shared_z = !(e && e[0] == '0');
     }
+    s_cur_depth = NULL;
     ds = zeta_va && s_shared_z ? depth_get(zeta_va, s->pw, s->ph, &fresh) : s->ds;
     if (s->ds_on != ds) {
         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
@@ -630,6 +651,7 @@ static void tex_account(GlTex *t, uint32_t bytes)
             break;                      /* everything left is in use this frame */
         glDeleteTextures(1, &lru->tex);
         tex_bind_forget();
+        s_tex_gen++;
         s_tex_bytes -= lru->bytes;
         tex_index_del(lru);
         memset(lru, 0, sizeof *lru);
@@ -673,6 +695,7 @@ static GLuint tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h,
         if (t->tex) {
             glDeleteTextures(1, &t->tex);
             tex_bind_forget();
+            s_tex_gen++;
             s_tex_bytes -= t->bytes;
             tex_index_del(t);
         }
@@ -815,6 +838,14 @@ static void rt_scale(uint32_t w, uint32_t h, uint32_t sw, uint32_t sh,
     if (h < lh) scale[1] *= (float)h / (float)lh;
 }
 
+/* bind_stage's memo of the last texture per stage (knob TEX_MEMO). */
+typedef struct {
+    uint32_t frame, gen, va, color, w, h, pitch, pal_va, pal_reg;
+    GLuint   tex;
+    GlSurf  *rt;
+} StageMemo;
+static StageMemo s_stage_memo[4];
+
 /* Bind stage `i` from the method shadow; returns the texcoord scale. */
 static void bind_stage(const uint32_t *regs, int i, float scale[2])
 {
@@ -849,6 +880,23 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2])
     }
     s_palette_reg = regs[base + 8];          /* SET_TEXTURE_PALETTE */
     s_palette_va = s_batch->pal_va[i];
+    {
+        /* Most draws sample what the previous one did on this stage. Within
+         * a frame, with no texture deleted and no surface made since, the
+         * same address and format is the same GL texture: tex_get checks a
+         * texture's bytes only once a frame anyway, so skipping it (and the
+         * surface search) for a repeat changes nothing. */
+        StageMemo *m = &s_stage_memo[i];
+        if (knob(KN_TEX_MEMO)
+            && m->frame == s_frame && m->gen == s_tex_gen && m->va == va && m->color == color
+            && m->w == w && m->h == h && m->pitch == pitch && m->pal_va == s_palette_va
+            && m->pal_reg == s_palette_reg) {
+            tex = m->tex;
+            if (m->rt)
+                rt_scale(w, h, m->rt->w, m->rt->h, m->rt->aa_sx, m->rt->aa_sy, scale);
+            goto bound;
+        }
+    }
     rt = surf_find(va);
     if (rt) {
         tex = rt->tex;
@@ -872,6 +920,13 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2])
             tex = tex_get(va, color, w, h, pitch);
         s_stage_unit = -1;
     }
+    {
+        StageMemo *m = &s_stage_memo[i];
+        m->frame = s_frame; m->gen = s_tex_gen; m->va = va; m->color = color;
+        m->w = w; m->h = h; m->pitch = pitch; m->pal_va = s_palette_va;
+        m->pal_reg = s_palette_reg; m->tex = tex; m->rt = rt;
+    }
+bound:
     bind_unit(i, tex);
     {
         /* Sampler state lives in the texture object: set it only when it
@@ -1625,6 +1680,7 @@ typedef void (GLAPIENTRY *PFN_glBufferStorageEXT)(GLenum, GLsizeiptr, const void
 static int s_persist;                       /* rings are persistent */
 static uint8_t *s_ring_map[2];
 static GLsync s_ring_fence[2][RING_SEGS];
+static uint64_t s_ring_bytes[2];            /* written to the persistent rings: vertex, index */
 static int s_ring_seg[2];
 
 /* Give the rings (their buffers already made, nothing allocated) persistent
@@ -1708,6 +1764,7 @@ static GLintptr ring_alloc(GlRing *g, GLsizeiptr size, void **ptr)
     GLintptr at;
 
     if (s_persist) {
+        s_ring_bytes[g == &s_iring] += (uint64_t)size;
         at = ring_alloc_persist(g, size, ptr);
         if (at >= 0)
             return at;
@@ -2270,6 +2327,7 @@ static double s_census_fps;              /* last frame's rate, for the dump */
 static uint32_t s_skip_wh[SKIP_MAX];
 static int s_skip_n = -1;
 static uint64_t s_skipped;
+static uint64_t s_clr_n, s_clr_dropped;  /* gl_clear calls, and those CLR_DEDUP dropped */
 
 static void skip_init(void)
 {
@@ -2697,7 +2755,7 @@ static void call_stats_frame(void)
 static void surf_stats_frame(void)
 {
     static uint32_t frames;
-    static uint64_t last_skipped;
+    static uint64_t last_skipped, last_clr_n, last_clr_dropped, last_ring[2];
     int i;
     if (s_ss_on <= 0 && s_skip_n <= 0)
         return;
@@ -2714,8 +2772,34 @@ static void surf_stats_frame(void)
     if (s_skip_n > 0)
         fprintf(stderr, "  [GL] skipped %llu draws/frame (RECOMP_GL_SKIP)\n",
                 (unsigned long long)((s_skipped - last_skipped) / frames));
+    fprintf(stderr, "  [GL] clears/frame %.1f, %.1f dropped as repeats (CLR_DEDUP); "
+            "ring KB/frame: vertex %.0f, index %.0f\n",
+            (double)(s_clr_n - last_clr_n) / frames,
+            (double)(s_clr_dropped - last_clr_dropped) / frames,
+            (double)(s_ring_bytes[0] - last_ring[0]) / 1024.0 / frames,
+            (double)(s_ring_bytes[1] - last_ring[1]) / 1024.0 / frames);
+    last_ring[0] = s_ring_bytes[0];
+    last_ring[1] = s_ring_bytes[1];
     last_skipped = s_skipped;
+    last_clr_n = s_clr_n;
+    last_clr_dropped = s_clr_dropped;
     frames = 0;
+}
+
+/* 32-bit indices to 16 (all below 65536), usually straight into the mapped
+ * index ring. One 2-byte store per index was 0.7% of the GL thread on the
+ * R36S; NEON narrows and stores 8 at a time. */
+static void idx_narrow(uint16_t *o, const uint32_t *in, uint32_t n)
+{
+    uint32_t i = 0;
+#if defined(__aarch64__)
+    for (; i + 8 <= n; i += 8) {
+        uint32x4_t a = vld1q_u32(in + i), c = vld1q_u32(in + i + 4);
+        vst1q_u16(o + i, vcombine_u16(vmovn_u32(a), vmovn_u32(c)));
+    }
+#endif
+    for (; i < n; i++)
+        o[i] = (uint16_t)in[i];
 }
 
 static void gl_draw_raw(const Nv2aRawBatch *b)
@@ -2749,6 +2833,9 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     if (!s)
         return;
     s_drew_any = 1;
+    s->clr_sig = s->zclr_sig = 0;       /* clear dedup: a draw may write colour and depth */
+    if (s_cur_depth)
+        s_cur_depth->clean_sig = 0;
     XTRACE_DRAW_MARK("d:surface");
     psh_key(r, &pk);
     XTRACE_DRAW_MARK("d:psh_key");
@@ -3107,8 +3194,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
                 }
                 o = idx16;
             }
-            for (i = 0; i < n; i++)
-                o[i] = (uint16_t)idx[i];
+            idx_narrow(o, idx, n);
             ring_done(&s_iring, idx_at, (GLsizeiptr)n * 2, dst, idx16);
         }
     }
@@ -3211,42 +3297,89 @@ static void gl_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     s = surf_bind(sf, rs ? rs->zeta_va : 0);
     if (!s)
         return;
-    glDisable(GL_SCISSOR_TEST);
-    if (s_regs) {
-        uint32_t hz = s_regs[0x1D98 / 4], vt = s_regs[0x1D9C / 4];
-        /* The clear rectangle is in logical pixels, like SURFACE_CLIP; the
-         * surface is larger by the anti-aliasing factor. Unscaled, a 2x1
-         * surface cleared only its left half, and stale depth on the right
-         * kept old frames of a moving car alive behind the background. */
-        uint32_t x0 = (hz & 0xFFFF) * s->aa_sx, x1 = ((hz >> 16) + 1) * s->aa_sx;
-        uint32_t y0 = (vt & 0xFFFF) * s->aa_sy, y1 = ((vt >> 16) + 1) * s->aa_sy;
-        if (x1 > s->w) x1 = s->w;
-        if (y1 > s->h) y1 = s->h;
-        if (x1 > x0 && y1 > y0 && (x1 - x0 < s->w || y1 - y0 < s->h)) {
+    s_clr_n++;
+    {
+        uint32_t x0 = 0, x1 = s->w, y0 = 0, y1 = s->h, z = 0, zmax = 0;
+        int part = 0;
+        if (s_regs) {
+            uint32_t hz = s_regs[0x1D98 / 4], vt = s_regs[0x1D9C / 4];
+            /* The clear rectangle is in logical pixels, like SURFACE_CLIP; the
+             * surface is larger by the anti-aliasing factor. Unscaled, a 2x1
+             * surface cleared only its left half, and stale depth on the right
+             * kept old frames of a moving car alive behind the background. */
+            uint32_t cx0 = (hz & 0xFFFF) * s->aa_sx, cx1 = ((hz >> 16) + 1) * s->aa_sx;
+            uint32_t cy0 = (vt & 0xFFFF) * s->aa_sy, cy1 = ((vt >> 16) + 1) * s->aa_sy;
+            if (cx1 > s->w) cx1 = s->w;
+            if (cy1 > s->h) cy1 = s->h;
+            if (cx1 > cx0 && cy1 > cy0 && (cx1 - cx0 < s->w || cy1 - cy0 < s->h)) {
+                x0 = cx0; x1 = cx1; y0 = cy0; y1 = cy1;
+                part = 1;
+            }
+        }
+        if (flags & 0x1) {
+            zmax = s_regs ? zmax_of(s_regs) : 0xFFFFFFu;
+            z = zmax == 0xFFFFu ? (zstencil & 0xFFFF) : (zstencil >> 8);
+        }
+        /* Clear dedup (knob CLR_DEDUP, docs/13 §10). A pass whose draws
+         * RECOMP_GL_SKIP drops (road reflection, car environment maps) is
+         * still cleared every frame, ~0.3 ms of driver time per clear on the
+         * R36S, though nothing has touched it since the same clear a frame
+         * ago. Drop a clear when the colour it clears was last written by
+         * this very clear (same mask, value, rectangle) and so was the depth
+         * buffer, if it clears depth or stencil. Colour is tracked per
+         * surface, depth per buffer: NFSU2's car environment-map faces
+         * share one Z buffer and clear it in turn, so its content is the
+         * same clear whichever face did it. Any draw resets both. Applying
+         * a clear twice is the same as once, so this changes nothing. */
+        {
+            const int col = (flags & 0xF0) != 0, zs = (flags & 0x3) != 0;
+            uint64_t *zsig = s_cur_depth ? &s_cur_depth->clean_sig : &s->zclr_sig;
+            uint32_t kc[4] = { flags & 0xF0, argb, x0 | x1 << 16, y0 | y1 << 16 };
+            uint32_t kz[6] = { flags & 0x3, z, zmax, (flags & 0x2) ? (zstencil & 0xFF) : 0,
+                               x0 | x1 << 16, y0 | y1 << 16 };
+            uint64_t cs = 0xCBF29CE484222325ull, zsg = 0xCBF29CE484222325ull;
+            int i;
+            for (i = 0; i < 4; i++)
+                cs = (cs ^ kc[i]) * 0x100000001B3ull;
+            for (i = 0; i < 6; i++)
+                zsg = (zsg ^ kz[i]) * 0x100000001B3ull;
+            cs |= 1;
+            zsg |= 1;
+            if (knob(KN_CLR_DEDUP) && (col || zs)
+                && (!col || s->clr_sig == cs) && (!zs || *zsig == zsg)) {
+                s_clr_dropped++;
+                gl_step_done("clear");
+                return;
+            }
+            if (col)
+                s->clr_sig = cs;
+            if (zs)
+                *zsig = zsg;
+        }
+        glDisable(GL_SCISSOR_TEST);
+        if (part) {
             GLint px0 = to_stored(x0, s->pw, s->w), py0 = to_stored(y0, s->ph, s->h);
             glEnable(GL_SCISSOR_TEST);
             glScissor(px0, py0, to_stored(x1, s->pw, s->w) - px0,
                       to_stored(y1, s->ph, s->h) - py0);
         }
-    }
-    if (flags & 0xF0) {
-        argb_vec4(argb, c);
-        glColorMask((flags & 0x10) != 0, (flags & 0x20) != 0,
-                    (flags & 0x40) != 0, (flags & 0x80) != 0);
-        glClearColor(c[0], c[1], c[2], c[3]);
-        bits |= GL_COLOR_BUFFER_BIT;
-    }
-    if (flags & 0x1) {
-        uint32_t zmax = s_regs ? zmax_of(s_regs) : 0xFFFFFFu;
-        uint32_t z = zmax == 0xFFFFu ? (zstencil & 0xFFFF) : (zstencil >> 8);
-        glDepthMask(1);
-        glClearDepth((double)z / (double)zmax);
-        bits |= GL_DEPTH_BUFFER_BIT;
-    }
-    if (flags & 0x2) {
-        glStencilMask(0xFF);
-        glClearStencil((GLint)(zstencil & 0xFF));
-        bits |= GL_STENCIL_BUFFER_BIT;
+        if (flags & 0xF0) {
+            argb_vec4(argb, c);
+            glColorMask((flags & 0x10) != 0, (flags & 0x20) != 0,
+                        (flags & 0x40) != 0, (flags & 0x80) != 0);
+            glClearColor(c[0], c[1], c[2], c[3]);
+            bits |= GL_COLOR_BUFFER_BIT;
+        }
+        if (flags & 0x1) {
+            glDepthMask(1);
+            glClearDepth((double)z / (double)zmax);
+            bits |= GL_DEPTH_BUFFER_BIT;
+        }
+        if (flags & 0x2) {
+            glStencilMask(0xFF);
+            glClearStencil((GLint)(zstencil & 0xFF));
+            bits |= GL_STENCIL_BUFFER_BIT;
+        }
     }
     if (bits)
         glClear(bits);

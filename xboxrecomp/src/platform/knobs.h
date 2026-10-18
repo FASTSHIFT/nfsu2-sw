@@ -61,6 +61,8 @@ enum {
     KN_NATIVE_OFF,      /* unused since the upstream merge (RECOMP_NATIVE=0 / RECOMP_NATIVE_CHECK=1 instead); kept so knob numbering stays (0) */
     KN_EXP_MERGESTAT,   /* experiment: 1 = log per frame how many draws are pre-transformed and how many runs of them share program/textures/surface/state (0) */
     KN_RAMP_EPS,        /* contrast ramp (sub_000A3FA0) rebuilt only when a parameter moved more than this x 1e-4 since the last build (20; 0 = stock: any change) */
+    KN_CLR_DEDUP,       /* 1: drop a clear that repeats the last write to its surface and depth buffer (a pass whose draws RECOMP_GL_SKIP drops) (1) */
+    KN_TEX_MEMO,        /* 1: a texture stage that samples what it did on the previous draw skips the surface search and tex_get (1) */
     KN_COUNT
 };
 
