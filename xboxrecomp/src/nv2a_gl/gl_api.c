@@ -8,6 +8,8 @@ NV2A_GL_FUNCS(NV2A_GL_DEFINE)
 #undef NV2A_GL_DEFINE
 
 uint32_t nv2a_gl_calls[NV2A_GLID_COUNT];
+int nv2a_gl_pending;                      /* set only together with the flush below */
+void (*nv2a_gl_pending_flush)(void);
 #define NV2A_GL_NAME(ret, name, args) #name,
 const char *const nv2a_gl_names[NV2A_GLID_COUNT] = { NV2A_GL_FUNCS(NV2A_GL_NAME) };
 #undef NV2A_GL_NAME

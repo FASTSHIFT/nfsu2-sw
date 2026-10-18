@@ -1387,8 +1387,9 @@ static int ready(void)
     s_vring.buf = s_vbo;
     s_iring.buf = s_ibo;
     s_vao_bound = 1;
-    /* Desktop 3.3 core has no EXT_buffer_storage: per-draw maps there. */
-    if (!nv2a_gl_api_es || !ring_persist_init(SDL_GL_GetProcAddress)) {
+    /* Desktop 3.3 core has no EXT_buffer_storage: per-draw maps there,
+     * unless RECOMP_GL_PERSIST=1 asks for GL 4.4's glBufferStorage. */
+    if (!ring_persist_init(SDL_GL_GetProcAddress)) {
         glBindBuffer(GL_ARRAY_BUFFER, s_vring.buf);
         glBufferData(GL_ARRAY_BUFFER, s_vring.cap, NULL, GL_STREAM_DRAW);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_iring.buf);
@@ -1695,9 +1696,17 @@ static int ring_persist_init(void *(*getproc)(const char *))
     GlRing *g[2] = { &s_vring, &s_iring };
     int k;
 
-    if ((e && *e == '0') || !ext || !strstr(ext, "GL_EXT_buffer_storage"))
+    if (e && *e == '0')
         return 0;
-    storage = (PFN_glBufferStorageEXT)getproc("glBufferStorageEXT");
+    if (nv2a_gl_api_es && ext && strstr(ext, "GL_EXT_buffer_storage"))
+        storage = (PFN_glBufferStorageEXT)getproc("glBufferStorageEXT");
+    else if (!nv2a_gl_api_es && e && *e == '1')
+        /* Desktop GL (core in 4.4; a core context has no GL_EXTENSIONS
+         * string), on request only: RECOMP_GL_PERSIST=1 runs the R36S's
+         * ring path on a PC, e.g. to check draw merging (GL_MERGE). */
+        storage = (PFN_glBufferStorageEXT)getproc("glBufferStorage");
+    else
+        return 0;
     if (!storage)
         return 0;
     while (glGetError() != GL_NO_ERROR) { }
@@ -2202,6 +2211,9 @@ static int vab_bind(const Nv2aRawBatch *b, GLintptr at, const VRun *run, const i
     return 1;
 }
 
+static GLintptr s_last_vat;     /* upload_vertices: where the last draw's vertices went */
+static int      s_last_legacy;  /* ... and they were bound by glVertexAttribPointer there */
+
 static int upload_vertices(const Nv2aRawBatch *b)
 {
     VRun run[NV2A_RAW_ATTRS];
@@ -2253,11 +2265,14 @@ static int upload_vertices(const Nv2aRawBatch *b)
                        4 * sizeof(float));
     }
     ring_done(&s_vring, at, bytes, map, staging);
+    s_last_vat = at;
+    s_last_legacy = 0;
 
     if (s_vab && !(knob(KN_GL_LEGACY) & 1)) {
         if (vab_bind(b, at, run, of_run, slot, np, pack_at))
             return 1;
     }
+    s_last_legacy = 1;                      /* glVertexAttribPointer at `at`: draw merging may extend it */
     s_lay.valid = 0;                        /* legacy calls change the VAO under it */
 
     for (a = 0; a < NV2A_RAW_ATTRS; a++) {
@@ -2291,6 +2306,169 @@ static int upload_vertices(const Nv2aRawBatch *b)
         glVertexAttribPointer(slot[i], 4, GL_FLOAT, GL_FALSE,
                               (GLsizei)(np * 4 * sizeof(float)),
                               (const void *)(uintptr_t)(at + pack_at + i * 4 * sizeof(float)));
+    return 1;
+}
+
+/* ── Draw merging (knob GL_MERGE) ─────────────────────────────────────
+ *
+ * Each glDrawRangeElements costs the R36S's Mali blob ~30 us whatever it
+ * draws, and runs of draws in a frame need no GL state change between them
+ * (the state code only calls GL when something differs). A triangle-list
+ * draw is held back; when the next one finds nothing called GL since (the
+ * hook in gl_api.h submits the held draw before any GL call) and has the
+ * same vertex layout, its vertices go into the ring right after the held
+ * ones, its indices after the held indices (offset by the vertices already
+ * there), and the one call draws both. Same state, same order of triangles,
+ * so the same picture.
+ *
+ * Only interleaved layouts: every attribute direct (none converted), one
+ * stride, all inside [lowest pointer, + stride), 16-bit indices. */
+typedef struct {
+    uint16_t direct;
+    uint32_t stride;
+    struct { uint32_t type, size, off; } a[NV2A_RAW_ATTRS];
+} MergeLayout;
+static struct {
+    int on;
+    MergeLayout lay;
+    GLintptr v_base, i_at;              /* ring offsets of vertex 0 and of the indices */
+    GLintptr v_used;                    /* end of the vertex bytes written so far */
+    uint32_t nv, n;                     /* vertex slots, indices */
+} s_mp;
+static uint64_t s_merge_joined;         /* draws that went into another's call */
+
+static void merge_flush(void)
+{
+    if (!s_mp.on)
+        return;
+    s_mp.on = 0;
+    nv2a_gl_pending = 0;
+    glDrawRangeElements(GL_TRIANGLES, 0, s_mp.nv - 1, (GLsizei)s_mp.n, GL_UNSIGNED_SHORT,
+                        (const void *)(uintptr_t)s_mp.i_at);
+}
+
+/* b's vertices as one interleaved array starting at *lo, *len bytes. */
+static int merge_layout(const Nv2aRawBatch *b, MergeLayout *L, const uint8_t **lo, size_t *len)
+{
+    uint32_t nv = b->vertex_count, a, end = 0;
+    const uint8_t *mn = NULL;
+
+    if (!nv || nv > 65536 || !b->attr_direct || (b->attr_present & (uint16_t)~b->attr_direct))
+        return 0;
+    memset(L, 0, sizeof *L);
+    for (a = 0; a < NV2A_RAW_ATTRS; a++) {
+        if (!(b->attr_direct & (1u << a)))
+            continue;
+        if (!b->direct[a].stride || (L->stride && b->direct[a].stride != L->stride))
+            return 0;
+        L->stride = b->direct[a].stride;
+        if (!mn || b->direct[a].ptr < mn)
+            mn = b->direct[a].ptr;
+    }
+    if (!mn || ((uintptr_t)mn & 3))
+        return 0;
+    for (a = 0; a < NV2A_RAW_ATTRS; a++) {
+        uint32_t elem, off;
+        if (!(b->attr_direct & (1u << a)))
+            continue;
+        switch (b->direct[a].type) {        /* as vertex_runs */
+        case 0: elem = 4; break;
+        case 2: elem = 4 * b->direct[a].size; break;
+        case 4: elem = b->direct[a].size; break;
+        default: elem = 2 * b->direct[a].size; break;
+        }
+        off = (uint32_t)(b->direct[a].ptr - mn);
+        if (off + elem > L->stride)
+            return 0;
+        if (off + elem > end)
+            end = off + elem;
+        L->a[a].type = b->direct[a].type;
+        L->a[a].size = b->direct[a].size;
+        L->a[a].off = off;
+    }
+    L->direct = b->attr_direct;
+    *lo = mn;
+    *len = (size_t)(nv - 1) * L->stride + end;
+    return 1;
+}
+
+/* upload_vertices put b's vertices in the ring as one run from the lowest
+ * pointer (a one-vertex draw's attributes need not touch: then two runs). */
+static int merge_one_run(const Nv2aRawBatch *b)
+{
+    VRun run[NV2A_RAW_ATTRS];
+    int of_run[NV2A_RAW_ATTRS];
+    return vertex_runs(b, run, of_run) == 1;
+}
+
+/* The persistent ring's bytes [from, from + size), right after `used` (the
+ * end of the held draw's data), if the ring's last allocation was that draw
+ * (g->off is `used` plus at most the 16-byte rounding of upload_vertices)
+ * and the bytes stay inside the current segment (no fence to place or wait
+ * for). */
+static uint8_t *ring_extend(GlRing *g, GLintptr used, GLintptr from, GLsizeiptr size, int commit)
+{
+    int k = g == &s_iring;
+    GLsizeiptr seg = g->cap / RING_SEGS;
+    GLintptr end = from + size;
+
+    if (!s_persist || from < used || g->off < used || g->off - used >= 16
+        || end > g->cap || (end - 1) / seg != s_ring_seg[k])
+        return NULL;
+    if (end < g->off)
+        end = g->off;
+    if (commit) {
+        g->off = end;
+        s_ring_bytes[k] += (uint64_t)size;
+    }
+    return s_ring_map[k] + from;
+}
+
+static void idx_narrow_add(uint16_t *o, const uint32_t *in, uint32_t n, uint32_t base)
+{
+    uint32_t i = 0;
+#if defined(__aarch64__)
+    uint32x4_t vb = vdupq_n_u32(base);
+    for (; i + 8 <= n; i += 8) {
+        uint32x4_t a = vaddq_u32(vld1q_u32(in + i), vb), c = vaddq_u32(vld1q_u32(in + i + 4), vb);
+        vst1q_u16(o + i, vcombine_u16(vmovn_u32(a), vmovn_u32(c)));
+    }
+#endif
+    for (; i < n; i++)
+        o[i] = (uint16_t)(in[i] + base);
+}
+
+/* Join b to the held draw; 0 if it cannot (then the held draw is submitted
+ * by the caller, and b goes the usual way). */
+static int merge_try(const Nv2aRawBatch *b, GLenum mode, const uint32_t *idx, uint32_t n)
+{
+    MergeLayout L;
+    const uint8_t *lo;
+    size_t len;
+    uint32_t base = s_mp.nv;
+    GLintptr v_from, i_from;
+    uint8_t *v;
+    uint16_t *o;
+
+    if (!s_mp.on || mode != GL_TRIANGLES || !n)
+        return 0;
+    if (!merge_layout(b, &L, &lo, &len) || memcmp(&L, &s_mp.lay, sizeof L) != 0)
+        return 0;
+    if (base + b->vertex_count > 65536)
+        return 0;
+    v_from = s_mp.v_base + (GLintptr)base * L.stride;
+    i_from = s_mp.i_at + (GLintptr)s_mp.n * 2;
+    if (!ring_extend(&s_vring, s_mp.v_used, v_from, (GLsizeiptr)len, 0)
+        || !ring_extend(&s_iring, i_from, i_from, (GLsizeiptr)n * 2, 0))
+        return 0;
+    v = ring_extend(&s_vring, s_mp.v_used, v_from, (GLsizeiptr)len, 1);
+    o = (uint16_t *)ring_extend(&s_iring, i_from, i_from, (GLsizeiptr)n * 2, 1);
+    memcpy(v, lo, len);
+    idx_narrow_add(o, idx, n, base);
+    s_mp.v_used = v_from + (GLintptr)len;
+    s_mp.nv = base + b->vertex_count;
+    s_mp.n += n;
+    s_merge_joined++;
     return 1;
 }
 
@@ -2755,7 +2933,7 @@ static void call_stats_frame(void)
 static void surf_stats_frame(void)
 {
     static uint32_t frames;
-    static uint64_t last_skipped, last_clr_n, last_clr_dropped, last_ring[2];
+    static uint64_t last_skipped, last_clr_n, last_clr_dropped, last_ring[2], last_joined;
     int i;
     if (s_ss_on <= 0 && s_skip_n <= 0)
         return;
@@ -2773,11 +2951,13 @@ static void surf_stats_frame(void)
         fprintf(stderr, "  [GL] skipped %llu draws/frame (RECOMP_GL_SKIP)\n",
                 (unsigned long long)((s_skipped - last_skipped) / frames));
     fprintf(stderr, "  [GL] clears/frame %.1f, %.1f dropped as repeats (CLR_DEDUP); "
-            "ring KB/frame: vertex %.0f, index %.0f\n",
+            "ring KB/frame: vertex %.0f, index %.0f; %.0f draws/frame joined another's call (GL_MERGE)\n",
             (double)(s_clr_n - last_clr_n) / frames,
             (double)(s_clr_dropped - last_clr_dropped) / frames,
             (double)(s_ring_bytes[0] - last_ring[0]) / 1024.0 / frames,
-            (double)(s_ring_bytes[1] - last_ring[1]) / 1024.0 / frames);
+            (double)(s_ring_bytes[1] - last_ring[1]) / 1024.0 / frames,
+            (double)(s_merge_joined - last_joined) / frames);
+    last_joined = s_merge_joined;
     last_ring[0] = s_ring_bytes[0];
     last_ring[1] = s_ring_bytes[1];
     last_skipped = s_skipped;
@@ -3146,16 +3326,14 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     apply_state(r, b->zeta_va != 0, s);
     XTRACE_DRAW_MARK("d:state");
 
-    bind_vao();
-    if (!upload_vertices(b))
-        return;
-    XTRACE_DRAW_MARK("d:vertices");
     {
         /* The absent attributes read the title's SET_VERTEX_DATA* values
          * (Nv2aRawBatch.attr_const); set them only when those or the set of
          * attributes changed. A fixed (0,0,0,1) gave NFSU2's lens drops a
          * specular alpha, so fog 1, of 1 instead of 0: their screen copy
-         * came out as the fog colour -- grey squares. */
+         * came out as the fog colour -- grey squares. (Before the vertices:
+         * this is context state, not the VAO's, and draw merging needs every
+         * GL call of a draw done before it decides.) */
         static uint32_t last_mask = 0xFFFFFFFFu, last_gen;
         if (b->attr_present != last_mask || b->attr_const_gen != last_gen) {
             last_mask = b->attr_present;
@@ -3169,6 +3347,17 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     mode = gl_prim(b, &idx, &n);
     if (!n)
         return;
+    /* Nothing above called GL if the held draw is still held: same state. */
+    if (s_mp.on && !s_watch_hit && merge_try(b, mode, idx, n)) {
+        XTRACE_DRAW_MARK("d:merged");
+        gl_step_done("draw");
+        return;
+    }
+    merge_flush();
+    bind_vao();
+    if (!upload_vertices(b))
+        return;
+    XTRACE_DRAW_MARK("d:vertices");
     {
         /* 16-bit indices whenever the batch's vertices allow: half the bytes
          * through the ring, and the GPU's native index size. */
@@ -3250,11 +3439,30 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
             s_st_valid = 0;                     /* put every piece of state back */
             apply_state(r, b->zeta_va != 0, s);
         }
-        if (b->vertex_count)
-            glDrawRangeElements(mode, 0, b->vertex_count - 1, (GLsizei)n, idx_type,
-                                (const void *)(uintptr_t)idx_at);
-        else
-            glDrawElements(mode, (GLsizei)n, idx_type, (const void *)(uintptr_t)idx_at);
+        {
+            MergeLayout L;
+            const uint8_t *lo;
+            size_t len;
+            if (knob(KN_GL_MERGE) && s_persist && s_last_legacy && mode == GL_TRIANGLES
+                && idx_type == GL_UNSIGNED_SHORT && !rd && !s_expq_on && !s_finish
+                && !s_watch_hit && merge_layout(b, &L, &lo, &len)
+                && merge_one_run(b)) {
+                /* Held: the next draw may join it (merge_try). */
+                s_mp.on = 1;
+                s_mp.lay = L;
+                s_mp.v_base = s_last_vat;
+                s_mp.v_used = s_last_vat + (GLintptr)len;
+                s_mp.i_at = idx_at;
+                s_mp.nv = b->vertex_count;
+                s_mp.n = n;
+                nv2a_gl_pending_flush = merge_flush;
+                nv2a_gl_pending = 1;
+            } else if (b->vertex_count)
+                glDrawRangeElements(mode, 0, b->vertex_count - 1, (GLsizei)n, idx_type,
+                                    (const void *)(uintptr_t)idx_at);
+            else
+                glDrawElements(mode, (GLsizei)n, idx_type, (const void *)(uintptr_t)idx_at);
+        }
         if (rd == 2)
             glDisable(GL_RASTERIZER_DISCARD);
         XTRACE_DRAW_MARK("d:glDrawElements");      /* or glDrawRangeElements */
@@ -3418,6 +3626,7 @@ extern void nv2a_host_frame_presented(uint32_t width, uint32_t height) __attribu
 
 static void gl_flip(void)
 {
+    merge_flush();                      /* the frame's last held draw, before present */
     state_dirty();
     static int dump_every = -1;
     static char dump_prefix[256];

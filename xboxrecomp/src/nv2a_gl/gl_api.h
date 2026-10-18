@@ -230,7 +230,17 @@ extern uint32_t nv2a_gl_calls[NV2A_GLID_COUNT];
 extern const char *const nv2a_gl_names[NV2A_GLID_COUNT];
 /* A function, not a comma expression: two counted calls in one expression
  * (a printf of two glGetString) stay sequenced. */
-static inline void nv2a_gl_count(int id) { nv2a_gl_calls[id]++; }
+/* Draw merging (nv2a_gl.c, knob GL_MERGE): a draw may be held back so the
+ * next one can join it. Any GL call submits it first, so it is drawn with
+ * the state it was made with, before anything changes that state. */
+extern int nv2a_gl_pending;
+extern void (*nv2a_gl_pending_flush)(void);
+static inline void nv2a_gl_count(int id)
+{
+    nv2a_gl_calls[id]++;
+    if (nv2a_gl_pending)
+        nv2a_gl_pending_flush();
+}
 #define NV2A_GLCALL(name) (nv2a_gl_count(NV2A_GLID_##name), p_##name)
 
 /* Resolve every entry point. Returns the number that could not be found

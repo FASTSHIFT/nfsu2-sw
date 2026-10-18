@@ -41,6 +41,7 @@ volatile int g_knob[KN_COUNT] = {
     [KN_RAMP_EPS]         = 20,       /* docs/13 §6: below one 8-bit step */
     [KN_CLR_DEDUP]        = 1,        /* docs/13 §10 */
     [KN_TEX_MEMO]         = 1,        /* docs/13 §10 */
+    [KN_GL_MERGE]         = 1,        /* docs/13 §11 */
 };
 
 static const char *const s_count_name[KC_COUNT] = {
@@ -54,9 +55,9 @@ static const char *const s_knob_name[KN_COUNT] = {
     "POKE_VA", "POKE_VAL", "DUMP_DRAWS", "HUD",
     "EXP_DROPFRAG", "EXP_RD", "EXP_QUERY", "EXP_STATIC", "EXP_RDSEL",
     "GL_LEGACY", "DUMP_SEQ", "EXP_NOUNI", "CSCAN", "PX_PCT", "PX_BIG", "PX_STAT", "NATIVE_OFF", "EXP_MERGESTAT", "RAMP_EPS",
-    "CLR_DEDUP", "TEX_MEMO",
+    "CLR_DEDUP", "TEX_MEMO", "GL_MERGE",
 };
-static const int s_knob_min[KN_COUNT] = { 1, 1, 0, 50, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0 };
+static const int s_knob_min[KN_COUNT] = { 1, 1, 0, 50, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 static int s_quiet;                  /* RECOMP_KNOBS_QUIET: no [wake] lines */
 
