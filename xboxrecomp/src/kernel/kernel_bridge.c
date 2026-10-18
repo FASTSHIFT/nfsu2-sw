@@ -6962,11 +6962,33 @@ static void ke_shadow_init(void)
     g_ke_shadow_init = 1;
 }
 
+/* The table is open-addressed by guest VA (linear probing, deletion by
+ * backward shift, so a free slot always ends a probe). It used to be
+ * scanned front to back: a lookup of an object not in it -- the common case
+ * for objects the dispatcher knows as guest objects -- read all 4096 slots,
+ * and NFSU2's stream thread (g:2B1A22) spent 36% of its time there on the
+ * R36S, on the guest core. */
+static uint32_t ke_shadow_home(uint32_t guest_va)
+{
+    return ((guest_va >> 2) * 2654435761u) >> (32 - 12);   /* 12 = log2 KE_SHADOW_SIZE */
+}
+typedef char ke_shadow_size_is_4096[KE_SHADOW_SIZE == (1 << 12) ? 1 : -1];
+
+/* The slot holding guest_va, or the free slot where it would go (-1: full). */
+static int ke_shadow_find(uint32_t guest_va)
+{
+    uint32_t i = ke_shadow_home(guest_va), n;
+    for (n = 0; n < KE_SHADOW_SIZE; n++, i = (i + 1) & (KE_SHADOW_SIZE - 1))
+        if (!g_ke_shadow[i].in_use || g_ke_shadow[i].guest_va == guest_va)
+            return (int)i;
+    return -1;
+}
+
 /* Insert a mapping guest_va -> host HANDLE. Replaces any prior mapping for
  * the same guest_va (closing the old handle and inserting the new one). */
 static void ke_shadow_insert(uint32_t guest_va, HANDLE host)
 {
-    uint32_t i;
+    int i;
 
     if (!guest_va || !host)
         return;
@@ -6974,27 +6996,21 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host)
     ke_shadow_init();
 
     EnterCriticalSection(&g_ke_shadow_cs);
-
-    /* Reuse an existing slot for this VA, if present. */
-    for (i = 0; i < KE_SHADOW_SIZE; i++) {
-        if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
-            if (g_ke_shadow[i].host_handle && g_ke_shadow[i].host_handle != host)
-                CloseHandle(g_ke_shadow[i].host_handle);
-            g_ke_shadow[i].host_handle = host;
-            LeaveCriticalSection(&g_ke_shadow_cs);
-            return;
-        }
+    i = ke_shadow_find(guest_va);
+    if (i >= 0 && g_ke_shadow[i].in_use) {
+        /* Reuse the existing slot for this VA. */
+        if (g_ke_shadow[i].host_handle && g_ke_shadow[i].host_handle != host)
+            CloseHandle(g_ke_shadow[i].host_handle);
+        g_ke_shadow[i].host_handle = host;
+        LeaveCriticalSection(&g_ke_shadow_cs);
+        return;
     }
-
-    /* Otherwise find a free slot. */
-    for (i = 0; i < KE_SHADOW_SIZE; i++) {
-        if (!g_ke_shadow[i].in_use) {
-            g_ke_shadow[i].in_use      = 1;
-            g_ke_shadow[i].guest_va    = guest_va;
-            g_ke_shadow[i].host_handle = host;
-            LeaveCriticalSection(&g_ke_shadow_cs);
-            return;
-        }
+    if (i >= 0) {
+        g_ke_shadow[i].in_use      = 1;
+        g_ke_shadow[i].guest_va    = guest_va;
+        g_ke_shadow[i].host_handle = host;
+        LeaveCriticalSection(&g_ke_shadow_cs);
+        return;
     }
 
     /* Table full -- log and drop the new object. The caller's subsequent
@@ -7008,8 +7024,8 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host)
 /* Look up the host HANDLE for a guest object VA. Returns NULL if not found. */
 static HANDLE ke_shadow_lookup(uint32_t guest_va)
 {
-    uint32_t i;
     HANDLE h = NULL;
+    int i;
 
     if (!guest_va)
         return NULL;
@@ -7017,12 +7033,9 @@ static HANDLE ke_shadow_lookup(uint32_t guest_va)
     ke_shadow_init();
 
     EnterCriticalSection(&g_ke_shadow_cs);
-    for (i = 0; i < KE_SHADOW_SIZE; i++) {
-        if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
-            h = g_ke_shadow[i].host_handle;
-            break;
-        }
-    }
+    i = ke_shadow_find(guest_va);
+    if (i >= 0 && g_ke_shadow[i].in_use)
+        h = g_ke_shadow[i].host_handle;
     LeaveCriticalSection(&g_ke_shadow_cs);
     return h;
 }
@@ -7030,7 +7043,7 @@ static HANDLE ke_shadow_lookup(uint32_t guest_va)
 /* Remove (and close) the mapping for a guest object VA. */
 static void ke_shadow_remove(uint32_t guest_va)
 {
-    uint32_t i;
+    int i;
 
     if (!guest_va)
         return;
@@ -7038,15 +7051,27 @@ static void ke_shadow_remove(uint32_t guest_va)
     ke_shadow_init();
 
     EnterCriticalSection(&g_ke_shadow_cs);
-    for (i = 0; i < KE_SHADOW_SIZE; i++) {
-        if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
-            if (g_ke_shadow[i].host_handle)
-                CloseHandle(g_ke_shadow[i].host_handle);
-            g_ke_shadow[i].in_use      = 0;
-            g_ke_shadow[i].guest_va    = 0;
-            g_ke_shadow[i].host_handle = NULL;
-            break;
+    i = ke_shadow_find(guest_va);
+    if (i >= 0 && g_ke_shadow[i].in_use) {
+        uint32_t hole = (uint32_t)i, j = (uint32_t)i;
+        if (g_ke_shadow[i].host_handle)
+            CloseHandle(g_ke_shadow[i].host_handle);
+        /* Backward shift: pull later entries of the probe run into the hole
+         * when their home slot does not lie in (hole, j]. */
+        for (;;) {
+            uint32_t k;
+            j = (j + 1) & (KE_SHADOW_SIZE - 1);
+            if (!g_ke_shadow[j].in_use)
+                break;
+            k = ke_shadow_home(g_ke_shadow[j].guest_va);
+            if (((j - k) & (KE_SHADOW_SIZE - 1)) >= ((j - hole) & (KE_SHADOW_SIZE - 1))) {
+                g_ke_shadow[hole] = g_ke_shadow[j];
+                hole = j;
+            }
         }
+        g_ke_shadow[hole].in_use      = 0;
+        g_ke_shadow[hole].guest_va    = 0;
+        g_ke_shadow[hole].host_handle = NULL;
     }
     LeaveCriticalSection(&g_ke_shadow_cs);
 }
