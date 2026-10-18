@@ -196,6 +196,16 @@ else()
              "-fprofile-correction" "-Wno-missing-profile")
     endif()
 
+    # x86 has no FMA, so the title's float maths never fuses a*b+c; GCC on
+    # aarch64 does by default (fmadd). The native rewrites in recomp_manual.c
+    # are meant to give the x86 result bit for bit, so they never fuse.
+    # NFSU2_GEN_FP_EXACT does the same for the lifted code (verification:
+    # RECOMP_NATIVE_CHECK=1 then compares like with like on aarch64).
+    set_property(SOURCE src/recomp_manual.c APPEND PROPERTY COMPILE_OPTIONS "-ffp-contract=off")
+    option(NFSU2_GEN_FP_EXACT "Lifted code: no FMA contraction (x86 float results)" OFF)
+    if(NFSU2_GEN_FP_EXACT)
+        list(APPEND _gen_opts "-ffp-contract=off")
+    endif()
     set_source_files_properties(${RECOMP_GEN_SOURCES} PROPERTIES
         COMPILE_OPTIONS "${_gen_opts}")
     target_link_libraries(${PROJECT_NAME} PRIVATE m)

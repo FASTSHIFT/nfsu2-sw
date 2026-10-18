@@ -111,12 +111,14 @@ PX 10 下行驶时 GL 线程开始等游戏线程（`wait` 10-22 ms），游戏�
 ## 7. 复现
 
 ```bash
-# 设备构建（gen 里 sub_001C6900 / sub_002213EA / sub_002A68EC / sub_000A3FA0 已改名 _gen）
-NFSU2_GEN_DIR=$PWD/build/gen-hud EXTRA_CMAKE="-DNFSU2_WRAP_FENGHUD=ON -DNFSU2_WRAP_PXSIZE=ON -DNFSU2_NATIVE_MATMUL=ON -DNFSU2_NATIVE_FTOL=ON -DNFSU2_WRAP_RAMP=ON" bash r36s/build.sh
-# 同一次启动里交替比较
-python3 -u r36s/autotest.py --host 192.168.10.241 --sweep --set a:PX_PCT=35 --set b:PX_PCT=10,PX_BIG=200
+# 合并上游后（§9）不再需要手工改名 _gen，也不需要额外的 -D 选项：
+# tools/regen.sh 按 recomp_manual.c 的 extern ... _gen 行自动处理
+NFSU2_XBE=$PWD/build/game/default.xbe NFSU2_GEN_DIR=$PWD/build/gen-up bash tools/regen.sh
+NFSU2_GEN_DIR=$PWD/build/gen-up bash r36s/build.sh
+# 同一次启动里交替比较（--host 见 AGENT.md）
+python3 -u r36s/autotest.py --host <r36s> --sweep --set a:PX_PCT=35 --set b:PX_PCT=10,PX_BIG=200
 # 每 draw 阶段
-python3 -u r36s/autotest.py --host 192.168.10.241 --trace --env RECOMP_KNOB_PX_PCT=10
+python3 -u r36s/autotest.py --host <r36s> --trace --env RECOMP_KNOB_PX_PCT=10
 python3 tools/trace_draw_phases.py build-r36s/autotest/<dir>/xtrace/base.pftrace
 ```
 
@@ -128,3 +130,28 @@ autotest 的"进入比赛"判定：大 draw（≥50 索引）≥ 350，或 HUD l
 2. textures 阶段 8-10 µs：每帧每纹理一次 `bytes_hash`（GL 线程 1.7%）和 4 个 stage 的查表，可以按"纹理 VA 与上一 draw 相同"短路。
 3. 合并：不改 shader 的只有 ~19%；要更多得先在真机上小规模验证"每 draw 一个矩阵"的 shader 方案（per-vertex 块号属性代替 gl_VertexID 循环），见 §4。
 4. 温控：70 ℃ 被动点后降到 1008 MHz，驱动每 draw 慢 ~20%。
+
+## 9. 合并上游（antoxa2584x/nfsu2-sw v0.5.13，2026-10-18）
+
+上游在我们分叉（5a24c21）之后有 34 个提交，合并提交 fd80e1e。对 R36S 有用的部分：
+
+| 上游改动 | 对我们 |
+|---|---|
+| 59.94 Hz vblank（原来 now+16 ms 配 10 ms 等待，实际约 46 Hz；游戏隔一个 vblank 翻帧，上限约 23 fps） | `[fps]` 行现在带 vblank 频率，设备上 59.9-60.0 Hz；PC 进比赛 30 s → 12 s |
+| 种子 0x930D0（比赛每帧的间接调用失败） | 日志里的 `[15] 0x000930D0` 消失 |
+| 执行器里的视野外批次剔除（`RECOMP_CULL`，默认开，跑在 executor 线程） | 起跑线 dc 834-871 → 712-824 |
+| 原生重写：_ftol2、矩阵乘、GetPixelSize、颜色查找表、sin、点/矩阵变换等 | 我们自己的 bMulMatrix/_ftol2 删掉，用上游的；PX_PCT/PX_BIG 包在上游原生 GetPixelSize 外面；RAMP_EPS 在上游原生颜色表前面挡掉多余的重建 |
+| Vulkan 实例化、Switch 专属改动 | R36S 用不上 |
+
+冲突处理：CMake 保留我们的 LTO/PGO 块；保留 xtrace 标记、ES shader 路径、NFSU2_SAVE_DIR；`[fps]` 行同时带 draws/frame 和 vblank。
+
+**FMA**：设备上 `RECOMP_NATIVE_CHECK=1` 报 `sub_0004B260`（sin）每 100 万次约 4 万次不一致，PC 上为 0。原因是 aarch64 的 GCC 默认把 a*b+c 融合成 fmadd，x86 没有 FMA。`recomp_manual.c` 现在固定 `-ffp-contract=off`（原生实现给出 x86 的结果）；`-DNFSU2_GEN_FP_EXACT=ON` 让 lifted 代码也不融合，用来在设备上验证：这样编出来的版本，运行到的 11 个原生函数全部 0 不一致。正常构建不开这个选项（lifted 代码里的 FMA 一直都在，画面没问题）。
+
+**实测**（起跑线，PX 10 + PX_BIG 200，每次冷却到 ≤ 66 ℃ 后单独启动，7 个窗口取中位数，两个版本交替跑）：
+
+| 版本 | 帧时间（ms） | dc |
+|---|---|---|
+| 合并前 | 55.7 / 57.0 | 834 / 871 |
+| 合并后 | 49.9 / 54.5 / 53.3 | 712 / 824 / 745 |
+
+平均 56.4 → 52.6 ms（-7%），主要来自剔除减掉的 draw。起跑线是 GL 线程瓶颈，vblank 修正和游戏线程的原生重写在这里看不出来；帧时间低于 33 ms，或者游戏线程成为瓶颈（行驶中 `wait` > 0）时才会显出来。
