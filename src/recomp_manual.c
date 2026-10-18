@@ -2230,6 +2230,7 @@ void sub_00076A70(void)
 #pragma GCC optimize ("fp-contract=off")
 void sub_0027AF30(void);
 void sub_0027CCF0(void);
+void sub_0027B5B5(void);
 
 static int native_mode_mix(void)
 {
@@ -2311,12 +2312,68 @@ static void resample_native(void)
     esp += 4;
 }
 
+/* sub_0027C040: cdecl (float *state, int n, const float *src, float *dst):
+ * a one-pole filter on the x87 stack, so in double precision between steps
+ * (the lifted code's fp stack is double):
+ *   acc = state[0];  do { acc = acc * state[1] + state[2] * src[i];
+ *                         dst[i] = (float)acc; } while (++i < n);
+ *   state[0] = (float)acc
+ * The loop is a do-while: n = 0 still writes dst[0], as the original does.
+ * Each product and the sum round once to double, as fmul/faddp did. */
+static void onepole_native(void)
+{
+    uint32_t st = MEM32(esp + 4), src = MEM32(esp + 12), dst = MEM32(esp + 16);
+    int32_t n = (int32_t)MEM32(esp + 8), i = 0;
+    const float *s = (const float *)XBOX_PTR(src);
+    float *d = (float *)XBOX_PTR(dst);
+    double acc = (double)MEMF(st);
+    const double a = (double)MEMF(st + 4), b = (double)MEMF(st + 8);
+
+    do {
+        double t = b * (double)s[i];
+        acc = acc * a;
+        acc = acc + t;
+        d[i] = (float)acc;
+    } while (++i < n);
+    MEMF(st) = (float)acc;
+    esp += 4;
+}
+
+/* sub_0027B5B5: cdecl (obj, int n, float *buf, int16_t *out), returns n:
+ * float samples to 16-bit with clipping by the magic-number trick --
+ *   buf[i] += K (K at 0x3700D4; the sum is written back), bits = low 20
+ *   bits of the sum; bits <= 0x7FFF or >= 0xF8000 is the sample, anything
+ *   between clips to 0x7FFF (below 0x80000) or 0x8000.
+ * With a callback at obj+8 the original first calls it (and may return
+ * early); that path stays lifted. */
+static unsigned long s_tos16_cb;
+static void tos16_native(void)
+{
+    uint32_t n = MEM32(esp + 8), p = MEM32(esp + 12), out = MEM32(esp + 16);
+    uint32_t end = p + n * 4u;
+    const float k = MEMF(0x003700D4u);
+
+    for (; p < end; p += 4, out += 2) {
+        float f = MEMF(p) + k;
+        uint32_t bits;
+        MEMF(p) = f;
+        memcpy(&bits, &f, 4);
+        bits &= 0xFFFFFu;
+        if (bits > 0x7FFFu && bits < 0xF8000u)
+            bits = bits < 0x80000u ? 0x7FFFu : 0x8000u;
+        MEM16(out) = (uint16_t)bits;
+    }
+    eax = n;
+    ecx = end;                          /* the original leaves its loop bound there */
+    esp += 4;
+}
+
 /* Native + check: the lifted function on a copy of the output, compared. */
 static void native_checked(void (*native)(void), void (*lifted)(void), const char *name,
                            uint32_t dst, uint32_t bytes, uint32_t st0, uint32_t st1)
 {
-    static unsigned long calls[2], bad[2];
-    int w = native == resample_native;
+    static unsigned long calls[4], bad[4];
+    int w = native == resample_native ? 1 : native == onepole_native ? 2 : native == tos16_native ? 3 : 0;
     uint8_t *d = (uint8_t *)XBOX_PTR(dst);
     static uint8_t keep[65536], mine[65536];
     uint32_t s0 = st0 ? MEM32(st0) : 0, s1 = st1 ? MEM32(st1) : 0, n0, n1;
@@ -2350,6 +2407,54 @@ static void mix_gain_entry(void)
                        MEM32(esp + 16), MEM32(esp + 4) * 4u, 0, 0);
     else
         mix_gain_native();
+}
+
+/* Called directly (the call at 0x0027A8F7), not through the dispatch table:
+ * replaced by name, the lifted body renamed _gen by tools/regen.sh. */
+extern void sub_0027C040_gen(void);
+void sub_0027C040(void)
+{
+    int32_t n = (int32_t)MEM32(esp + 8);
+    int mode = native_mode_mix();
+    if (mode == 0)
+        sub_0027C040_gen();
+    else if (mode == 2 && n >= 0)
+        native_checked(onepole_native, sub_0027C040_gen, "sub_0027C040 one-pole",
+                       MEM32(esp + 16), (uint32_t)(n > 0 ? n : 1) * 4u, MEM32(esp + 4), 0);
+    else
+        onepole_native();
+}
+
+static void tos16_entry(void)
+{
+    uint32_t obj = MEM32(esp + 4), n = MEM32(esp + 8), buf = MEM32(esp + 12), out = MEM32(esp + 16);
+    if (MEM32(obj + 8)) {                       /* the callback path: lifted */
+        s_tos16_cb++;
+        sub_0027B5B5();
+        return;
+    }
+    if (native_mode_mix() == 2 && n <= 16384) {
+        /* Both outputs (the samples written back, the 16-bit copy) and eax. */
+        static unsigned long calls, bad;
+        static uint8_t keep_b[65536], keep_o[32768], mine_b[65536], mine_o[32768];
+        uint8_t *pb = (uint8_t *)XBOX_PTR(buf), *po = (uint8_t *)XBOX_PTR(out);
+        uint32_t sp = esp, my_eax;
+        memcpy(keep_b, pb, n * 4); memcpy(keep_o, po, n * 2);
+        tos16_native();
+        my_eax = eax;
+        memcpy(mine_b, pb, n * 4); memcpy(mine_o, po, n * 2);
+        memcpy(pb, keep_b, n * 4); memcpy(po, keep_o, n * 2);
+        esp = sp;
+        sub_0027B5B5();
+        calls++;
+        if ((memcmp(mine_b, pb, n * 4) || memcmp(mine_o, po, n * 2) || my_eax != eax) && bad++ < 20)
+            fprintf(stderr, "[native] sub_0027B5B5 to-s16 mismatch (call %lu, n %u)\n", calls, n);
+        if (calls == 1 || (calls & 0x7FFF) == 0)
+            fprintf(stderr, "[native] sub_0027B5B5 to-s16: %lu calls, %lu mismatches, %lu via the callback (lifted)\n",
+                    calls, bad, s_tos16_cb);
+        return;
+    }
+    tos16_native();
 }
 
 static void resample_entry(void)
@@ -2389,6 +2494,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
     if (native_mode_mix()) {
         if (xbox_va == 0x0027AF30u) return mix_gain_entry;
         if (xbox_va == 0x0027CCF0u) return resample_entry;
+        if (xbox_va == 0x0027B5B5u) return tos16_entry;
     }
     return (recomp_func_t)0;
 }
