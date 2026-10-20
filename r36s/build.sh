@@ -15,6 +15,11 @@
 #   JOBS           parallel jobs (default: nproc for cross, 8 under qemu; each
 #                  -O2 chunk takes ~0.4 GB)
 #   BUILD_DIR      default build-r36s (cross) / build-r36s-qemu
+#   VULKAN=1       the Vulkan renderer (nv2a_vk, Vulkan 1.0 paths on the Mali
+#                  blob) instead of GLES; default BUILD_DIR build-r36s-vk. The
+#                  image has no arm64 Vulkan: libvulkan/libshaderc are opened at
+#                  run time and the headers come from the host (VK_HEADERS, a
+#                  directory with vulkan/ and vk_video/; default /usr/include).
 #   EXTRA_CMAKE    extra -D options, e.g. A/B builds (docs/03):
 #                    "-DNFSU2_LTO=ON" "-DNFSU2_GEN_NONVOLATILE=ON"
 #                    "-DNFSU2_PGO=gen -DNFSU2_PGO_DIR=/roms/ports/nfs8/pgo"
@@ -33,16 +38,23 @@ if [ "${QEMU:-0}" = "1" ]; then
     FF_CROSS=""
 else
     IMAGE=nfsu2-r36s-cross:focal; PLATFORM=()
-    BUILD="${BUILD_DIR:-build-r36s}"; JOBS="${JOBS:-$(nproc)}"
+    BUILD="${BUILD_DIR:-build-r36s$([ "${VULKAN:-0}" = 1 ] && echo -vk)}"; JOBS="${JOBS:-$(nproc)}"
     CC=aarch64-linux-gnu-gcc
     TOOLCHAIN="-DCMAKE_TOOLCHAIN_FILE=/src/r36s/toolchain-aarch64.cmake"
     OBJDUMP=aarch64-linux-gnu-objdump; READELF=aarch64-linux-gnu-readelf
     FF_CROSS="--enable-cross-compile --cross-prefix=aarch64-linux-gnu- --arch=aarch64 --target-os=linux"
 fi
 mkdir -p "$REPO/$BUILD" "$REPO/build-r36s" "$CCACHE"
+VK_MOUNT=(); VK_CMAKE=""
+if [ "${VULKAN:-0}" = "1" ]; then
+    VKH="${VK_HEADERS:-/usr/include}"
+    [ -f "$VKH/vulkan/vulkan_core.h" ] || { echo "error: no vulkan/vulkan_core.h in $VKH" >&2; exit 1; }
+    VK_MOUNT=(-v "$VKH/vulkan":/vkinc/vulkan:ro -v "$VKH/vk_video":/vkinc/vk_video:ro)
+    VK_CMAKE="-DNFSU2_VULKAN=ON -DXBOXRECOMP_VK_DLOPEN=ON -DXBOXRECOMP_VK_HEADERS=/vkinc"
+fi
 
 run() {
-    docker run --rm "${PLATFORM[@]}" \
+    docker run --rm "${PLATFORM[@]}" "${VK_MOUNT[@]}" \
         --user "$(id -u):$(id -g)" -e HOME=/tmp \
         -e CCACHE_DIR=/ccache -e CCACHE_MAXSIZE=8G -v "$CCACHE":/ccache \
         -v "$REPO":/src -v "$GEN":/gen:ro -w /src \
@@ -84,7 +96,7 @@ run "
         -DCMAKE_C_COMPILER_LAUNCHER=ccache \
         -DCMAKE_C_FLAGS='-mcpu=cortex-a35' \
         -DCMAKE_EXE_LINKER_FLAGS=-Wl,--as-needed \
-        -DXBOXRECOMP_EMBEDDED=ON -DNFSU2_GEN_DIR=/gen $FF ${EXTRA_CMAKE:-} >/dev/null
+        -DXBOXRECOMP_EMBEDDED=ON -DNFSU2_GEN_DIR=/gen $FF $VK_CMAKE ${EXTRA_CMAKE:-} >/dev/null
     ninja -C $BUILD -j$JOBS
     file $BUILD/nfsu2_recomp
     echo -n 'max GLIBC: '; $OBJDUMP -T $BUILD/nfsu2_recomp | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
