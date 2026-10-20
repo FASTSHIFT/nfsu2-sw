@@ -454,3 +454,71 @@ GL 线程少了 ~1.2 ms，帧时间只少 0.3 ms（噪声内）：GL 线程一�
 - 驱动部分 Vulkan 约为 GL 的一半（合成测试是 1/2-1/3，游戏里有管线绑定、描述符集更新和每帧提交）。
 - 但 Vulkan 的所有渲染工作和推送缓冲解释在同一个执行器线程上串行（~40 ms/帧），GL 版是执行器（~40% 核）和 GL 线程（~100%）两条线并行，所以整帧没有变快。
 - 上限：游戏主线程本身每帧在 CPU 上 ~40 ms（Vulkan 版 6231 个样本 / 8 s；GL 版 75-81% 一个核），渲染再快，帧时间也在 ~40 ms（~25 fps）附近，目前是 ~50 ms（20 fps）。
+
+## 18. 主线程计算链路（用 GC 符号给 Xbox 函数命名）
+
+### 18.1 方法
+- GC 侧：`Speed.elf.c` 缺不少函数体（`World::DoTimestep`、`DoTimestepCollisions`、`IntegrateEuler`、`World::GetTimestep` 都没有），所以直接读 `disc/files/Speed.elf` 的符号表（15029 个函数）+ 逐字解码 `bl`，得到完整的直接调用图（`tmp/chain/gcelf.py` → `gcelf.json`，CodeWarrior 名字粗略还原成 `Class::method`）。
+- Xbox 侧：§16.7 那次 perf 的主线程调用栈（Vulkan 版，比赛中，6231 个样本，`tmp/chain/main_stacks.txt.gz`）+ gen 里的 `CALL()` 静态调用图。
+- 对齐：从结构确定的一对（`MainLoop` = `sub_0018A8C0`）开始，把两边**按调用顺序**排列的直接被调函数并排比较（函数大小、被调数、重复次数）；虚函数调用在静态图里看不到，靠 perf 栈里的父子关系补。`tmp/chain/side.py X=GCADDR` 并排打印，`ntree.py` 打印带名字的动态树。
+- 表里只列结构对得上的（被调序列逐项对上，或大小/被调数/唯一调用关系都一致）；带 ≈ 的是只有一两条证据。`prop.py` 的自动传播结果有误配（比如所有空函数 `sub_00011000` 被配成同一个名字），没有直接采用。
+
+### 18.2 主线程一帧（% 为占主线程样本，含子函数；主线程 ~40 ms/帧 CPU）
+| Xbox | GC 名字 | 含子 | 自身 |
+|---|---|---|---|
+| `sub_0018A8C0` | `MainLoop` | 100 | 0 |
+| ├ `sub_001F9E40` | `World::DoTimestep`（Xbox 41 个被调、GC 46 个，顺序对得上） | 53.6 | 0.2 |
+| │ ├ `sub_001E1130` | `World::DoTimestepMove`（遍历 CollisionBodyList，虚调 Move） | 29.9 | 0 |
+| │ │ └ `sub_001B4730` | `CarCollisionBody::Move`（两条路径合计 36.2） | 29.9 | 0.1 |
+| │ │ &nbsp;&nbsp;└ `sub_001F1260` | `Car::Move` | 29.6 | 0.1 |
+| │ │ &nbsp;&nbsp;&nbsp;&nbsp;├ `sub_001C1510` | `PhysicsMover::Move`（玩家/对手车，见 18.3） | 21.1 | 0.1 |
+| │ │ &nbsp;&nbsp;&nbsp;&nbsp;│ └ `sub_001B4CD0` | `PhysicsSystem::IntegrateEuler`（两条路径合计 31.3） | 20.1 | 1.1 |
+| │ │ &nbsp;&nbsp;&nbsp;&nbsp;│ &nbsp;&nbsp;├ `sub_001BAA90` | 组件遍历（各组件 ResolveForces / ComputeAuxiliaries 的虚调） | 17.4 | 0.3 |
+| │ │ &nbsp;&nbsp;&nbsp;&nbsp;│ &nbsp;&nbsp;│ ├ `sub_001BAB00` | `PhysicsMover::ResolveForces`（9 个被调逐项对上） | 9.1 | 0.3 |
+| │ │ &nbsp;&nbsp;&nbsp;&nbsp;│ &nbsp;&nbsp;│ │ └ `sub_001B6700` | `PhysicsMover::IterateForces`（`Wheel::GuessGroundForce` `001B2B10`、`Wheel::FinalizeGroundForce` `001A8250`、`DriveTrain::*Clutch*`） | 6.0 | 1.1 |
+| │ │ &nbsp;&nbsp;&nbsp;&nbsp;│ &nbsp;&nbsp;│ ├ `sub_001B2FF0` | ≈`Suspension::ComputeAuxiliaries`（3×bSin、3×矩阵乘；下面 `001A7E90` → `001D7890` `TopologyCoordinate::NewGetElevation`） | 3.2 | 0.7 |
+| │ │ &nbsp;&nbsp;&nbsp;&nbsp;│ &nbsp;&nbsp;│ └ `sub_001B6400` | `PhysicsMover::BottomOut`（→ `001AB710` `PhysicsSystem::ComputeAuxiliaries`） | 2.7 | 0.1 |
+| │ │ &nbsp;&nbsp;&nbsp;&nbsp;│ &nbsp;&nbsp;└ `sub_001AB6B0` | `PhysicsSystem::GetDerivative` | 1.8 | 0.4 |
+| │ │ &nbsp;&nbsp;&nbsp;&nbsp;└ `sub_001B55A0` | `MellowMover::Move`（远处/交通车的简化物理，同样走 IntegrateEuler） | 6.9 | 0.1 |
+| │ ├ `sub_001EF9A0` | `World::DoTimestepCollisions`（17 个被调逐项对上） | 9.7 | 0 |
+| │ │ ├ `sub_001BCB00` | `Contact::Resolve` → 再调一次 `CarCollisionBody::Move`（碰撞后重算物理） | 7.3 | 0 |
+| │ │ └ `sub_001BF400` | `CollisionBodyWitness::TestForContact` | 1.7 | 0 |
+| │ ├ `sub_0003B2D0` | `RaceCarController::Think`（对手 AI） | 5.7 | 0 |
+| │ │ └ `sub_00039CC0` → `0002B490` → … → `00037EF0` | `AICarController::Think` → `ExecuteCurrentAction` → ≈`PsychoDriver::Drive`（转向/油门 PID、查表） | 5.6 | 0 |
+| │ ├ `sub_00038E90` | ≈`TrafficController::Think` | 1.1 | 0 |
+| │ └ `sub_00049EF0` | `CAnimPlayer::UpdateTime` | 1.4 | 0 |
+| ├ `sub_000AEA90` | `eDisplayFrame`（Xbox 版，结构和 GC 差别大） | 39.1 | 0 |
+| │ ├ `sub_000ADF60` | 主视图的场景/车绘制（GC 里是 `eDisplayFrame` 内联的一段） | 30.4 | 0 |
+| │ │ ├ `sub_000AD7D0` | 贴图 bucket flush（≈`eFlushTextureBucketList` 的 Xbox 实现，下面是 D3D 推送缓冲） | 10.3 | 1.3 |
+| │ │ ├ `sub_002106F0` | `RenderCars`（Xbox 13 个被调、GC 14 个，顺序对得上） | 8.4 | 0.1 |
+| │ │ │ ├ `sub_0020BC50` | `CarRenderInfo::Render`（Xbox 301 个被调，GC 307） | 6.3 | 0.9 |
+| │ │ │ └ `sub_00204D60` | `CarRenderInfo::RenderFast` | 1.6 | 0.3 |
+| │ │ ├ `sub_001D9E30` → `001D9DB0` → `001C6DC0` | `GrandSceneryCullInfo::DoCulling` → `CullView` → `ScenerySectionHeader::TreeCull` | 4.8 | 0.7 |
+| │ │ │ └ `sub_001C69C0` | `ScenerySectionHeader::DrawAScenery`（§2，`001C6900` = `eView::GetPixelSize`） | 3.4 | 2.0 |
+| │ │ ├ `sub_001C6EF0` | `GrandSceneryCullInfo::StuffScenery`（→ `000ACB30` `eViewPlatInterface::Render`） | 1.6 | 0.1 |
+| │ │ └ `sub_00206330` | ≈`RenderCarReflections` | 1.1 | 0 |
+| │ ├ `sub_000AE590` | HUD/前端界面（`0014xxxx` 一带 ≈ `cFEngRender::PackageFinished` / `RenderObject`） | 4.1 | 0 |
+| │ └ `sub_000AC6F0` | 光晕/反射一类的附加 pass（未细分） | 3.8 | 0 |
+| └ `sub_00091760` | `EAXSound::Update`（音频逻辑，混音在别的线程） | 4.3 | 0 |
+
+运行时自身（`recomp_lookup` + `recomp_lookup_manual`）1.5%。最高的单个函数自身时间是 `DrawAScenery` 2.0%，其余都在 1.5% 以下：没有可以单独改写的热点。
+
+### 18.3 物理是按固定步长子步的，帧越慢每帧子步越多
+GC `PhysicsMover::Move`（Xbox `sub_001C1510`，同样的 `fdiv [0x3A55B0]` → `_ftol` → `+1`）：
+```
+n = (int)(dt / MaximumTimeStep) + 1;          // MaximumTimeStep = 0.0044 s
+for (i = 0; i < n; i++) IntegrateEuler(dt / n);
+```
+- Xbox 的两个常量都在 `.data`（可写）：`MaximumTimeStep` = 0.0044 @ `0x3A55B0`，`MaxiMellowTimeStep`（`MellowMover::Move`）= 1/70 @ `0x3A5580`。GC 里还有 `SmokeableMaximumTimeStep` = 1/60。
+- `dt` 由 `PrepareRealTimestep` 按 1/60 s 的 tick 量化，最多 `MaxTicksPerTimestep` = 3 个 tick（GC 的值；Xbox 的对应变量没找）。所以 R36S 上 ~50 ms/帧时 dt 被截在 50 ms：每辆 PhysicsMover 车**每帧 12 个子步**（60 fps 时是 4 个），MellowMover 车 4 个。再慢游戏就变成慢动作。
+- 子步频率约 1/0.0044 ≈ 230-240 Hz，物理每秒的总开销与帧率无关；帧率低时它占每帧的比例就高。上表里车辆物理合计 36.2%（~14 ms/帧），其中玩家/对手车的 IntegrateEuler ~25%。
+- 子步数没有在设备上直接计数，以上来自 GC 代码 + Xbox 的同一常量；"12 步"是推算。
+
+### 18.4 能动的地方（按预计收益）
+1. 物理子步：把 `0x3A55B0` 从 0.0044 提到 0.0066 → 12 步变 8 步，物理约 -1/3（主线程 ~-4-5 ms/帧）；提到 0.0088 → 6 步（~-7 ms）。代价是显式欧拉对硬悬挂的稳定性和手感会变，必须实车试（颠簸路面、落地、撞墙）。是一个启动时写一个 float 的 knob，改动最小。
+2. 碰撞后重算：`Contact::Resolve` 再跑一遍 `CarCollisionBody::Move` 占 6.2%，随 1 一起下降。
+3. AI（5.7%）、音频逻辑（4.3%）、HUD（4.1%）各自都不大。
+4. 绘制侧的 guest 代码（39%）里 bucket flush 10.3% 和 `CarRenderInfo::Render` 6.3% 最大，但它们的大头是生成推送缓冲，减少它们需要减少 draw（§2 的 PX_PCT 已经在做）。
+5. 单函数原生改写：最热的也只有 2% 自身时间，收益小。
+
+注意主线程降下来不等于帧率升：GL 版的 GL 线程、Vulkan 版的执行器线程每帧也在 40-50 ms，两边都要降。
