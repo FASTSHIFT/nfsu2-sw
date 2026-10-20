@@ -371,3 +371,76 @@ GL 线程少了 ~1.2 ms，帧时间只少 0.3 ms（噪声内）：GL 线程一�
 - `tmp/vkbench/vkbench.c`（同样 800 个小 draw，离屏 640×480）：每 draw 一个 push constant，录制 6.8 µs；加每 draw 动态偏移的 UBO（整份 3 KB `c[]`），9.6 µs；再加每 4 个 draw 换描述符集、每 8 个换管线，9.8 µs。一帧录制加提交加 GPU 共 10-14 ms。GLES 同样负载 14-17 µs/draw，加 glFinish 15-18 ms。
 - 游戏里 GL 每 draw 约 45 µs（驱动 30 + 我们 15），所以 Vulkan 估计能省下 750 个 draw × 约 15-20 µs ≈ 10-15 ms/帧（没验证）。
 - 代价：现有的 `nv2a_vk` 需要 Vulkan 1.3（dynamic rendering、push descriptor、extended dynamic state、动态顶点输入），这个驱动全都没有。要改成 render pass、描述符集，把这些状态都做进管线排列组合，再加离屏到 KMS 的呈现，工作量是几天量级。
+
+## 16. Vulkan 后端在 R36S 上的可行性
+### 16.1 驱动能力（`vulkaninfo`，libmali Mali-G31，Vulkan 1.0.108）
+- 设备扩展只有 15 个，都是 1.1 以前的 KHR 扩展（maintenance1/2、descriptor_update_template、dedicated_allocation、external_memory/fence/semaphore（无 dma-buf 导入导出）等）。没有 `VK_KHR_surface` / `swapchain` / `display`，没有 push descriptor、dynamic rendering、extended dynamic state、vertex input dynamic state。
+- 特性：没有 `depthClamp`、`logicOp`、`dualSrcBlend`、`textureCompressionBC`；有各向异性、ETC2/ASTC、independentBlend。
+- 限制：push constant 256 B，最多 4 个描述符集，动态 UBO 8 个，UBO 最大 64 KB，偏移对齐 16。
+- 内存：一个堆，类型 0 是 device-local + host-visible + coherent，类型 1 是 device-local + host-visible + cached，类型 2 是 lazily allocated。
+
+### 16.2 不用交换链也能显示（`tmp/vkbench/vkpresent.c`，已在设备上跑通）
+- 流程：离屏渲染到 640×480 的 B8G8R8A8 图像，`vkCmdCopyImageToBuffer` 拷到 cached 缓冲区，等 fence，按行 memcpy 到 KMS dumb buffer（XRGB8888），`drmModePageFlip`，两个 dumb buffer 轮换。300 帧 300 次 flip 全部成功，面板 640×480@78 Hz。
+- 每帧开销：invalidate 0.21 ms，memcpy 到 dumb buffer 1.04 ms（都在 CPU 上）。600 个小 draw 时，提交加 GPU 加拷贝共 4.5 ms。
+- 只改固定功能状态（cull、front face、blend、顶点 stride）的管线变体，每个 `vkCreateGraphicsPipelines` 只要 0.2-0.4 ms，第一条 109 ms（编译着色器）。所以把 1.3 的动态状态改成管线静态状态，代价主要是表变大，不会卡顿。shaderc 第一次编译（含初始化）约 1 s。
+
+### 16.3 和 GL 的每 draw 开销对比（§15.4 的测试）
+| | 每 draw CPU |
+|---|---|
+| Vulkan，push constant | 6.3-6.8 µs |
+| Vulkan，动态 UBO（整份 3 KB `c[]`）+ 描述符集 / 管线切换 | 9.6-9.8 µs |
+| GLES，同样负载 | 14-17 µs |
+| GLES，游戏里实测 | 约 45 µs（驱动 30 + 我们 15） |
+
+### 16.4 现有 `nv2a_vk` 需要改的地方（按现有代码估计）
+| 部分 | 要做的事 | 规模 |
+|---|---|---|
+| 实例 / 设备 | apiVersion 1.0，`pEnabledFeatures`，去掉 swapchain、push descriptor、vertex input dynamic 三个扩展和 12 个 1.3/EXT 入口 | 小，约 50 行 |
+| 渲染 | dynamic rendering 改成 VkRenderPass + framebuffer 缓存（只需两种：颜色、颜色+深度，都是 LOAD/STORE、GENERAL 布局），表面重建时清掉对应 framebuffer | 中，约 200 行 |
+| 管线状态 | cull/front/拓扑/深度/模板/顶点布局并进 PipeKey；strip、fan 在 CPU 上转 list；顶点布局去重成 id | 中到大，约 300 行 |
+| 描述符 | push descriptor 改成动态 UBO 偏移（绑定 0、1、6）+ 每帧描述符池（纹理组合各一个集） | 中，约 150 行 |
+| 着色器 | glslang C 接口改成 dlopen 的 shaderc，目标 Vulkan 1.0 / SPIR-V 1.0，换 SPIR-V 缓存的魔数 | 小，约 80 行 |
+| 呈现 | 换掉交换链：拷到 cached 缓冲区，交给 KMS flip 线程（16.2 的做法） | 中，约 200 行 |
+| 纹理 | 没有 BC：已有的 CPU 解码回退能用，但 DXT 是逐 texel 解码，慢；建议加一个按块解码的 BC1/2/3（约 100 行） | 小到中 |
+| 其它 | 帧环（2×48 MB）缩小；分辨率默认 1.5 倍要强制成 1；SDL 视频不用 kmsdrm（输入和音频照用） | 小 |
+
+- 全部约 1000-1200 行改动。另有两个风险：一是 1.0.108 这个老驱动在真实负载下是否稳定（只跑过合成测试）；二是 `nv2a_vk` 的录制全在执行器线程上，GL 后端有独立的提交线程，所以 Vulkan 版要么也加一个提交线程，要么接受执行器线程变重（但录制本身已比 GL 便宜一半以上）。
+- 建议的第一步：只做到无头（`RECOMP_VK_HEADLESS=1`）跑出第一帧并 dump 出图（前五项），确认驱动稳定、画面对，再接 KMS 呈现和性能工作。
+
+### 16.5 移植进度：Vulkan 1.0 路径（`nv2a_vk.c`，`s_vk10`）
+- 设备没有 1.3 / push descriptor / 动态顶点输入时自动走 1.0 路径；`RECOMP_VK_COMPAT=1` 在任何驱动上强制走（PC 上用 lavapipe 测）。
+  - 渲染：两个 VkRenderPass（颜色、颜色+深度模板），全部 LOAD/STORE、GENERAL 布局；framebuffer 按（颜色 view、深度 view、尺寸）缓存，view 进垃圾时一起回收。
+  - 状态：cull、winding、拓扑、深度、模板测试和操作、顶点布局（去重成 id）放进 PipeKey；动态的只剩 viewport、scissor、blend 常量、模板掩码和参考值。
+  - 描述符：绑定 0、1、6 改成动态 UBO（帧环里固定范围，每 draw 只换偏移；帧环 buffer 多留 64 KB 给绑定 6 的固定范围）；纹理组合每帧一个描述符集，从每帧的描述符池里分配，帧开始时重置。
+  - FXAA 在 1.0 路径下关闭（它用 dynamic rendering + push descriptor）。帧环 16 MB（`RECOMP_VK_RING_MB`）。
+- 构建：`XBOXRECOMP_VK_DLOPEN=ON` 时运行时打开 `libvulkan.so.1` 和 `libshaderc.so.1`（不需要 glslang，也不链接 Vulkan 库），1.0 驱动编译成 SPIR-V 1.0；`VULKAN=1 r36s/build.sh` 出 `build-r36s-vk/nfsu2_recomp`（Vulkan 头文件从宿主机挂进容器）。PC：`cmake -DNFSU2_VULKAN=ON -DXBOXRECOMP_VK_DLOPEN=ON`，shaderc 用 `apt-get download libshaderc1` 解出来的库。
+- 呈现：`SDL_VIDEODRIVER=kmsdrm`（R36S 启动脚本）时不初始化 SDL 视频，自己打开 `/dev/dri/card0`：每帧把要显示的表面 blit（加黑边）到面板大小的图像，拷进该帧的 cached 回读缓冲区；一个线程等该帧 fence 后 memcpy 到 dumb buffer 并翻页（16.2 的做法）。`RECOMP_VK_KMS=0` 改为无头。
+- PC（lavapipe）验证：1.0 路径进得了比赛，菜单、读取画面、比赛画面正常；关掉 BC（`RECOMP_GL_DXT=0`，和 Mali 一样）也正常，DXT 走 CPU 解码，有几帧 ~90 ms 的纹理卡顿。原来的 1.3 路径同一个二进制照常工作（含 FXAA）。
+- 还没做：设备上实测（设备掉线）；DXT 按块快速解码；执行器线程的录制开销。
+
+## 17. 死机后自动恢复（设备配置，`r36s/recovery/`）
+### 17.1 为什么"游戏死机 WiFi 也卡死"
+- WiFi 是 USB 网卡（RTL8188ETV，`8188eu`），经 USB hub 接在 `dwc2` 控制器上；这个控制器空闲时也有约 8000 次/秒中断，全在 CPU0。机器整体冻结时 WiFi 是外面唯一能看到的东西，所以看起来像"WiFi 卡死"。
+- 死机那次启动的控制台（ramoops）停在开机 287 s：`mali ff400000.gpu: job status 0x00000004 (TERMINATED) / GPU fault 0x04 from job slot 0`，之后再无任何输出，也没有 soft lockup / hung task 报告。正常 `kill -9` 游戏时也会出现同样两行而系统无事，所以这两行只说明游戏进程在 GPU 任务未完成时消失了；之后整机停止，最可能是 Mali 驱动清理该进程的 GPU 任务或复位 GPU 时卡死（未证实）。
+- 原来的系统：`kernel.panic=0`（panic 后永远挂着）、硬件看门狗在 DTB 里是 `disabled`。所以任何内核级卡死都只能按电源键。
+
+### 17.2 现在的三层恢复（都已装到设备上并实测）
+| 层 | 处理什么 | 做法 | 实测 |
+|---|---|---|---|
+| 硬件看门狗 | 整机冻结（内核/GPU 卡死、关中断） | DTB `watchdog@ff1e0000` 改为 `okay`（`dw_wdt` 驱动内核自带），systemd `RuntimeWatchdogSec=20s` 喂狗（硬件超时 21 s） | `kernel.panic=0` 下 `sysrq c` 让内核死掉，约 60 s 后自己重启回来 |
+| 内核 panic | oops、soft lockup、D 状态挂起 120 s | `/etc/sysctl.d/90-r36s-recover.conf`：`panic=10`、`panic_on_oops=1`、`softlockup_panic=1`、`hung_task_panic=1` | panic 日志进 pstore（`dmesg-ramoops-*`） |
+| r36s-guard 服务 | 系统活着但游戏卡住 / WiFi 卡住 | `r36s-guard.service`（SCHED_FIFO 10）：游戏进程 180 s 没写 `log.txt` 就按 PID 杀掉并重启 `oga_events`；有载波但网关 120 s 不通就 `wlan0` down/up，再不行就让 USB 网卡重新枚举（不会因为 WiFi 重启机器，离开信号范围时没有载波，不触发）；挂起唤醒后计时重来 | 假游戏进程 21 s 被杀；网关 ARP 被篡改后 30 s 触发 down/up，网络恢复 |
+- 取证：guard 每 5 s 往内核日志写一行心跳（负载、内存、温度、GPU 占用、USB 中断计数、WiFi 收发计数、游戏进程状态），会进 ramoops。每次开机把上一次的 `console-ramoops` / `dmesg-ramoops` 拷到 `/roms/ports/nfs8/crashlogs/`（保留 30 份）。下次死机后看最后几行心跳就知道死前在干什么。
+- 安装：`r36s/recovery/` 下 4 个文件分别放到 `/usr/local/bin/`、`/etc/systemd/system/`、`/etc/sysctl.d/`、`/etc/systemd/system.conf.d/`，`systemctl enable --now r36s-guard`；DTB 用 `fdtput -t s /boot/rk3326-r36s-linux.dtb /watchdog@ff1e0000 status okay`，原文件在 `/boot/rk3326-r36s-linux.dtb.pre-wdt`。
+- 回退：把 `.pre-wdt` 拷回 `/boot/rk3326-r36s-linux.dtb`（设备起不来时在电脑上改 SD 卡第一个 FAT 分区），删掉上面几个文件。
+- 注意：硬件看门狗复位等同断电，`/roms`（exFAT）上正在写的文件可能损坏（开机已见过 "Volume was not properly unmounted"）；系统升级若换掉 DTB，看门狗会回到关闭状态。
+
+### 16.6 设备上的第一组数据（KMS 显示，起跑线，冷却后单次启动）
+| | 帧时间 ms（各窗口） | 后端在执行器线程上的时间 ms | draw / 调用 |
+|---|---|---|---|
+| GL（3 次） | 47.6-52.0 | GL 线程 46-52 | ~720 / ~5000 GL 调用 |
+| Vulkan 1.0（2 次） | 51-60、55-69 | 36-45 | ~720-820 / ~600-730 次 vkCmdDrawIndexed |
+- Vulkan 版画面正常（截图亮度和 GL 一致），渲染倍率锁 1.0（游戏的 1.5 倍选项在 1.0 路径下忽略，`RECOMP_VK_GAME_SCALE=1` 恢复），`RECOMP_GL_SKIP` 也在 Vulkan 后端实现了（同样丢掉路面反射和车身环境图）。
+- 结论：现在比 GL 慢 5-10 ms。原因不是驱动：Vulkan 的录制、顶点/常量拷贝、描述符查找全在执行器线程上，每个 draw 约 50 µs（合成测试里驱动本身只要 7-10 µs），而 GL 后端把这些交给了单独的 GL 线程，执行器和 GL 线程并行。下一步：在设备上 perf 执行器线程，找出 nv2a_vk 自己每 draw 的开销；再考虑像 GL 一样把录制挪到单独线程。
+- 一次运行在开机约 40 s 后游戏停住（不是整机死机）：最后一帧之后主线程在 D3D 的 BlockOnFence 里等，GPU 信号量 0x3F17 落后 D3D 写序号 0x3F19，推送缓冲已全部执行完（GET == PUT）。像是等一个永远不会来的围栏事件（陷阱/事件丢失），原因未查清；GL 版是否也会发生未知。r36s-guard 改为按"[fps] 行是否增加"判断游戏卡住（只看 log.txt 修改时间不够：卡住的游戏仍在写 [wake] 行），这次 186 s 后自动杀掉。
+- 测试工具的修正：gptokeyb 退出游戏用 `pkill -f <二进制名>`，命令行里带 `NFSU2_BIN=nfsu2_recomp_vk` 的 autotest 驱动也被它杀了 —— 启动脚本改成 `NFSU2_VULKAN=1` 选 Vulkan 版；autotest 认 `nfsu2_recomp_vk` 进程名（procps 的模式不能超过 15 字符）；按 A 后若 ES 启动的不是 NFSU2 立刻报错。
