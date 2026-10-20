@@ -1,0 +1,15 @@
+[Unit]
+Description=R36S guard: heartbeat to pstore, stalled-game kill, WiFi recovery
+After=systemd-pstore.service network.target
+
+[Service]
+ExecStart=/bin/sh /usr/local/bin/r36s-guard.sh
+Restart=always
+RestartSec=5
+# Runs even when the game saturates every core.
+Nice=-15
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=10
+
+[Install]
+WantedBy=multi-user.target
