@@ -41,7 +41,7 @@ volatile int g_knob[KN_COUNT] = {
     [KN_RAMP_EPS]         = 20,       /* docs/13 §6: below one 8-bit step */
     [KN_CLR_DEDUP]        = 1,        /* docs/13 §10 */
     [KN_TEX_MEMO]         = 1,        /* docs/13 §10 */
-    [KN_GL_MERGE]         = 1,        /* docs/13 §11 */
+    [KN_GL_MERGE]         = 0,        /* docs/13 §11, §12: off since two device hangs with it on */
 };
 
 static const char *const s_count_name[KC_COUNT] = {

@@ -63,7 +63,7 @@ enum {
     KN_RAMP_EPS,        /* contrast ramp (sub_000A3FA0) rebuilt only when a parameter moved more than this x 1e-4 since the last build (20; 0 = stock: any change) */
     KN_CLR_DEDUP,       /* 1: drop a clear that repeats the last write to its surface and depth buffer (a pass whose draws RECOMP_GL_SKIP drops) (1) */
     KN_TEX_MEMO,        /* 1: a texture stage that samples what it did on the previous draw skips the surface search and tex_get (1) */
-    KN_GL_MERGE,        /* 1: a triangle-list draw that needs no GL state change after the previous one joins its glDrawRangeElements (1) */
+    KN_GL_MERGE,        /* 1: a triangle-list draw that needs no GL state change after the previous one joins its glDrawRangeElements (0: the R36S hung twice with it on, docs/13 §12) */
     KN_COUNT
 };
 

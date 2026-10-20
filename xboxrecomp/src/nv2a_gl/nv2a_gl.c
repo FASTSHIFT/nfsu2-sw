@@ -2456,6 +2456,16 @@ static int merge_try(const Nv2aRawBatch *b, GLenum mode, const uint32_t *idx, ui
         return 0;
     if (base + b->vertex_count > 65536)
         return 0;
+    {
+        /* An index past its own draw's vertices would read the next draw's
+         * (or past the ring): not merged, drawn as before. */
+        uint32_t i, mx = 0;
+        for (i = 0; i < n; i++)
+            if (idx[i] > mx)
+                mx = idx[i];
+        if (mx >= b->vertex_count)
+            return 0;
+    }
     v_from = s_mp.v_base + (GLintptr)base * L.stride;
     i_from = s_mp.i_at + (GLintptr)s_mp.n * 2;
     if (!ring_extend(&s_vring, s_mp.v_used, v_from, (GLsizeiptr)len, 0)
@@ -2499,7 +2509,20 @@ static int s_ss_on = -1;
 #define CENSUS_PROG 64
 static struct { uint32_t va, w, h, draws; } s_census_surf[CENSUS_SURF];
 static struct { uint32_t prog, draws; } s_census_prog[CENSUS_PROG];
+#define CENSUS_TEX 512
+#define CENSUS_VP 48
+#define CENSUS_SEQ 2048
+/* the frame's draws in order: vertex program, surface slot, size class, 4-index quads flagged */
+static struct { uint16_t vp; uint16_t idx; uint32_t surf; uint32_t tex0; } s_census_seq[CENSUS_SEQ];
+static uint32_t s_census_seq_n;
+/* by (vertex program start slot, transform kind, attribute mask) */
+static struct { uint32_t vp, xform, attrs, draws, idx, verts, small; } s_census_vp[CENSUS_VP];
+static uint32_t s_census_size[3][3];       /* [xform][<50, 50-299, 300+ indices]: draws, then idx below */
+static uint32_t s_census_size_idx[3][3];
+/* by (stage-0 texture address, transform kind, surface): what kind of object a draw is */
+static struct { uint32_t tex0, xform, va, draws, idx, verts; } s_census_tex[CENSUS_TEX];
 static uint32_t s_census_total;
+static int s_census_on;                  /* armed at a flip: the census covers one whole frame */
 static double s_census_fps;              /* last frame's rate, for the dump */
 #define SKIP_MAX 8
 static uint32_t s_skip_wh[SKIP_MAX];
@@ -2826,11 +2849,12 @@ static void surf_stats_draw(const Nv2aSurface *sf)
  * GL (after pass_skipped), so the counts reflect what is actually drawn.
  * The knobs thread sets DUMP_DRAWS; draws accumulate from that moment, and
  * the next flip prints and clears. */
-static void census_draw(const Nv2aSurface *sf, uint32_t prog)
+static void census_draw(const Nv2aRawBatch *b, uint32_t prog)
 {
+    const Nv2aSurface *sf = &b->surface;
     uint32_t w, h;
     int i;
-    if (!knob(KN_DUMP_DRAWS))
+    if (!s_census_on)
         return;
     batch_surf_size(sf, &w, &h);
     for (i = 0; i < CENSUS_SURF; i++) {
@@ -2851,6 +2875,46 @@ static void census_draw(const Nv2aSurface *sf, uint32_t prog)
             break;
         }
     }
+    for (i = 0; i < CENSUS_TEX; i++) {
+        if (!s_census_tex[i].draws ||
+            (s_census_tex[i].tex0 == b->tex_va[0] && s_census_tex[i].xform == (uint32_t)b->xform
+             && s_census_tex[i].va == sf->color_va)) {
+            s_census_tex[i].tex0 = b->tex_va[0];
+            s_census_tex[i].xform = (uint32_t)b->xform;
+            s_census_tex[i].va = sf->color_va;
+            s_census_tex[i].draws++;
+            s_census_tex[i].idx += b->index_count;
+            s_census_tex[i].verts += b->vertex_count;
+            break;
+        }
+    }
+    for (i = 0; i < CENSUS_VP; i++) {
+        if (!s_census_vp[i].draws ||
+            (s_census_vp[i].vp == b->vp_start && s_census_vp[i].xform == (uint32_t)b->xform
+             && s_census_vp[i].attrs == b->attr_present)) {
+            s_census_vp[i].vp = b->vp_start;
+            s_census_vp[i].xform = (uint32_t)b->xform;
+            s_census_vp[i].attrs = b->attr_present;
+            s_census_vp[i].draws++;
+            s_census_vp[i].idx += b->index_count;
+            s_census_vp[i].verts += b->vertex_count;
+            if (b->index_count < 50)
+                s_census_vp[i].small++;
+            break;
+        }
+    }
+    if (s_census_seq_n < CENSUS_SEQ) {
+        s_census_seq[s_census_seq_n].vp = (uint16_t)b->vp_start;
+        s_census_seq[s_census_seq_n].idx = (uint16_t)(b->index_count > 65535 ? 65535 : b->index_count);
+        s_census_seq[s_census_seq_n].surf = sf->color_va;
+        s_census_seq[s_census_seq_n].tex0 = b->tex_va[0];
+        s_census_seq_n++;
+    }
+    {
+        uint32_t x = b->xform > 2 ? 2 : (uint32_t)b->xform, c = b->index_count < 50 ? 0 : b->index_count < 300 ? 1 : 2;
+        s_census_size[x][c]++;
+        s_census_size_idx[x][c] += b->index_count;
+    }
     s_census_total++;
 }
 
@@ -2860,6 +2924,11 @@ static void census_flush(void)
     int i;
     if (!knob(KN_DUMP_DRAWS))
         return;
+    if (!s_census_on) {                 /* this flip starts the frame to be counted */
+        s_census_on = 1;
+        return;
+    }
+    s_census_on = 0;
     fprintf(stderr, "  [GL] draw census (%u draws, %.1f fps, %.1f ms/frame):\n",
             s_census_total, s_census_fps, s_census_fps ? 1000.0 / s_census_fps : 0.0);
     fprintf(stderr, "    by surface:");
@@ -2869,9 +2938,70 @@ static void census_flush(void)
     fprintf(stderr, "\n    by program:");
     for (i = 0; i < CENSUS_PROG && s_census_prog[i].draws; i++)
         fprintf(stderr, " %u:%u", s_census_prog[i].prog, s_census_prog[i].draws);
-    fprintf(stderr, "\n");
+    fprintf(stderr, "\n    by tex0/xform/surface (draws idx verts), biggest first:\n");
+    {
+        int order[CENSUS_TEX], n = 0, j;
+        for (i = 0; i < CENSUS_TEX && s_census_tex[i].draws; i++) {
+            for (j = n++; j > 0 && s_census_tex[order[j - 1]].draws < s_census_tex[i].draws; j--)
+                order[j] = order[j - 1];
+            order[j] = i;
+        }
+        {
+            uint32_t tot_d = 0;
+            for (i = 0; i < n; i++)
+                tot_d += s_census_tex[order[i]].draws;
+            fprintf(stderr, "      (%d texture groups, %u draws in them)\n", n, tot_d);
+        }
+        for (i = 0; i < n && i < 12; i++) {
+            const int k = order[i];
+            fprintf(stderr, "      tex %08X x%u surf %08X: %u draws, %u idx, %u verts\n", s_census_tex[k].tex0,
+                    s_census_tex[k].xform, s_census_tex[k].va, s_census_tex[k].draws, s_census_tex[k].idx,
+                    s_census_tex[k].verts);
+        }
+    }
+    fprintf(stderr, "    by transform x size: ");
+    {
+        int x, c;
+        static const char *const cn[3] = { "<50", "50-299", "300+" };
+        for (x = 0; x < 3; x++)
+            for (c = 0; c < 3; c++)
+                if (s_census_size[x][c])
+                    fprintf(stderr, " x%d %s idx: %u draws (%u idx);", x, cn[c], s_census_size[x][c], s_census_size_idx[x][c]);
+        fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "    by vertex program (start slot / xform / attribute mask): draws, small(<50 idx), idx, verts\n");
+    for (i = 0; i < CENSUS_VP && s_census_vp[i].draws; i++)
+        fprintf(stderr, "      vp %3u x%u attrs %04X: %u draws, %u small, %u idx, %u verts\n", s_census_vp[i].vp,
+                s_census_vp[i].xform, s_census_vp[i].attrs, s_census_vp[i].draws, s_census_vp[i].small,
+                s_census_vp[i].idx, s_census_vp[i].verts);
+    /* the order of the frame: runs of the same (vertex program, surface, size class) */
+    fprintf(stderr, "    sequence (vp/surf-tail/class[S<50 Q=4 idx M<300 L]: draws, idx):");
+    {
+        uint32_t i0 = 0;
+        while (i0 < s_census_seq_n) {
+            uint32_t j0 = i0, di = 0;
+            const uint16_t vp = s_census_seq[i0].vp;
+            const uint32_t sf0 = s_census_seq[i0].surf;
+            const uint32_t cl0 = s_census_seq[i0].idx == 4 ? 'Q' : s_census_seq[i0].idx < 50 ? 'S'
+                               : s_census_seq[i0].idx < 300 ? 'M' : 'L';
+            while (j0 < s_census_seq_n && s_census_seq[j0].vp == vp && s_census_seq[j0].surf == sf0
+                   && (s_census_seq[j0].idx == 4 ? 'Q' : s_census_seq[j0].idx < 50 ? 'S'
+                       : s_census_seq[j0].idx < 300 ? 'M' : 'L') == (int)cl0) {
+                di += s_census_seq[j0].idx;
+                j0++;
+            }
+            fprintf(stderr, "%s%u/%X/%c:%ux%u", (i0 % 8 == 0 || 1) ? " " : "", vp, sf0 & 0xFFFF, (char)cl0, j0 - i0, di);
+            i0 = j0;
+        }
+        fprintf(stderr, "\n");
+    }
+    s_census_seq_n = 0;
     memset(s_census_surf, 0, sizeof s_census_surf);
     memset(s_census_prog, 0, sizeof s_census_prog);
+    memset(s_census_tex, 0, sizeof s_census_tex);
+    memset(s_census_vp, 0, sizeof s_census_vp);
+    memset(s_census_size, 0, sizeof s_census_size);
+    memset(s_census_size_idx, 0, sizeof s_census_size_idx);
     s_census_total = 0;
     knob_set(KN_DUMP_DRAWS, 0);
 }
@@ -2982,6 +3112,9 @@ static void idx_narrow(uint16_t *o, const uint32_t *in, uint32_t n)
         o[i] = (uint16_t)in[i];
 }
 
+/* EXP_MERGESTAT: the (vertex program, set of differing c[] rows) pairs of joinable draws */
+static struct { uint32_t vp, h, n, nd; uint8_t rows[12]; } s_cb_set[16];
+
 static void gl_draw_raw(const Nv2aRawBatch *b)
 {
     GlSurf *s;
@@ -3060,7 +3193,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     s_draws_total++;
     if (b->index_count < 50)
         s_frag_total++;
-    census_draw(&b->surface, pk.shader_program);
+    census_draw(b, pk.shader_program);
     if (knob(KN_EXP_MERGESTAT)) {
         /* How much a merge of consecutive same-state draws could save, by
          * transform: a run continues while program, the 4 texture VAs, the
@@ -3082,13 +3215,109 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
         lcg = b->vp_const_gen;
         lp = p; memcpy(lt, b->tex_va, sizeof lt); ls = b->surface.color_va; lprim = b->prim;
         lxf = b->xform; lreg = reg;
-        if (s_frame != frames) {
-            static uint32_t shown;
-            frames = s_frame;
-            if ((++shown % 60) == 0)
-                fprintf(stderr, "  [MERGE] per frame: xform0 %u draws in %u runs, xform1 %u in %u, prog %u in %u; %u runs if constants must match too\n",
-                        n[0] / 60, runs[0] / 60, n[1] / 60, runs[1] / 60, n[2] / 60, runs[2] / 60, runs_c / 60);
-            if ((shown % 60) == 0) memset(n, 0, sizeof n), memset(runs, 0, sizeof runs), runs_c = 0;
+        {
+            /* Constant batching (docs/13 §15): a program draw in the same
+             * state as the one before, whose c[] differs only in a few rows,
+             * could join it if those rows went per draw (a row table the
+             * shader indexes by a draw number). Which rows, how many, and
+             * the runs that would be left at each limit. The vertex layout
+             * must match too (same attributes, formats, strides). */
+            static float lc[192][4];
+            static uint32_t lay_last, hist[6], rowcnt[192], runs_k[4], lc_ok, runs_m, prims[11], last_m;
+            MergeLayout ML;
+            const uint8_t *mlo;
+            size_t mlen;
+            const uint32_t mok = (b->prim == 5 || b->prim == 8) && merge_layout(b, &ML, &mlo, &mlen);
+            static const uint32_t lim[4] = { 4, 8, 12, 16 };
+            uint32_t lay = 2166136261u, nd = 0, a2, j;
+            uint8_t drow[192];
+            for (a2 = 0; a2 < NV2A_RAW_ATTRS; a2++) {
+                lay = (lay ^ ((b->attr_present >> a2) & 1) ^ (((b->attr_direct >> a2) & 1) << 1)) * 16777619u;
+                if (b->attr_direct & (1u << a2))
+                    lay = (lay ^ (b->direct[a2].type | b->direct[a2].size << 4 | b->direct[a2].stride << 8)) * 16777619u;
+            }
+            if (b->xform == 2 && b->vp_consts) {
+                if (lc_ok)
+                    for (j = 0; j < 192; j++)
+                        if (memcmp(lc[j], b->vp_consts[j], 16))
+                            drow[nd++] = (uint8_t)j;
+                for (j = 0; j < 4; j++)
+                    if (!same || lay != lay_last || !lc_ok || nd > lim[j])
+                        runs_k[j]++;
+                /* ... and mergeable by merge_try as it is (lists/quads, one interleaved run) */
+                if (!same || lay != lay_last || !lc_ok || nd > 12 || !mok || !last_m)
+                    runs_m++;
+                if (b->prim <= 10)
+                    prims[b->prim]++;
+                if (same && lay == lay_last && lc_ok) {
+                    hist[nd == 0 ? 0 : nd <= 4 ? 1 : nd <= 8 ? 2 : nd <= 12 ? 3 : nd <= 16 ? 4 : 5]++;
+                    if (nd <= 16)
+                        for (j = 0; j < nd; j++)
+                            rowcnt[drow[j]]++;
+                    if (nd && nd <= 12) {
+                        uint32_t hsh = 2166136261u, t3;
+                        for (j = 0; j < nd; j++)
+                            hsh = (hsh ^ drow[j]) * 16777619u;
+                        for (t3 = 0; t3 < 16; t3++)
+                            if (!s_cb_set[t3].n || (s_cb_set[t3].vp == b->vp_start && s_cb_set[t3].h == hsh)) {
+                                if (!s_cb_set[t3].n) {
+                                    s_cb_set[t3].vp = b->vp_start; s_cb_set[t3].h = hsh; s_cb_set[t3].nd = nd;
+                                    memcpy(s_cb_set[t3].rows, drow, nd);
+                                }
+                                s_cb_set[t3].n++;
+                                break;
+                            }
+                    }
+                }
+                memcpy(lc, b->vp_consts, sizeof lc);
+                lc_ok = 1;
+                last_m = mok;
+            }
+            lay_last = lay;
+            if (s_frame != frames) {
+                static uint32_t shown;
+                frames = s_frame;
+                if ((++shown % 60) == 0) {
+                    uint32_t top[12], nt = 0, t2, used[6] = { 0 };
+                    fprintf(stderr, "  [MERGE] per frame: xform0 %u draws in %u runs, xform1 %u in %u, prog %u in %u; %u runs if constants must match too\n",
+                            n[0] / 60, runs[0] / 60, n[1] / 60, runs[1] / 60, n[2] / 60, runs[2] / 60, runs_c / 60);
+                    fprintf(stderr, "  [CBATCH] prog draws in the same state+layout as the last: rows differing 0:%u 1-4:%u 5-8:%u 9-12:%u 13-16:%u >16:%u;"
+                            " prog runs if <=4/8/12/16 rows may differ: %u %u %u %u\n",
+                            hist[0] / 60, hist[1] / 60, hist[2] / 60, hist[3] / 60, hist[4] / 60, hist[5] / 60,
+                            runs_k[0] / 60, runs_k[1] / 60, runs_k[2] / 60, runs_k[3] / 60);
+                    for (nt = 0; nt < 12; nt++) {   /* the 12 rows that differ most often */
+                        uint32_t best = 0, bj = 0;
+                        for (j = 0; j < 192; j++)
+                            if (!(used[j >> 5] & (1u << (j & 31))) && rowcnt[j] > best)
+                                best = rowcnt[j], bj = j;
+                        if (!best)
+                            break;
+                        used[bj >> 5] |= 1u << (bj & 31);
+                        top[nt] = bj;
+                    }
+                    (void)t2;
+                    fprintf(stderr, "  [CBATCH] runs at <=12 rows if only lists/quads in one interleaved run join: %u; prog draws by prim:", runs_m / 60);
+                    for (j = 0; j <= 10; j++)
+                        if (prims[j])
+                            fprintf(stderr, " %u:%u", j, prims[j] / 60);
+                    fprintf(stderr, "\n");
+                    runs_m = 0; memset(prims, 0, sizeof prims);
+                    for (j = 0; j < 16 && s_cb_set[j].n; j++) {
+                        uint32_t t3;
+                        fprintf(stderr, "  [CBATCH] vp %u, %u draws/frame differ in:", s_cb_set[j].vp, s_cb_set[j].n / 60);
+                        for (t3 = 0; t3 < s_cb_set[j].nd; t3++)
+                            fprintf(stderr, " c%u", s_cb_set[j].rows[t3]);
+                        fprintf(stderr, "\n");
+                    }
+                    memset(s_cb_set, 0, sizeof s_cb_set);
+                    fprintf(stderr, "  [CBATCH] rows that differ (per frame):");
+                    for (j = 0; j < nt; j++)
+                        fprintf(stderr, " c%u:%u", top[j], rowcnt[top[j]] / 60);
+                    fprintf(stderr, "\n");
+                    memset(n, 0, sizeof n), memset(runs, 0, sizeof runs), runs_c = 0;
+                    memset(hist, 0, sizeof hist), memset(rowcnt, 0, sizeof rowcnt), memset(runs_k, 0, sizeof runs_k);
+                }
+            }
         }
     }
     if (knob(KN_EXP_STATIC))
