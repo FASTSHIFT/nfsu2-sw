@@ -112,7 +112,12 @@ BIN="${NFSU2_BIN:-nfsu2_recomp}"
 # nfsu2_recomp_vk. (A switch, not NFSU2_BIN=nfsu2_recomp_vk on someone's
 # command line: gptokeyb's exit is `pkill -f <binary>`, which also kills any
 # process whose arguments name the binary -- the autotest driver did.)
-[ "${NFSU2_VULKAN:-0}" = 1 ] && BIN=nfsu2_recomp_vk
+# Its recording runs on a thread of its own (RECOMP_VK_THREAD=0: on the
+# executor, as before; docs/13 §19).
+if [ "${NFSU2_VULKAN:-0}" = 1 ]; then
+    BIN=nfsu2_recomp_vk
+    export RECOMP_VK_THREAD="${RECOMP_VK_THREAD:-1}"
+fi
 [ -f "$BIN" ] || BIN=nfsu2_recomp
 # gptokeyb only for the hotkey exit (the pad itself goes through SDL).
 $GPTOKEYB "$BIN" &

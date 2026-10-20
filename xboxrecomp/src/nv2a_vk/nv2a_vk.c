@@ -235,16 +235,42 @@ static int s_drew_any;
 static int fxaa_on(void);
 static const uint32_t *s_regs;
 static const Nv2aRawBatch *s_batch;
+/* RECOMP_VK_THREAD=1: recording runs on a thread of its own (the end of this
+ * file). That thread then reads register changes from s_t_dirty (filled from
+ * the records) instead of the executor's dirty blocks, and the draw's vertex
+ * pointers as the title gave them from s_dkey (the batch's own point into
+ * the queue record, a new place every draw). */
+static int s_thr;
+static uint8_t s_t_dirty[0x2000 / 64];
+static const uint8_t *const *s_dkey;
+#define DKEY(b, a) (s_dkey ? s_dkey[a] : (b)->direct[a].ptr)
 
 /* Hitch accounting, as in nv2a_gl. */
 static uint32_t s_hz_progs, s_hz_texs, s_hz_draws;
 static uint64_t s_hz_prog_ns, s_hz_tex_ns, s_hz_tex_bytes;
+#if defined(__aarch64__) && !defined(__SWITCH__)
+/* The generic timer read from user space: a draw took three timestamps
+ * through clock_gettime (vdso), ~2% of the executor on the R36S. */
+static uint64_t hz_now(void)
+{
+    static double ns_per_tick;
+    uint64_t v;
+    if (!ns_per_tick) {
+        uint64_t f;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+        ns_per_tick = f ? 1e9 / (double)f : 1.0;
+    }
+    __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(v) : : "memory");
+    return (uint64_t)((double)v * ns_per_tick);
+}
+#else
 static uint64_t hz_now(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
+#endif
 
 /* ── Device ───────────────────────────────────────────────────────── */
 
@@ -1802,14 +1828,6 @@ static int s_prog_head[PROG_BUCKETS];
 static uint32_t s_prog_made, s_prog_live;
 
 uint32_t nv2a_gl_program_count(void) { return s_prog_live; }
-/* The GL renderer's thread statistics; the Vulkan one records on the
- * executor's thread. */
-void nv2a_gl_queue_stats(double secs, int *gl_idle_pct, int *exec_wait_pct)
-{
-    (void)secs;
-    if (gl_idle_pct) *gl_idle_pct = 0;
-    if (exec_wait_pct) *exec_wait_pct = 0;
-}
 
 typedef struct {
     glslang_stage_t stage;
@@ -3854,7 +3872,7 @@ static uint32_t s_regs_seen[0x2000 / 4];    /* registers as of the last draw */
 /* Did a register a draw depends on change since the last draw? */
 static int regs_changed(const uint32_t *r)
 {
-    uint8_t *dirty = nv2a_pb_reg_dirty();
+    uint8_t *dirty = s_thr ? s_t_dirty : nv2a_pb_reg_dirty();
     uint32_t blk, w;
     int changed = 0;
 
@@ -3922,7 +3940,7 @@ static int pend_matches(const Nv2aRawBatch *b)
         return 0;
     for (a = 0; a < NV2A_RAW_ATTRS; a++)
         if ((b->attr_direct & (1u << a))
-         && (b->direct[a].ptr != s_pend.direct[a].ptr || b->direct[a].type != s_pend.direct[a].type
+         && (DKEY(b, a) != s_pend.direct[a].ptr || b->direct[a].type != s_pend.direct[a].type
           || b->direct[a].size != s_pend.direct[a].size || b->direct[a].stride != s_pend.direct[a].stride))
             return 0;
     return !memcmp(b->indices, s_pend.idx, (size_t)b->index_count * 4);
@@ -3966,7 +3984,7 @@ static void pend_hold(const Nv2aRawBatch *b, uint32_t n, VkDeviceSize cat, uint3
     memcpy(s_pend.tex_va, b->tex_va, sizeof s_pend.tex_va);
     memcpy(s_pend.pal_va, b->pal_va, sizeof s_pend.pal_va);
     for (a = 0; a < NV2A_RAW_ATTRS; a++) {
-        s_pend.direct[a].ptr = b->direct[a].ptr;
+        s_pend.direct[a].ptr = DKEY(b, a);
         s_pend.direct[a].type = b->direct[a].type;
         s_pend.direct[a].size = b->direct[a].size;
         s_pend.direct[a].stride = b->direct[a].stride;
@@ -4119,7 +4137,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
         fprintf(stderr, "  [VK] instancing %s (uniform range %u, alignment %u)\n",
                 s_inst_on ? "on" : "off", s_ubo_range, (unsigned)s_ubo_align);
     }
-    if (pass_skipped(&b->surface)) {
+    if (!s_thr && pass_skipped(&b->surface)) {  /* threaded: the executor skipped it */
         pend_flush();                           /* a held instance run ends here */
         regs_changed(r);                        /* keep the register snapshot current */
         return;
@@ -5181,7 +5199,8 @@ static void vk_flip(void)
     if (!ready())
         return;
     pend_flush();
-    pass_skip_frame();
+    if (!s_thr)
+        pass_skip_frame();                      /* threaded: tq_flip did */
     s_frame++;
     if (s_inst_alt)
         s_inst_on = s_frame & 1;
@@ -5477,6 +5496,426 @@ static void vk_flip_timed(void)
     s_pf_draws_frame = 0;
 }
 
+/* ── Recording on a thread of its own (RECOMP_VK_THREAD=1) ─────────────
+ *
+ * nv2a_gl's threaded submission, for Vulkan. On the R36S the executor
+ * thread decoded the pushbuffer *and* recorded every draw (~40 ms a frame,
+ * a core of its own at 80%) while nv2a_gl split the two over two cores.
+ * With this on, the executor decodes and queues; this thread records,
+ * submits and presents. The executor copies what a draw reads that it or
+ * the title may change once it moves on: the method shadow, transform
+ * program and constants as the 64/16-byte blocks that differ from what was
+ * last queued (this thread keeps its own copies), the vertex byte ranges
+ * the draw reads, converted attributes and indices. Textures are read from
+ * guest memory when this thread gets to them, at most two frames later, as
+ * with nv2a_gl's thread. Pass skipping (RECOMP_GL_SKIP) runs on the
+ * executor, before a draw is queued. */
+enum { TQ_WRAP = 0, TQ_DRAW = 1, TQ_CLEAR = 2, TQ_FLIP = 3 };
+typedef struct { uint32_t type, size, nreg, nprog, nconst, pad[3]; } TqHdr;
+typedef struct { uint32_t idx, pad[3]; uint32_t w[16]; } TqRegChunk;
+typedef struct { uint32_t idx, pad[3]; uint32_t w[4]; } TqRow;
+typedef struct {
+    Nv2aSurface s;
+    Nv2aRenderState rs;
+    uint32_t flags, argb, zs, pad;
+} TqClear;
+typedef struct { const uint8_t *key[NV2A_RAW_ATTRS]; } TqKeys;
+
+#define TQ_BYTES      (48u << 20)
+#define TQ_ALIGN(x)   (((x) + 15u) & ~(size_t)15u)
+#define TQ_REG_WORDS  (0x2000 / 4)
+#define TQ_PROG_ROWS  136
+#define TQ_CONST_ROWS 192
+
+static uint8_t *s_tq;
+static size_t s_tq_head, s_tq_tail;          /* bytes written / read, ever */
+static int s_tq_consumer_waits, s_tq_producer_waits, s_tq_flips;
+static pthread_mutex_t s_tq_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_tq_cv = PTHREAD_COND_INITIALIZER;
+static uint64_t s_tq_dropped;
+/* ns this thread sat with an empty queue / the executor was held back. */
+static uint64_t s_tq_idle_ns, s_tq_exec_wait_ns;
+/* Executor thread: what was last queued. */
+static uint32_t s_tq_regs[TQ_REG_WORDS], s_tq_prog[TQ_PROG_ROWS][4];
+static float s_tq_consts[TQ_CONST_ROWS][4];
+static const uint32_t *s_tq_live_regs;
+static uint32_t s_tq_prog_gen, s_tq_const_gen;
+static uint16_t s_tq_pend[TQ_REG_WORDS / 16];
+static uint32_t s_tq_npend;
+/* Recording thread: its copies, rebuilt from the records. */
+static uint32_t t_regs[TQ_REG_WORDS], t_prog[TQ_PROG_ROWS][4];
+static float t_consts[TQ_CONST_ROWS][4];
+
+static void tq_timed_wait(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += 2000000;
+    if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+    pthread_cond_timedwait(&s_tq_cv, &s_tq_lock, &ts);
+}
+
+static size_t tq_used(void)
+{
+    return s_tq_head - __atomic_load_n(&s_tq_tail, __ATOMIC_ACQUIRE);
+}
+
+/* Room for `size` contiguous bytes; returns where to write them. */
+static uint8_t *tq_reserve(size_t size)
+{
+    size_t off = s_tq_head % TQ_BYTES, need = size;
+    if (off + size > TQ_BYTES)
+        need += TQ_BYTES - off;                 /* the wrap filler */
+    if (TQ_BYTES - tq_used() < need) {
+        uint64_t t0 = hz_now();
+        pthread_mutex_lock(&s_tq_lock);
+        __atomic_store_n(&s_tq_producer_waits, 1, __ATOMIC_SEQ_CST);
+        while (TQ_BYTES - tq_used() < need)
+            tq_timed_wait();
+        __atomic_store_n(&s_tq_producer_waits, 0, __ATOMIC_SEQ_CST);
+        pthread_mutex_unlock(&s_tq_lock);
+        __atomic_add_fetch(&s_tq_exec_wait_ns, hz_now() - t0, __ATOMIC_RELAXED);
+    }
+    if (off + size > TQ_BYTES) {
+        TqHdr *w = (TqHdr *)(s_tq + off);
+        w->type = TQ_WRAP;                       /* the ring has slack past its end */
+        w->size = (uint32_t)(TQ_BYTES - off);
+        __atomic_store_n(&s_tq_head, s_tq_head + (TQ_BYTES - off), __ATOMIC_RELEASE);
+        off = 0;
+    }
+    return s_tq + off;
+}
+
+static void tq_publish(size_t size)
+{
+    __atomic_store_n(&s_tq_head, s_tq_head + size, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&s_tq_consumer_waits, __ATOMIC_SEQ_CST)) {
+        pthread_mutex_lock(&s_tq_lock);
+        pthread_cond_broadcast(&s_tq_cv);
+        pthread_mutex_unlock(&s_tq_lock);
+    }
+}
+
+/* The shadow's 64-byte blocks the executor wrote (nv2a_pb_reg_dirty) that
+ * differ from what was last queued, kept in s_tq_pend until tq_write_state. */
+static uint32_t tq_reg_collect(void)
+{
+    uint8_t *dirty = nv2a_pb_reg_dirty();
+    uint32_t c;
+    if (!s_tq_live_regs)
+        return 0;
+    for (c = 0; c < TQ_REG_WORDS / 16; c++) {
+        if (!dirty[c])
+            continue;
+        dirty[c] = 0;
+        if (memcmp(s_tq_live_regs + c * 16, s_tq_regs + c * 16, 64) != 0) {
+            uint32_t k;
+            for (k = 0; k < s_tq_npend && s_tq_pend[k] != c; k++) { }
+            if (k == s_tq_npend)
+                s_tq_pend[s_tq_npend++] = (uint16_t)c;
+        }
+    }
+    return s_tq_npend;
+}
+
+static uint32_t tq_rows_diff(const uint32_t (*live)[4], uint32_t (*sent)[4], uint32_t rows,
+                             TqRow *out)
+{
+    uint32_t r, n = 0;
+    for (r = 0; r < rows; r++)
+        if (memcmp(live[r], sent[r], 16) != 0) {
+            if (out) {
+                out[n].idx = r;
+                memcpy(out[n].w, live[r], 16);
+                memcpy(sent[r], live[r], 16);
+            }
+            n++;
+        }
+    return n;
+}
+
+/* tq_draw's program/constant rows that changed, found once (the diff was
+ * done twice, to size the record and to fill it: 14% of the executor). */
+static TqRow s_tq_rprog[TQ_PROG_ROWS], s_tq_rconst[TQ_CONST_ROWS];
+
+/* Header plus the shadow changes; returns the offset after them. */
+static size_t tq_write_state(uint8_t *rec, uint32_t type, uint32_t nprog, uint32_t nconst)
+{
+    TqHdr *h = (TqHdr *)rec;
+    size_t at = sizeof(TqHdr);
+    uint32_t k;
+    memset(h, 0, sizeof *h);
+    h->type = type;
+    for (k = 0; k < s_tq_npend; k++) {
+        TqRegChunk *o = (TqRegChunk *)(rec + at) + k;
+        uint32_t c = s_tq_pend[k];
+        o->idx = c;
+        memcpy(o->w, s_tq_live_regs + c * 16, 64);
+        memcpy(s_tq_regs + c * 16, s_tq_live_regs + c * 16, 64);
+    }
+    h->nreg = s_tq_npend;
+    s_tq_npend = 0;
+    at += (size_t)h->nreg * sizeof(TqRegChunk);
+    h->nprog = nprog;
+    memcpy(rec + at, s_tq_rprog, (size_t)nprog * sizeof(TqRow));
+    at += (size_t)nprog * sizeof(TqRow);
+    h->nconst = nconst;
+    memcpy(rec + at, s_tq_rconst, (size_t)nconst * sizeof(TqRow));
+    at += (size_t)nconst * sizeof(TqRow);
+    return at;
+}
+
+static void tq_draw(const Nv2aRawBatch *b)
+{
+    VRun run[NV2A_RAW_ATTRS];
+    int of_run[NV2A_RAW_ATTRS];
+    uint32_t nrun, i, a, nreg, nprog = 0, nconst = 0;
+    uint16_t conv = b->attr_present & (uint16_t)~b->attr_direct;
+    size_t size, at, runs_at[NV2A_RAW_ATTRS], attrs_at = 0, idx_at, batch_at, keys_at;
+    Nv2aRawBatch *qb;
+    TqKeys *keys;
+    uint8_t *rec;
+
+    if (pass_skipped(&b->surface))
+        return;
+    nrun = b->vertex_count ? vertex_runs(b, b->attr_direct, run, of_run) : 0;
+    s_tq_live_regs = b->regs;
+    nreg = tq_reg_collect();
+    if (b->vp_program && b->vp_prog_gen != s_tq_prog_gen && b->vp_slots <= TQ_PROG_ROWS)
+        nprog = tq_rows_diff(b->vp_program, s_tq_prog, TQ_PROG_ROWS, s_tq_rprog);
+    if (b->vp_consts && b->vp_const_gen != s_tq_const_gen && b->vp_const_count <= TQ_CONST_ROWS)
+        nconst = tq_rows_diff((const uint32_t (*)[4])b->vp_consts,
+                              (uint32_t (*)[4])s_tq_consts, TQ_CONST_ROWS, s_tq_rconst);
+    size = sizeof(TqHdr) + (size_t)nreg * sizeof(TqRegChunk)
+         + (size_t)(nprog + nconst) * sizeof(TqRow);
+    batch_at = size;
+    size += TQ_ALIGN(sizeof(Nv2aRawBatch));
+    keys_at = size;
+    size += TQ_ALIGN(sizeof(TqKeys));
+    for (i = 0; i < nrun; i++) {
+        runs_at[i] = size;
+        size += TQ_ALIGN((size_t)(run[i].hi - run[i].lo));
+    }
+    if (conv) {
+        attrs_at = size;
+        size += TQ_ALIGN((size_t)b->vertex_count * NV2A_RAW_ATTRS * 16);
+    }
+    idx_at = size;
+    size += TQ_ALIGN((size_t)b->index_count * 4);
+    if (size > TQ_BYTES / 4) {
+        if ((s_tq_dropped++ & 1023) == 0)
+            LOGE("queued draw of %zu bytes dropped (%llu so far)\n",
+                 size, (unsigned long long)s_tq_dropped);
+        return;
+    }
+
+    rec = tq_reserve(size);
+    at = tq_write_state(rec, TQ_DRAW, nprog, nconst);
+    s_tq_prog_gen = b->vp_prog_gen;
+    s_tq_const_gen = b->vp_const_gen;
+    if (at != batch_at) {                       /* cannot happen: the same diffs */
+        LOGE("queue record mismatch %zu/%zu\n", at, batch_at);
+        abort();
+    }
+    qb = (Nv2aRawBatch *)(rec + batch_at);
+    *qb = *b;
+    keys = (TqKeys *)(rec + keys_at);
+    /* Pointers become offsets into the record; the recording thread adds
+     * the record's address. */
+    for (i = 0; i < nrun; i++)
+        memcpy(rec + runs_at[i], run[i].lo, (size_t)(run[i].hi - run[i].lo));
+    for (a = 0; a < NV2A_RAW_ATTRS; a++) {
+        keys->key[a] = b->direct[a].ptr;
+        if (b->attr_direct & (1u << a))
+            qb->direct[a].ptr = (const uint8_t *)(uintptr_t)(!nrun ? keys_at :
+                runs_at[of_run[a]] + (size_t)(b->direct[a].ptr - run[of_run[a]].lo));
+    }
+    if (conv)
+        memcpy(rec + attrs_at, b->attrs, (size_t)b->vertex_count * NV2A_RAW_ATTRS * 16);
+    qb->attrs = (const float *)(uintptr_t)attrs_at;
+    memcpy(rec + idx_at, b->indices, (size_t)b->index_count * 4);
+    qb->indices = (const uint32_t *)(uintptr_t)idx_at;
+    qb->regs = NULL;
+    ((TqHdr *)rec)->size = (uint32_t)size;
+    tq_publish(size);
+}
+
+static void tq_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
+                     uint32_t flags, uint32_t argb, uint32_t zs)
+{
+    uint32_t nreg = tq_reg_collect();
+    size_t size = sizeof(TqHdr) + (size_t)nreg * sizeof(TqRegChunk) + TQ_ALIGN(sizeof(TqClear));
+    uint8_t *rec = tq_reserve(size);
+    size_t at = tq_write_state(rec, TQ_CLEAR, 0, 0);
+    TqClear *c = (TqClear *)(rec + at);
+    c->s = *sf;
+    if (rs)
+        c->rs = *rs;
+    else
+        memset(&c->rs, 0, sizeof c->rs);
+    c->flags = flags;
+    c->argb = argb;
+    c->zs = zs;
+    c->pad = rs != NULL;
+    ((TqHdr *)rec)->size = (uint32_t)size;
+    tq_publish(size);
+}
+
+static void tq_flip(void)
+{
+    uint32_t nreg;
+    size_t size;
+    uint8_t *rec;
+
+    pass_skip_frame();                          /* executor side, as tq_draw's skips */
+    /* No more than two frames behind the executor. */
+    if (__atomic_load_n(&s_tq_flips, __ATOMIC_ACQUIRE) >= 2) {
+        uint64_t t0 = hz_now();
+        pthread_mutex_lock(&s_tq_lock);
+        __atomic_store_n(&s_tq_producer_waits, 1, __ATOMIC_SEQ_CST);
+        while (__atomic_load_n(&s_tq_flips, __ATOMIC_ACQUIRE) >= 2)
+            tq_timed_wait();
+        __atomic_store_n(&s_tq_producer_waits, 0, __ATOMIC_SEQ_CST);
+        pthread_mutex_unlock(&s_tq_lock);
+        __atomic_add_fetch(&s_tq_exec_wait_ns, hz_now() - t0, __ATOMIC_RELAXED);
+    }
+    nreg = tq_reg_collect();
+    size = sizeof(TqHdr) + (size_t)nreg * sizeof(TqRegChunk);
+    rec = tq_reserve(size);
+    tq_write_state(rec, TQ_FLIP, 0, 0);
+    ((TqHdr *)rec)->size = (uint32_t)size;
+    __atomic_add_fetch(&s_tq_flips, 1, __ATOMIC_ACQ_REL);
+    tq_publish(size);
+}
+
+static void *tq_thread(void *arg)
+{
+    extern void xbox_nx_spread_thread(void);
+    (void)arg;
+    xbox_nx_spread_thread();
+#if defined(__linux__)
+    {
+        extern int prctl(int, ...);
+        prctl(15 /* PR_SET_NAME */, "vkrec", 0, 0, 0);
+    }
+#endif
+    for (;;) {
+        size_t avail = __atomic_load_n(&s_tq_head, __ATOMIC_SEQ_CST) - s_tq_tail;
+        uint8_t *rec;
+        const TqHdr *h;
+        size_t at;
+        uint32_t i;
+
+        if (!avail) {
+            uint64_t t0 = hz_now();
+            pthread_mutex_lock(&s_tq_lock);
+            __atomic_store_n(&s_tq_consumer_waits, 1, __ATOMIC_SEQ_CST);
+            while (__atomic_load_n(&s_tq_head, __ATOMIC_SEQ_CST) == s_tq_tail)
+                tq_timed_wait();
+            __atomic_store_n(&s_tq_consumer_waits, 0, __ATOMIC_SEQ_CST);
+            pthread_mutex_unlock(&s_tq_lock);
+            __atomic_add_fetch(&s_tq_idle_ns, hz_now() - t0, __ATOMIC_RELAXED);
+            continue;
+        }
+        rec = s_tq + s_tq_tail % TQ_BYTES;
+        h = (const TqHdr *)rec;
+        if (h->type != TQ_WRAP) {
+            at = sizeof(TqHdr);
+            for (i = 0; i < h->nreg; i++, at += sizeof(TqRegChunk)) {
+                const TqRegChunk *c = (const TqRegChunk *)(rec + at);
+                memcpy(t_regs + c->idx * 16, c->w, 64);
+                s_t_dirty[c->idx] = 1;
+            }
+            for (i = 0; i < h->nprog; i++, at += sizeof(TqRow)) {
+                const TqRow *r = (const TqRow *)(rec + at);
+                memcpy(t_prog[r->idx], r->w, 16);
+            }
+            for (i = 0; i < h->nconst; i++, at += sizeof(TqRow)) {
+                const TqRow *r = (const TqRow *)(rec + at);
+                memcpy(t_consts[r->idx], r->w, 16);
+            }
+            s_regs = t_regs;                    /* what clears and the flip read */
+            if (h->type == TQ_DRAW) {
+                Nv2aRawBatch bb = *(const Nv2aRawBatch *)(rec + at);
+                const TqKeys *keys = (const TqKeys *)(rec + at + TQ_ALIGN(sizeof(Nv2aRawBatch)));
+                uint32_t a;
+                bb.regs = t_regs;
+                bb.vp_program = (const uint32_t (*)[4])t_prog;
+                bb.vp_consts = (const float (*)[4])t_consts;
+                for (a = 0; a < NV2A_RAW_ATTRS; a++)
+                    if (bb.attr_direct & (1u << a))
+                        bb.direct[a].ptr = rec + (uintptr_t)bb.direct[a].ptr;
+                bb.attrs = (const float *)(rec + (uintptr_t)bb.attrs);
+                bb.indices = (const uint32_t *)(rec + (uintptr_t)bb.indices);
+                s_dkey = keys->key;
+                vk_draw_raw_timed(&bb);
+                s_dkey = NULL;
+            } else if (h->type == TQ_CLEAR) {
+                const TqClear *c = (const TqClear *)(rec + at);
+                vk_clear_timed(&c->s, c->pad ? &c->rs : NULL, c->flags, c->argb, c->zs);
+            } else if (h->type == TQ_FLIP) {
+                vk_flip_timed();
+                __atomic_sub_fetch(&s_tq_flips, 1, __ATOMIC_ACQ_REL);
+                {
+                    static uint64_t last;
+                    uint64_t now = hz_now();
+                    if (!last)
+                        last = now;
+                    if (now - last >= 10000000000ull) {
+                        double secs = (now - last) / 1e9;
+                        fprintf(stderr, "[vk] recording thread: idle %.0f%%, executor held %.0f%%\n",
+                                __atomic_exchange_n(&s_tq_idle_ns, 0, __ATOMIC_RELAXED) / (secs * 1e7),
+                                __atomic_exchange_n(&s_tq_exec_wait_ns, 0, __ATOMIC_RELAXED) / (secs * 1e7));
+                        last = now;
+                    }
+                }
+            }
+        }
+        __atomic_store_n(&s_tq_tail, s_tq_tail + h->size, __ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&s_tq_producer_waits, __ATOMIC_SEQ_CST)) {
+            pthread_mutex_lock(&s_tq_lock);
+            pthread_cond_broadcast(&s_tq_cv);
+            pthread_mutex_unlock(&s_tq_lock);
+        }
+    }
+    return NULL;
+}
+
+/* For the Switch [perf] line (nv2a_gl's name): share of the last `secs`
+ * the recording thread sat idle and the executor was held back. */
+void nv2a_gl_queue_stats(double secs, int *gl_idle_pct, int *exec_wait_pct)
+{
+    if (!s_thr) {
+        if (gl_idle_pct) *gl_idle_pct = -1;
+        if (exec_wait_pct) *exec_wait_pct = -1;
+        return;
+    }
+    if (gl_idle_pct)
+        *gl_idle_pct = (int)(__atomic_exchange_n(&s_tq_idle_ns, 0, __ATOMIC_RELAXED) / (secs * 1e7));
+    if (exec_wait_pct)
+        *exec_wait_pct = (int)(__atomic_exchange_n(&s_tq_exec_wait_ns, 0, __ATOMIC_RELAXED) / (secs * 1e7));
+}
+
+static int tq_start(void)
+{
+    pthread_t t;
+    pthread_attr_t at;
+    s_tq = (uint8_t *)malloc(TQ_BYTES + 256);
+    if (!s_tq)
+        return 0;
+    pthread_attr_init(&at);
+    pthread_attr_setstacksize(&at, 4u << 20);  /* shader compiles run below it */
+    if (pthread_create(&t, &at, tq_thread, NULL) != 0) {
+        pthread_attr_destroy(&at);
+        free(s_tq);
+        s_tq = NULL;
+        return 0;
+    }
+    pthread_attr_destroy(&at);
+    pthread_detach(t);
+    return 1;
+}
+
 static const Nv2aBackend s_backend = {
     vk_clear_timed,
     vk_draw,
@@ -5485,8 +5924,21 @@ static const Nv2aBackend s_backend = {
     NV2A_BACKEND_RAW_DIRECT,
 };
 
+static const Nv2aBackend s_backend_q = {
+    tq_clear,
+    vk_draw,
+    tq_flip,
+    tq_draw,
+    NV2A_BACKEND_RAW_DIRECT,
+};
+
 void nv2a_vk_install(void)
 {
-    nv2a_backend_register(&s_backend);
-    fprintf(stderr, "[BOOT] NV2A Vulkan renderer registered\n");
+    const char *e = getenv("RECOMP_VK_THREAD");
+    s_thr = e && *e == '1';                     /* before the thread exists: it reads it */
+    if (s_thr && !tq_start())
+        s_thr = 0;
+    nv2a_backend_register(s_thr ? &s_backend_q : &s_backend);
+    fprintf(stderr, "[BOOT] NV2A Vulkan renderer registered%s\n",
+            s_thr ? ", recording on a thread of its own (RECOMP_VK_THREAD=1)" : "");
 }
