@@ -117,7 +117,11 @@ def game_pid():
     # -x: exact process-name match. A `pgrep -f nfsu2_recomp` would also match
     # the very shell running the pgrep (its command line contains the pattern),
     # so it always "found" a game that was never launched.
-    rc, out = sh("pgrep -x nfsu2_recomp | head -1")
+    # Either binary the launcher runs: the Vulkan build (NFSU2_VULKAN=1 in
+    # env.txt) is nfsu2_recomp_vk (15 characters: the whole comm).
+    # (procps refuses a pattern longer than 15 characters: two exact names.)
+    rc, out = sh("{ pgrep -x nfsu2_recomp; pgrep -x nfsu2_recomp_vk; } | head -1")
+    rc = 0 if out.strip() else 1
     return out if rc == 0 and out.isdigit() else None
 
 
@@ -268,9 +272,19 @@ def do_launch():
     # waking up instead of by ES (seen twice: the game only started on a later
     # press). So press, wait for the process, and press again.
     pid = None
+    rc, launched_before = sh(f"grep -A1 'Attempting to launch game' '{ES_LOG}' | tail -1")
+    if rc != 0:
+        launched_before = None
     for attempt in range(1, LAUNCH_TRIES + 1):
         log(f"pressing A to launch (try {attempt}/{LAUNCH_TRIES})")
         press(BTN_A, 200)
+        time.sleep(2)
+        # The ES cursor on another entry (seen: GPU Bench (glmark2)) starts
+        # that instead, and later presses only go to it: stop here.
+        rc, last = sh(f"grep -A1 'Attempting to launch game' '{ES_LOG}' | tail -1")
+        if rc == 0 and "Attempting" not in last and last and "Underground" not in last:
+            if launched_before is None or last != launched_before:
+                die("ES launched something else (cursor not on NFSU2): " + last.strip()[:160])
         pid = wait_game(LAUNCH_WAIT_S)
         if pid:
             break
