@@ -689,3 +689,28 @@ for (i = 0; i < n; i++) IntegrateEuler(dt / n);
 - 画面：PC 上 RT16 和 32 位看不出差别，设备上两个都开的截图正常。渐变（天空）可能有轻微色带，没有逐像素比。
 - 结论：颜色缓冲和纹理带宽都不是 GPU 时间的大头。§21.2 里半分辨率能省 25 ms，说明是和像素数成正比的东西，但不在颜色格式/纹理大小上。剩下的嫌疑（都未验证）：片元着色器的 ALU（通用的 register combiner 模拟）、每个 render pass 对颜色 + D24S8 深度的整张 LOAD/STORE（Mali 分块渲染每次切换渲染目标都要付）。
 - 开关保留、默认关：录制线程降下来、GPU 成为瓶颈以后，两个都开能拿回 ~3-4 ms。trace 在 `tmp/xtrace16/`。
+
+## 23. 烟雾和灯光：GC 版的开关，Xbox 版的对应
+
+### 23.1 GC 版有的（`Speed.elf` 符号 + 谁读它，`tmp/chain/gcflag.py`、`gcreads.py`）
+| GC 变量 | 默认 | 读它的函数 | Xbox |
+|---|---|---|---|
+| `DrawLightFlares` | 1 | `eRenderLightFlare`、`eRenderWorldLightFlares`、`RenderFlares`（车灯光晕）、`UpdateCarStreakingFlares`、`RenderFEFlares` | **0x399480**（读者 `sub_000A75D0`、`000A8210`、`00206190`、`00206220`、`00206330`，5 对 5；从不被写） |
+| `TexturedHeadLightsON` | 1 | `RenderCarsTexturedHeadlights`（车灯投在路面上的光斑） | **0x3CC824**（唯一读者 `sub_00204290`：同样读 `pCurrentWorld`、浮点 10.0 和这个开关，调 `GetVisibleState`；从不被写） |
+| `PrecipitationEnable` | 1 | `Rain::*` | 0x3A3FA0，已默认关（docs/10） |
+| `DrawCarsReflections` / `EnableRoadSpecular` | 1 | | 0x3CC5E8 / 0x3994A0，已默认关（docs/08、10） |
+| `DrawFancyCarShadow`、`EnableEnvMap`、`EnableLighting`、`EnableGlossMapping` | 1 | `eDisplayFrame` / `CarRenderInfo::Render` / `eDataRender::Render` | 未定位（Xbox 的渲染结构和 GC 不同，docs/08 §3.1） |
+| `DrawSmear`（动态模糊）、`GlowBloomPasses` | 2 | `eMotionBlurEffect`、`eGlowBloomEffect` / `eDepthOfFieldEffect` | 未定位；这些后处理画到 320×240，设备上 `RECOMP_GL_SKIP=320x240` 已经丢掉 |
+| `TriggerEffectsOn` | 1 | `UpdateTriggerEffects`（场景里的触发式特效） | 未定位 |
+- **烟雾（轮胎烟、火花等粒子）没有开关**：粒子系统是 `AcidEffectSystem`，`RenderEffects` 里不读任何全局。Xbox 对应 `sub_0009D240`（大小 3520 vs 3396，开头 `bGetTicker`，循环里一串 `bSin`/`bCos`，和 GC 的结构一致），主线程只占 0.8%。要关它只能改写这个函数（直接返回），要重新生成 gen（`tools/regen.sh` + `recomp_manual.c` 里的 `_gen` 声明），这次没做。
+
+### 23.2 设备上（Vulkan，起跑线，sweep，`POKE_VA`/`POKE_VAL` 实时写；POKE 写了就不会自己还原，所以按"关/开"成对看）
+| 窗口 | ms | draw / call |
+|---|---|---|
+| 光晕关 → 后面的基线（仍是关） → 开 | 48.7 → 49.0 → 53.1 | 698 → 710 → 732 |
+| 第二次：关 → 基线（关） → 开 | 45.9 → 46.6 → 47.5 | 671 → 671 → 687 |
+| 路面车灯光斑 关 / 开 | 47.5 / 46.5 | 699 / 686（无差别） |
+- `DrawLightFlares=0`：每帧少 ~16-30 个 draw（2-4%），帧时间差在噪声内（1-4 ms）。路灯和车灯的光晕会消失。
+- `TexturedHeadLightsON=0`：起跑线上没变化（这时候大概没有路面光斑），这项要在夜里开着车灯的路段再看。
+- 都没有改默认。要关光晕：`env.txt` 里 `RECOMP_POKE=0x399480:0`（启动脚本会把它接在默认的三项后面）。
+- 结论：这两项的 draw 都不多。现在每帧 ~700 draw 里，大头仍然是场景（§2 的 PX_PCT 已经在砍）和车（`CarRenderInfo::Render`）。
