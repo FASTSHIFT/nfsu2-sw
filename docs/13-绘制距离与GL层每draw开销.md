@@ -746,3 +746,33 @@ GC 符号里和几何细节有关的只有这些（`DebugCarLOD*`、`CarBodyMinL
 - LOD 3 每帧少 ~80 个 draw，帧时间的差在噪声里。代价明显：玩家自己的车也换成了最低模（PC 截图：车牌、轮毂、车灯细节都没了），近处很难看。`ForceCarLOD` 对所有车一样，没法只降别人的车。
 - `CAR_LOD_PCT` 几乎不改变 draw 数：车的 draw 主要是零件数（车身、轮子、玻璃、灯……），起跑线上的车都很近，阈值放大 4 倍也换不了几辆。
 - 都不改默认。要试：`/tmp/nfsu2.knobs` 写 `CAR_LOD=3`，或 env.txt `RECOMP_KNOB_CAR_LOD=3`。
+
+## 25. 还能减 draw 的档位（GC 找，设备 Vulkan 版验证）
+
+### 25.1 设备上（起跑线，一次启动 sweep；POKE 写了不会自己还原，所以按"关 → 开"成对看）
+| 开关 | Xbox 地址 | GC 名字 | 关 / 开 时的 draw | 帧时间 |
+|---|---|---|---|---|
+| **整个 HUD / 前端层** | 0x3A2728 | FE 管理器渲染总开关（§13.2） | **651 / 746（-95，-13%）** | 46.1 / 50.4（**~-3 ms**） |
+| 车下的精细阴影 | 0x3CC838 | `DrawFancyCarShadow`（GC 和 Xbox 都只在 `CarRenderInfo::Render` 里读；§13.2 当时没认出来） | 692-710 / 717-719（-10..-25） | 噪声内 |
+| 车身环境贴图 | 0x39949C | `EnableEnvMap`（读者 `Render`、`RenderFast`，和 GC 一致） | 707 / 706 | 无（128×128 的 pass 本来就被 `RECOMP_GL_SKIP` 丢了） |
+| 天空 | 0x3CC86C | （§13.2） | 705 / 709 | 噪声内（只省填充） |
+| 光晕 | 0x399480 | `DrawLightFlares`（§23） | -16..-30 | 噪声内 |
+| 车辆最低模 | 0x3CC644 | `ForceCarLOD=3`（§24） | -82 | -2.5 ms，近处很难看 |
+
+### 25.2 游戏菜单里就有的 HUD 选项（Options → Player，存档里按玩家保存）
+HUD 是最大的一块（-95 draw，~3 ms），而且大部分是排行榜、圈数这些文字的一个个字符四边形（§13.3：行驶中 94 个 draw）。GC 版 `UIOptionsScreen::SetupPlayer` 有逐项开关，每项对应 `PlayerSettings`（GC `FEDatabase` +160 起，每个玩家 64 字节）里的一个标志，`Player::DetermineHudFeatures` 据此决定 `FEngHud::SetHudFeatures` 显示哪些部件：
+
+| 菜单项（GC 类） | 标志 | HUD 部件 |
+|---|---|---|
+| Gauges（`POGauges`） | +0 | 转速表 / 速度表 / 氮气 |
+| Position（`POPosition`） | +4 | 名次 "4th/4" |
+| Lap Info（`POLapInfo`） | +8 | 圈数、时间 |
+| Score（`POScore`） | +12 | 漂移 / 风格分 |
+| Leaderboard（`POLeaderBoard`） | +20 | 左上角对手名单 |
+| Split Time（`POSplitTime`） | +50（字节） | 分段时间 |
+
+- 直接在游戏里关掉 Leaderboard、Lap Info、Split Time、Position 就能省掉大部分文字 draw，不需要改代码；Gauges 保留就还有速度表。单项的收益没测（Xbox 版 `PlayerSettings` 的布局和 GC 不同，`PlayerSettings::Default` 对应的是按字节存的版本，地址没对上），上限是上表的整层 HUD：~95 draw、~3 ms。
+- 赛前设置里的交通密度（Traffic）和对手数也直接减车：`DrawCars=0` 时整帧 -120 draw（§13.2），每辆车 ~20-30 个 draw（零件），起跑线 4 辆车 + 行驶中的交通车。
+
+### 25.3 结论
+GC 符号里能直接减 draw 的档位基本找完了：剩下有量的只有 HUD（菜单里关）、车的数量（赛前设置）、车 LOD 3（难看）和 §2 的 `PX_PCT`（已经开到 10）。场景本身 250-300 个 draw 没有别的开关。
