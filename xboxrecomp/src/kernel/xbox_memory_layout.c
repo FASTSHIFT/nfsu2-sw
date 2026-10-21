@@ -1579,6 +1579,23 @@ void recomp_cs_violation(uint32_t callee, uint32_t reg, uint32_t want,
     fflush(stderr);
 }
 
+void recomp_x87_violation(uint32_t caller, uint32_t want, uint32_t got)
+{
+    enum { SLOTS = 256 };
+    static uint32_t seen[SLOTS];
+    static int count;
+    int i;
+
+    for (i = 0; i < count; i++)
+        if (seen[i] == caller)
+            return;
+    if (count < SLOTS)
+        seen[count++] = caller;
+    fprintf(stderr, "[X87] in sub_%08X: top after a call %u, expected %u\n",
+            caller, got & 7u, want & 7u);
+    fflush(stderr);
+}
+
 /* SEH frame pointer bridge (see recomp_types.h for explanation) */
 RECOMP_TLS uint32_t g_seh_ebp = 0;
 RECOMP_TLS double g_fp_stack[8];

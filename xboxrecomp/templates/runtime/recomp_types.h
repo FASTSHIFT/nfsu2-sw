@@ -1037,6 +1037,9 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * eax, ecx, edx, ebx, esi, edi, esp. */
 void recomp_cs_violation(uint32_t callee, uint32_t reg, uint32_t want,
                          uint32_t got);
+/* Static x87 depth check (RECOMP_X87_CHECK=1 at regen): after a call in
+ * `caller`, the x87 top is not where x87_summary.py said it would be. */
+void recomp_x87_violation(uint32_t caller, uint32_t want, uint32_t got);
 
 #ifdef RECOMP_ABI_CHECK
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,

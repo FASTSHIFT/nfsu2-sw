@@ -337,7 +337,123 @@ def _wrap_calls(line, call_re, spill, reload):
 _X87_CALL_RE = None
 
 
-def _localize_x87_stack(lines):
+X87_STATS = {"static_functions": 0, "dynamic_functions": 0, "bailed": 0}
+_X87_HIT_RE = None
+
+
+def _x87_static(lines, at, xsum, addr, check):
+    """The whole x87 stack in C locals, for a function whose depth is static
+    (x87_summary.py): a local double[8] indexed relative to the entry top,
+    which, the depth being the same on every path, the compiler sees as
+    constant indices and keeps in registers -- no guest store can alias a
+    local whose address is never taken.
+
+    The ring is touched only where something else can see it: on entry the
+    caller's positions this function reads (reach) are copied in; at a call
+    the callee's reach is copied out and the top stored, and afterwards the
+    callee's results copied back in; at a return, what the caller gets back.
+    Returns None (keep the dynamic scheme) for anything not understood."""
+    import re
+    global _X87_HIT_RE
+    info = xsum.info.get(addr)
+    if info is None or addr in getattr(xsum, "overridden", ()):
+        X87_STATS["dynamic_functions"] += 1
+        return None
+    if _X87_HIT_RE is None:
+        _X87_HIT_RE = re.compile(
+            r"RECOMP_ABI_CALL\(0x([0-9A-Fa-f]{8})u|"
+            r"RECOMP_ICALL_SAFE_AT\(_icall_target, _icall_esp, 0x([0-9A-Fa-f]{8})u\)|"
+            r"RECOMP_ICALL_SAFE\(0x([0-9A-Fa-f]{8})u|"
+            r"RECOMP_ITAIL\(0x([0-9A-Fa-f]{8})u\)|"
+            r"RECOMP_ITAIL\((_jt)\)|"
+            r"RECOMP_ITAIL\(MEM32\((0x[0-9A-Fa-f]+)\)\)|"
+            r"\bsub_([0-9A-Fa-f]{8})\s*\(\s*\)")
+    delta, reach = info
+    body = lines[at + 1:]
+
+    def summary_at(line, pos):
+        """(delta, reach) of the call starting at pos, "flush" for a
+        fallback that never runs, or None."""
+        if line.startswith("RECOMP_ICALL_GUARD", pos):
+            return "none"                          # counters, not calls
+        m = _X87_HIT_RE.match(line, pos)
+        if not m:
+            return None
+        g = m.groups()
+        if g[1] is not None:                       # through a pointer
+            r = xsum.icalls.get(int(g[1], 16))
+            # A site the analysis never reached is in code no path enters.
+            return "flush" if r is None else (r, 0)
+        if g[4] is not None:
+            return "flush"
+        if g[5] is not None:                       # kernel import tail
+            return (0, 0)
+        t = next(x for x in (g[0], g[2], g[3], g[6]) if x is not None)
+        return xsum.info.get(int(t, 16))
+
+    # Every call must be understood, and the arms of a guarded indirect
+    # call must agree with the reading of the call itself.
+    for l in body:
+        icall = re.search(r"RECOMP_ICALL_SAFE_AT\(_icall_target, _icall_esp, "
+                          r"0x([0-9A-Fa-f]{8})u\)", l)
+        want = None
+        if icall:
+            r = xsum.icalls.get(int(icall.group(1), 16))
+            want = None if r is None else (r, 0)
+        for m in _X87_CALL_RE.finditer(l):
+            s = summary_at(l, m.start())
+            if s is None or (want is not None and s not in ("flush", "none")
+                             and s != want):
+                X87_STATS["bailed"] += 1
+                return None
+
+    def put(j):
+        return (f"_fpb[(_fpT + (unsigned)g_fp_top + {j}u) & 7u] = "
+                f"g_fp_stack[(g_fp_top + {j}) & 7];")
+
+    def get(j):
+        return (f"g_fp_stack[(g_fp_top + {j}) & 7] = "
+                f"_fpb[(_fpT + (unsigned)g_fp_top + {j}u) & 7u];")
+
+    top_st = "recomp_fp_top_st((int)((_fpT + (unsigned)g_fp_top) & 7u));"
+
+    def sync_for(line, pos):
+        s = summary_at(line, pos)
+        if s == "none":
+            return "", ""
+        if s == "flush":
+            return " ".join(put(j) for j in range(8)) + " " + top_st, ""
+        dg, rg = s
+        pre = " ".join([put(j) for j in range(rg)] + [top_st])
+        post = [f"g_fp_top = (g_fp_top - ({dg})) & 7;"]
+        post += [get(j) for j in range(rg + dg)]
+        if check:
+            post.append(f"if (((unsigned)recomp_fp_top_ld() & 7u) != "
+                        f"((_fpT + (unsigned)g_fp_top) & 7u)) "
+                        f"recomp_x87_violation(0x{addr:08X}u, "
+                        f"(uint32_t)((_fpT + (unsigned)g_fp_top) & 7u), "
+                        f"(uint32_t)recomp_fp_top_ld());")
+        return pre, " ".join(post)
+
+    ret_spill = " ".join([put(j) for j in range(reach + delta)] + [top_st])
+    out = lines[:at + 1]
+    out.append("    double *const _fpb = recomp_fp_base(); "
+               "const unsigned _fpT = (unsigned)recomp_fp_top_ld(); "
+               "double g_fp_stack[8] = {0}; int g_fp_top = 0; "
+               "/* x87 stack in locals: static depth */")
+    if reach:
+        out.append("    " + " ".join(
+            f"g_fp_stack[{j}] = _fpb[(_fpT + {j}u) & 7u];" for j in range(reach)))
+    for l in body:
+        l = l.replace("((g_fp_top & 7u) << 11)",
+                      "(((_fpT + (unsigned)g_fp_top) & 7u) << 11)")
+        out.append(_wrap_calls_sync(l, _X87_CALL_RE, ret_spill, sync_for))
+    out.append(f"    {ret_spill} /* x87 stack back at the end */")
+    X87_STATS["static_functions"] += 1
+    return out
+
+
+def _localize_x87_stack(lines, xsum=None, addr=None, check=False):
     """Keep a function's x87 stack in C locals.
 
     g_fp_stack[8] and g_fp_top are thread-local globals, so every fld, fstp
@@ -379,6 +495,10 @@ def _localize_x87_stack(lines):
     if re.search(r"setjmp|longjmp|RECOMP_SEH|recomp_fsave|recomp_frstor|"
                  r"recomp_fxsave|recomp_fxrstor|recomp_fldenv|recomp_fstenv", text):
         return lines
+    if xsum is not None and addr is not None:
+        static = _x87_static(lines, at, xsum, addr, check)
+        if static is not None:
+            return static
     spill = "recomp_fp_top_st(g_fp_top);"
     reload = "g_fp_top = recomp_fp_top_ld();"
     out = lines[:at + 1]
@@ -2871,7 +2991,9 @@ class FunctionTranslator:
         if os.environ.get("RECOMP_LEAF_LOCALS", "1") != "0":
             lines = _localize_leaf_registers(lines, instructions, start, end)
         if os.environ.get("RECOMP_X87_LOCALS", "1") != "0":
-            lines = _localize_x87_stack(lines)
+            lines = _localize_x87_stack(
+                lines, xsum=getattr(self, "x87_summary", None), addr=start,
+                check=os.environ.get("RECOMP_X87_CHECK", "0") == "1")
         if os.environ.get("RECOMP_REG_LOCALS", "1") != "0":
             lines = _localize_registers(
                 lines, summary=getattr(self, "reg_summary", None),
@@ -3276,6 +3398,23 @@ class BatchTranslator:
         self.translator.lifter.wrapped_functions = wrapped
         manual_decls = {}
 
+        # Static x87 depths (x87_summary.py).
+        self.translator.x87_summary = None
+        if os.environ.get("RECOMP_X87_STATIC", "1") != "0":
+            from .x87_summary import compute as x87_compute
+            self.translator.x87_summary = x87_compute(
+                self.translator, func_list, verbose=True)
+            dump = os.environ.get("RECOMP_X87SUM_DUMP")
+            if dump:
+                import json
+                xs = self.translator.x87_summary
+                with open(dump, "w") as fh:
+                    json.dump({"static": {f"{a:08X}": v for a, v in xs.info.items()},
+                               "dynamic": {f"{a:08X}": v for a, v in xs.reasons.items()}},
+                              fh)
+            if os.environ.get("RECOMP_X87SUM_ONLY") == "1":
+                raise SystemExit(0)
+
         # Register summaries for call-site sync elision (reg_summary.py).
         # RECOMP_REG_CALLSYNC=0 at regen keeps the full sync at every call.
         self.translator.reg_summary = None
@@ -3327,6 +3466,9 @@ class BatchTranslator:
                 translations.append((addr, name, stub))
                 stats["failed"] += 1
 
+        if self.translator.x87_summary is not None:
+            stats["x87_static"] = dict(X87_STATS)
+            print(f"  [x87sum] emitted: {X87_STATS}", file=sys.stderr)
         if self.translator.reg_summary is not None:
             stats["callsync"] = dict(CALLSYNC_STATS)
             print(f"  [regsum] call sites: {CALLSYNC_STATS}", file=sys.stderr)

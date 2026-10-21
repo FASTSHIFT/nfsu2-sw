@@ -24,6 +24,9 @@ XBE="${NFSU2_XBE:-/root/nfsu2x/game/default.xbe}"
 GEN="${NFSU2_GEN_DIR:-/root/nfsu2x/gen}"
 
 cd "$TK"
+# x87 interface of the CRT's _CIpow (x, y in st(1)/st(0) -> x**y), which the
+# static x87 analysis cannot follow itself (see x87_summary.py).
+export RECOMP_X87_OVERRIDE="${RECOMP_X87_OVERRIDE-002A7328:-1:2}"
 if [ "${LIFT_ONLY:-0}" != "1" ]; then
     python3 -m tools.disasm "$XBE" --seed-functions "$HERE/config/seed_functions.json"
     python3 -m tools.func_id "$XBE"
