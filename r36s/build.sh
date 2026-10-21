@@ -38,7 +38,7 @@ if [ "${QEMU:-0}" = "1" ]; then
     FF_CROSS=""
 else
     IMAGE=nfsu2-r36s-cross:focal; PLATFORM=()
-    BUILD="${BUILD_DIR:-build-r36s$([ "${VULKAN:-0}" = 1 ] && echo -vk)}"; JOBS="${JOBS:-$(nproc)}"
+    BUILD="${BUILD_DIR:-build-r36s$([ "${VULKAN:-0}" = 1 ] && echo -vk || true)}"; JOBS="${JOBS:-$(nproc)}"
     CC=aarch64-linux-gnu-gcc
     TOOLCHAIN="-DCMAKE_TOOLCHAIN_FILE=/src/r36s/toolchain-aarch64.cmake"
     OBJDUMP=aarch64-linux-gnu-objdump; READELF=aarch64-linux-gnu-readelf

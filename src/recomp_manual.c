@@ -2739,3 +2739,36 @@ void sub_000A3FA0(void)
     rebuilt++;
     sub_000A3FA0_gen();
 }
+
+/* ── Physics substep length (knobs PHYS_PCT, MELLOW_PCT) ─────────────
+ *
+ * PhysicsMover::Move (sub_001C1510) integrates a frame's dt in
+ * n = (int)(dt / MaximumTimeStep) + 1 equal Euler steps; MaximumTimeStep is
+ * the .data float at 0x3A55B0 (0.0044 s, read only there). At ~50 ms a frame
+ * on the R36S that is 12 steps per car per frame, ~30% of the main thread.
+ * MellowMover::Move (sub_001B55A0, far and traffic cars) does the same with
+ * MaxiMellowTimeStep at 0x3A5580 (1/70 s). The knobs scale them in % of
+ * stock (fewer, longer steps; stability and feel change). Applied by the
+ * knobs thread once a second; at 100 nothing is written, and going back to
+ * 100 writes the stock value again. docs/13 §20. */
+extern void xbox_PokeRuntime(uint32_t va, uint32_t val);
+
+static void phys_step_apply(uint32_t va, float stock, int pct, int *last)
+{
+    float v = stock * (float)pct / 100.0f;
+    uint32_t bits;
+    if (pct == 100 && *last == 100)
+        return;
+    memcpy(&bits, pct == 100 ? &stock : &v, 4);
+    xbox_PokeRuntime(va, bits);
+    if (pct != *last)
+        fprintf(stderr, "[phys] %08X = %.6f s (%d%% of stock)\n", va, pct == 100 ? stock : v, pct);
+    *last = pct;
+}
+
+void knobs_game_apply(void)
+{
+    static int last_phys = 100, last_mellow = 100;
+    phys_step_apply(0x003A55B0u, 0.0044f, knob(KN_PHYS_PCT), &last_phys);
+    phys_step_apply(0x003A5580u, (float)(1.0 / 70.0), knob(KN_MELLOW_PCT), &last_mellow);
+}

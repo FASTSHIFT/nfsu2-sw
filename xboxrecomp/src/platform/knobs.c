@@ -42,6 +42,8 @@ volatile int g_knob[KN_COUNT] = {
     [KN_CLR_DEDUP]        = 1,        /* docs/13 §10 */
     [KN_TEX_MEMO]         = 1,        /* docs/13 §10 */
     [KN_GL_MERGE]         = 0,        /* docs/13 §11, §12: off since two device hangs with it on */
+    [KN_PHYS_PCT]         = 100,      /* docs/13 §18, §20 */
+    [KN_MELLOW_PCT]       = 100,
 };
 
 static const char *const s_count_name[KC_COUNT] = {
@@ -55,9 +57,10 @@ static const char *const s_knob_name[KN_COUNT] = {
     "POKE_VA", "POKE_VAL", "DUMP_DRAWS", "HUD",
     "EXP_DROPFRAG", "EXP_RD", "EXP_QUERY", "EXP_STATIC", "EXP_RDSEL",
     "GL_LEGACY", "DUMP_SEQ", "EXP_NOUNI", "CSCAN", "PX_PCT", "PX_BIG", "PX_STAT", "NATIVE_OFF", "EXP_MERGESTAT", "RAMP_EPS",
-    "CLR_DEDUP", "TEX_MEMO", "GL_MERGE",
+    "CLR_DEDUP", "TEX_MEMO", "GL_MERGE", "PHYS_PCT", "MELLOW_PCT",
 };
-static const int s_knob_min[KN_COUNT] = { 1, 1, 0, 50, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 };
+static const int s_knob_min[KN_COUNT] = { 1, 1, 0, 50, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+                                          10, 10 };
 
 static int s_quiet;                  /* RECOMP_KNOBS_QUIET: no [wake] lines */
 
@@ -129,6 +132,8 @@ static void *knobs_thread(void *arg)
         if (g_knob[KN_POKE_VA])
             xbox_PokeRuntime((uint32_t)g_knob[KN_POKE_VA],
                              (uint32_t)g_knob[KN_POKE_VAL]);
+        if (knobs_game_apply)
+            knobs_game_apply();
         if (s_quiet)
             continue;
         n += (size_t)snprintf(out + n, sizeof out - n, "[wake]");

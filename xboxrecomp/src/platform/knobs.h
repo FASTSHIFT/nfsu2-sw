@@ -64,8 +64,14 @@ enum {
     KN_CLR_DEDUP,       /* 1: drop a clear that repeats the last write to its surface and depth buffer (a pass whose draws RECOMP_GL_SKIP drops) (1) */
     KN_TEX_MEMO,        /* 1: a texture stage that samples what it did on the previous draw skips the surface search and tex_get (1) */
     KN_GL_MERGE,        /* 1: a triangle-list draw that needs no GL state change after the previous one joins its glDrawRangeElements (0: the R36S hung twice with it on, docs/13 §12) */
+    KN_PHYS_PCT,        /* NFSU2: PhysicsMover's longest physics substep (MaximumTimeStep, 0.0044 s) in % of stock; 150 = a third fewer substeps (100) */
+    KN_MELLOW_PCT,      /* NFSU2: the same for MellowMover (far/traffic cars, MaxiMellowTimeStep 1/70 s) (100) */
     KN_COUNT
 };
+
+/* Optional, defined by the game project: called by the knobs thread after
+ * every re-read of the file (once a second), to apply game-specific knobs. */
+extern void knobs_game_apply(void) __attribute__((weak));
 
 extern volatile unsigned g_knob_count[KC_COUNT];
 extern volatile int g_knob[KN_COUNT];

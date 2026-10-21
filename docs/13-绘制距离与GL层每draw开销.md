@@ -547,3 +547,51 @@ for (i = 0; i < n; i++) IntegrateEuler(dt / n);
 ### 19.3 现在卡在哪
 - 渲染两条线都没满（执行器 32%，录制 60%），**主线程 80% 一个核、~41 ms/帧 CPU，是帧率上限**。下一步就是 §18.4 的物理子步（`MaximumTimeStep` @ `0x3A55B0`）。
 - §16.6 那次的游戏停住（BlockOnFence 等不到信号量）在这几轮（8 次启动）里没有再出现，未证明已解决。
+
+## 20. 物理子步加长（knob `PHYS_PCT` / `MELLOW_PCT`）：主线程降了，帧时间不动
+
+### 20.1 做法
+- `PHYS_PCT`：`MaximumTimeStep`（0x3A55B0，0.0044 s，只有 `PhysicsMover::Move` 读）按百分比放大；`MELLOW_PCT`：`MaxiMellowTimeStep`（0x3A5580，1/70 s）同理。默认 100（不写内存）；改回 100 时写回原值。
+- 由 knobs 线程每秒调游戏侧的 `knobs_game_apply()`（`src/recomp_manual.c`，knobs.h 里的弱符号），可以在运行中的比赛里实时切换。
+- 顺带修了 `r36s/build.sh`：不带 `VULKAN=1` 时 `$([ … ] && echo -vk)` 返回 1，`set -e` 让脚本一声不响地退出，GL 版设备构建从 Vulkan 那次提交起其实一直没在编（`build-r36s/nfsu2_recomp` 停在 10-20 11:52）。
+
+### 20.2 设备上（比赛中一次启动，sweep 每个设置前后各一个基线窗口）
+主线程（perf 只采主线程 + 每秒读 `/proc/<pid>/task/<pid>/stat`；Vulkan 版）：
+
+| 窗口 | 主线程占一个核 | `PhysicsMover::Move` 子树 | `MellowMover::Move` |
+|---|---|---|---|
+| 基线 | 70-72% | 11-14% | 2-9% |
+| PHYS_PCT=150 | 73% | 8.0% | 9.1% |
+| PHYS_PCT=200 | 72% | 6.5% | 11.3% |
+| PHYS_PCT=200 + MELLOW_PCT=150 | 68% | 6.8% | 1.7% |
+| PHYS_PCT=300 | 62% | 5.9% | 0% |
+
+帧时间（d_ms = 设置减去两边基线的均值）：
+
+| | 150 | 200 | 200+M150 | 300 |
+|---|---|---|---|---|
+| GL | -0.5 | -1.4 | -2.5 | -0.3 |
+| Vulkan（第 2 次 sweep） | -11.7（第一个基线是 72 ms 的离群值） | -0.7 | -2.6 | -0.3 |
+| Vulkan（第 3 次 sweep） | -7.2（同上） | +1.2 | +1.2 | -0.8 |
+
+- 子步确实变少了（物理子树按比例下降，PHYS_PCT=300 时主线程从 ~72% 降到 ~62%），但帧时间都在噪声里：**主线程不是瓶颈**。GL 版是 GL 线程（ms ≈ gl），Vulkan 版是录制线程（见下）。§18.4 的推断（主线程 ~80% 就是上限）不对：主线程剩下的时间是在等渲染那边。
+- 手感没有测（设备上只有自动驾驶）。knob 保持默认 100。
+- 第 1 次 Vulkan sweep 跑完最后一个窗口后整机挂死，硬件看门狗约 1 分钟后重启（§17 的恢复正常工作）。ramoops 里最后只有 r36s-guard 的心跳，没有内核报错；之后同样的 sweep 又跑了 4 次都正常。原因未查。
+
+### 20.3 Vulkan 录制线程才是上限
+`[frame]` 行加了 `cpu=`（录制线程这一帧的 CPU 时间，`CLOCK_THREAD_CPUTIME_ID`）、`flip=`、`submit=`。比赛中 300 帧的中位数：ms 49.3，gl 43.4，**cpu 41.8**，flip 2.1，submit 0.9，wait 0.0，~740 draw → 每个 draw ~57 µs 的 CPU。
+
+只采录制线程的 perf（8 s，6225 个样本 = 78% 一个核）：
+
+| | 占录制线程 |
+|---|---|
+| Mali 驱动 | 39%，其中 `vkCmdDrawIndexed`（包括实例化攒下的那次）33%：每个 draw call ~22 µs |
+| 我们的代码 | 36%（`vk_draw_raw` 自身 13.6%，`bind_stage` 3.2%，`bytes_hash` 2.9%，`regs_changed` 2.8%，`uniform_upload` 2%，`tex_get` 1.1% …，很平） |
+| libc（几乎都是往 GPU 环形缓冲 memcpy：顶点、192 行常量、uniform） | 16% |
+| 内核（主要是 Mali ioctl） | 8% |
+
+- `RECOMP_GL_DUMP`（autotest 每 100 帧存一张 BMP）占 ~3%，正常游戏没有。
+- 所以下一步要降的是录制线程：
+  1. 减少 draw call（Mali 每次 ~22 µs，无法绕开）；
+  2. 我们这边每个 draw 的准备工作：索引 u32→u16 的逐个转换是标量循环、写的是 GPU 内存，FsBlock 的 16 个颜色做了 64 次除法；
+  3. 把能挪的挪到执行器（它只用了 ~32% 一个核）：索引转换、属性转换；或者让队列本身就是 GPU 可见内存，省掉第二次拷贝（改动大）。

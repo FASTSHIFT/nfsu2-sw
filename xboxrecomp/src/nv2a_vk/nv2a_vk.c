@@ -435,7 +435,7 @@ static void kms_wait_slot(uint32_t i);
 /* RECOMP_PERF_LOG=2: per frame, the back end's own time on the executor
  * thread (draws, clears, the flip: "gl" for nv2a_gl's GL thread) and the part
  * of it spent waiting for the GPU (frame slot fences, the KMS thread). */
-static uint64_t s_pf_be_ns, s_pf_wait_ns, s_pf_draws;
+static uint64_t s_pf_be_ns, s_pf_wait_ns, s_pf_draws, s_pf_submit_ns;
 static uint32_t s_pf_calls, s_pf_draws_frame;
 static void frame_begin(void)
 {
@@ -5416,8 +5416,12 @@ static void vk_flip(void)
         si.signalSemaphoreCount = 1;
         si.pSignalSemaphores = &s_sc_rendered[idx];
     }
-    if (vkQueueSubmit(s_queue, 1, &si, s_f->fence) != VK_SUCCESS)
-        LOGE("vkQueueSubmit failed\n");
+    {
+        uint64_t s0 = hz_now();
+        if (vkQueueSubmit(s_queue, 1, &si, s_f->fence) != VK_SUCCESS)
+            LOGE("vkQueueSubmit failed\n");
+        s_pf_submit_ns += hz_now() - s0;
+    }
     s_f->submitted = 1;
 #if !defined(__SWITCH__)
     if (s_kms_this) {
@@ -5478,17 +5482,30 @@ static void vk_flip_timed(void)
     static int log = -1;
     static uint64_t last;
     static uint32_t fno;
-    uint64_t t0 = hz_now(), draws0 = s_pf_draws;
+    uint64_t t0 = hz_now(), draws0 = s_pf_draws, flip_ns;
     vk_flip();
-    s_pf_be_ns += hz_now() - t0;
+    flip_ns = hz_now() - t0;
+    s_pf_be_ns += flip_ns;
     if (log < 0) {
         const char *e = getenv("RECOMP_PERF_LOG");
         log = e ? atoi(e) : 0;
     }
-    if (log >= 2 && last)
-        fprintf(stderr, "[frame] %u ms=%.1f gl=%.1f wait=%.1f swap=0.0 dc=%u frag=0 calls=%u merged=0\n",
-                fno++, (t0 - last) / 1e6, s_pf_be_ns / 1e6, s_pf_wait_ns / 1e6,
-                (unsigned)(s_pf_draws_frame), s_pf_calls);
+    {
+        /* cpu: this thread's CPU time over the frame (against ms, the wall
+         * time): what is left is preemption, the driver blocking, queue waits. */
+        static uint64_t cpu_last;
+        struct timespec ts;
+        uint64_t cpu;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+        cpu = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+        if (log >= 2 && last)
+            fprintf(stderr, "[frame] %u ms=%.1f gl=%.1f wait=%.1f swap=0.0 dc=%u frag=0 calls=%u merged=0"
+                    " cpu=%.1f flip=%.1f submit=%.1f\n", fno++, (t0 - last) / 1e6, s_pf_be_ns / 1e6,
+                    s_pf_wait_ns / 1e6, (unsigned)(s_pf_draws_frame), s_pf_calls,
+                    cpu_last ? (cpu - cpu_last) / 1e6 : 0.0, flip_ns / 1e6, s_pf_submit_ns / 1e6);
+        s_pf_submit_ns = 0;
+        cpu_last = cpu;
+    }
     (void)draws0;
     last = t0;
     s_pf_be_ns = s_pf_wait_ns = 0;
