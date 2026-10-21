@@ -101,6 +101,11 @@ void recomp_debug_service(uint32_t service, uint32_t arg_va);
  * Set once during memory initialization, then read-only.
  */
 extern ptrdiff_t g_xbox_mem_offset;
+/* Lifted functions shadow g_xbox_mem_offset with a const local taken from
+ * this (the translator's _localize_mem_offset): the global is not const, and
+ * with -fno-strict-aliasing every guest store may alias it, so XBOX_PTR
+ * otherwise reloads it after each store. */
+static inline ptrdiff_t recomp_mem_offset(void) { return g_xbox_mem_offset; }
 
 /* Bounds of the title's executable sections, filled in by
  * xbox_MemoryLayoutInit from the XBE's own section table. Zero means "not
@@ -164,13 +169,57 @@ extern uint32_t g_xbox_code_hi;
 #  define RECOMP_TLS _Thread_local
 #endif
 
+/* The scalar guest registers live in one thread-local struct. The runtime
+ * still names them g_eax .. g_fp_cc: xbox_memory_layout.c defines those as
+ * assembler aliases of the fields (ELF only). Generated code (the translator
+ * defines RECOMP_CPU_STRUCT) reaches them through g_cpu instead, so a function
+ * needs one TLS base address and immediate offsets from it. As separate TLS
+ * variables, each one's offset was loaded from the GOT into a register of its
+ * own, and GCC kept those live and spilled them around every call.
+ *
+ * A translation unit must use one naming or the other, never both: the
+ * compiler takes g_cpu and an alias for distinct objects. The fields' offsets
+ * are fixed (xbox_memory_layout.c checks them against the aliases). */
+typedef struct RecompCpu {
+    uint32_t r_eax, r_ecx, r_edx, r_ebx, r_esi, r_edi, r_esp, r_ebp;   /*  0 .. 28 */
+    uint32_t r_seh_ebp;                                  /* 32 */
+    int r_fp_top, r_fp_cmp, r_df;                            /* 36, 40, 44 */
+    uint16_t r_fp_cc, r_fp_control_word;                   /* 48, 50 */
+} RecompCpu;
+#if defined(__GNUC__) && !defined(__cplusplus)
+_Static_assert(offsetof(RecompCpu, r_esp) == 24 && offsetof(RecompCpu, r_seh_ebp) == 32
+               && offsetof(RecompCpu, r_df) == 44
+               && offsetof(RecompCpu, r_fp_control_word) == 50,
+               "RecompCpu layout must match the aliases in xbox_memory_layout.c");
+#endif
+#if defined(RECOMP_CPU_STRUCT) && defined(__GNUC__) && defined(__ELF__)
+#define RECOMP_CPU_IN_STRUCT 1
+extern RECOMP_TLS RecompCpu g_cpu;
+#define g_eax (g_cpu.r_eax)
+#define g_ecx (g_cpu.r_ecx)
+#define g_edx (g_cpu.r_edx)
+#define g_ebx (g_cpu.r_ebx)
+#define g_esi (g_cpu.r_esi)
+#define g_edi (g_cpu.r_edi)
+#define g_esp (g_cpu.r_esp)
+#define g_ebp (g_cpu.r_ebp)
+#define g_seh_ebp (g_cpu.r_seh_ebp)
+#define g_fp_top (g_cpu.r_fp_top)
+#define g_fp_cmp (g_cpu.r_fp_cmp)
+#define g_df (g_cpu.r_df)
+#define g_fp_cc (g_cpu.r_fp_cc)
+#define g_fp_control_word (g_cpu.r_fp_control_word)
+#else
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+#endif
 
 /* x87 stack. Per-thread for the same reason the integer registers are:
  * arguments are passed in st(0)/st(1) across call boundaries. */
 extern RECOMP_TLS double g_fp_stack[8];
+#ifndef RECOMP_CPU_IN_STRUCT
 extern RECOMP_TLS int g_fp_top;
+#endif
 
 /* A function whose x87 top index lives in a local (the translator's
  * _localize_x87_stack) takes this thread's stack once, and loads and stores
@@ -198,7 +247,9 @@ static inline void recomp_fp_top_st(int top) { g_fp_top = top; }
 extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE g_fs_base
 
+#ifndef RECOMP_CPU_IN_STRUCT
 extern RECOMP_TLS uint32_t g_seh_ebp;
+#endif
 
 /* ---- non-local jumps (setjmp / longjmp) --------------------------------
  *
@@ -326,7 +377,9 @@ static inline void recomp_spin_hint(void)
 #include <setjmp.h>
 jmp_buf *recomp_setjmp_slot(uint32_t buf_va);
 int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
+#ifndef RECOMP_CPU_IN_STRUCT
 extern RECOMP_TLS uint32_t g_ebp;
+#endif
 
 /* EFLAGS.DF, and the signed step the string instructions take because of it.
  *
@@ -340,16 +393,20 @@ extern RECOMP_TLS uint32_t g_ebp;
  * be found by name, and the dashboard rebooted rather than showing a UI.
  * memmove's overlapping case is the same instruction and the same bug.
  */
+#ifndef RECOMP_CPU_IN_STRUCT
 extern RECOMP_TLS int g_df;
+#endif
 #define RECOMP_DF_STEP(n) (g_df ? -(int32_t)(n) : (int32_t)(n))
 
 /* x87 control and status. Thread-local for the same reason the x87 stack
    above is: one guest routine can lift to several C functions, so a compare
    and the FNSTSW that reads it can land in different bodies, and the control
    word has to survive a call. (g_fp_stack/g_fp_top are declared above.) */
+#ifndef RECOMP_CPU_IN_STRUCT
 extern RECOMP_TLS uint16_t g_fp_control_word;
 extern RECOMP_TLS int g_fp_cmp;
 extern RECOMP_TLS uint16_t g_fp_cc;
+#endif
 #define RECOMP_FCMP_CC(c) ((uint16_t)((c)==2 ? 0x4500u : (c)<0 ? 0x0100u : (c)>0 ? 0u : 0x4000u))
 /* Values in the existing double-backed stack are all representable as normal
  * x87 extended values, including binary64 subnormals. Empty stack tags and

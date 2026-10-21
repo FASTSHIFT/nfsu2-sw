@@ -1490,14 +1490,63 @@ uint32_t g_xbox_code_hi = 0;
  * a spawned thread gets its own from xbox_AllocThreadTib(). */
 RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
 
+/* The scalar guest registers, as one struct (see RecompCpu in recomp_types.h).
+ * Generated code reaches them as g_cpu fields; the runtime's g_eax .. g_fp_cc
+ * are assembler aliases of the same storage, so nothing else changes. The
+ * initial values are the ones the separate variables had: zero, except the
+ * x87 control word (every exception masked, round to nearest) and the status
+ * condition bits (C3 set, as after finit). */
+#if defined(__GNUC__) && defined(__ELF__)
+#define RECOMP_CPU_ALIASED 1
+/* Same layout as recomp_types.h's RecompCpu (which this file does not
+ * include); both are checked against the alias offsets below. */
+typedef struct RecompCpu {
+    uint32_t r_eax, r_ecx, r_edx, r_ebx, r_esi, r_edi, r_esp, r_ebp;
+    uint32_t r_seh_ebp;
+    int r_fp_top, r_fp_cmp, r_df;
+    uint16_t r_fp_cc, r_fp_control_word;
+} RecompCpu;
+RECOMP_TLS RecompCpu g_cpu = { .r_fp_cc = 0x4000, .r_fp_control_word = 0x037Fu };
+__asm__(
+    ".globl g_eax\n\t.type g_eax, STT_TLS\n\t.size g_eax, 4\n\t.set g_eax, g_cpu + 0\n\t"
+    ".globl g_ecx\n\t.type g_ecx, STT_TLS\n\t.size g_ecx, 4\n\t.set g_ecx, g_cpu + 4\n\t"
+    ".globl g_edx\n\t.type g_edx, STT_TLS\n\t.size g_edx, 4\n\t.set g_edx, g_cpu + 8\n\t"
+    ".globl g_ebx\n\t.type g_ebx, STT_TLS\n\t.size g_ebx, 4\n\t.set g_ebx, g_cpu + 12\n\t"
+    ".globl g_esi\n\t.type g_esi, STT_TLS\n\t.size g_esi, 4\n\t.set g_esi, g_cpu + 16\n\t"
+    ".globl g_edi\n\t.type g_edi, STT_TLS\n\t.size g_edi, 4\n\t.set g_edi, g_cpu + 20\n\t"
+    ".globl g_esp\n\t.type g_esp, STT_TLS\n\t.size g_esp, 4\n\t.set g_esp, g_cpu + 24\n\t"
+    ".globl g_ebp\n\t.type g_ebp, STT_TLS\n\t.size g_ebp, 4\n\t.set g_ebp, g_cpu + 28\n\t"
+    ".globl g_seh_ebp\n\t.type g_seh_ebp, STT_TLS\n\t.size g_seh_ebp, 4\n\t.set g_seh_ebp, g_cpu + 32\n\t"
+    ".globl g_fp_top\n\t.type g_fp_top, STT_TLS\n\t.size g_fp_top, 4\n\t.set g_fp_top, g_cpu + 36\n\t"
+    ".globl g_fp_cmp\n\t.type g_fp_cmp, STT_TLS\n\t.size g_fp_cmp, 4\n\t.set g_fp_cmp, g_cpu + 40\n\t"
+    ".globl g_df\n\t.type g_df, STT_TLS\n\t.size g_df, 4\n\t.set g_df, g_cpu + 44\n\t"
+    ".globl g_fp_cc\n\t.type g_fp_cc, STT_TLS\n\t.size g_fp_cc, 2\n\t.set g_fp_cc, g_cpu + 48\n\t"
+    ".globl g_fp_control_word\n\t.type g_fp_control_word, STT_TLS\n\t.size g_fp_control_word, 2\n\t.set g_fp_control_word, g_cpu + 50\n\t");
+_Static_assert(offsetof(RecompCpu, r_ecx) == 4 && offsetof(RecompCpu, r_edx) == 8
+               && offsetof(RecompCpu, r_ebx) == 12 && offsetof(RecompCpu, r_esi) == 16
+               && offsetof(RecompCpu, r_edi) == 20 && offsetof(RecompCpu, r_esp) == 24
+               && offsetof(RecompCpu, r_ebp) == 28 && offsetof(RecompCpu, r_seh_ebp) == 32
+               && offsetof(RecompCpu, r_fp_top) == 36 && offsetof(RecompCpu, r_fp_cmp) == 40
+               && offsetof(RecompCpu, r_df) == 44 && offsetof(RecompCpu, r_fp_cc) == 48
+               && offsetof(RecompCpu, r_fp_control_word) == 50,
+               "RecompCpu layout must match the g_* aliases");
+/* This file uses the alias names only; g_cpu above is just the storage. */
+extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_esp;
+extern RECOMP_TLS uint32_t g_ebp, g_seh_ebp;
+extern RECOMP_TLS int g_fp_top, g_fp_cmp, g_df;
+extern RECOMP_TLS uint16_t g_fp_cc, g_fp_control_word;
+#endif
+
 /* The shape of the TLS block the loader built, so a new thread can be
  * given one just like it: where the initialised image data starts, how
  * big the block is, and how big the per-thread structure slot 0 points
  * at is. Zero total means the image had no TLS directory. */
 static uint32_t g_tls_template_va, g_tls_total, g_tls_thread_size = 64;
 
+#ifndef RECOMP_CPU_ALIASED
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
 RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
+#endif
 
 #ifdef RECOMP_ABI_CHECK
 /* Report a lifted function that returned without restoring ebx/esi/edi.
@@ -1597,9 +1646,13 @@ void recomp_x87_violation(uint32_t caller, uint32_t want, uint32_t got)
 }
 
 /* SEH frame pointer bridge (see recomp_types.h for explanation) */
+#ifndef RECOMP_CPU_ALIASED
 RECOMP_TLS uint32_t g_seh_ebp = 0;
+#endif
 RECOMP_TLS double g_fp_stack[8];
+#ifndef RECOMP_CPU_ALIASED
 RECOMP_TLS int g_fp_top = 0;
+#endif
 
 /* Set once at startup. The generated code reads it at the ret of every
  * --force-return function, so it has to be cheap and it has to default to
@@ -1608,9 +1661,11 @@ RECOMP_TLS int g_fp_top = 0;
 int g_force_return = 0;
 /* x87 control and status. The reset default masks every exception and
  * rounds to nearest, which is what the CRT expects before _control87. */
+#ifndef RECOMP_CPU_ALIASED
 RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
 RECOMP_TLS int g_fp_cmp = 0;
 RECOMP_TLS uint16_t g_fp_cc = 0x4000;
+#endif
 
 /* Defined below, with the other guest registers. */
 extern RECOMP_TLS uint32_t g_ebp;
@@ -2142,7 +2197,9 @@ RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 /* Last frame established by `mov ebp, esp`. Read by frameless functions
  * that address their caller's frame through ebp. */
+#ifndef RECOMP_CPU_ALIASED
 RECOMP_TLS uint32_t g_ebp = 0;
+#endif
 
 /* EFLAGS.DF. Zero means the string instructions walk forwards, which is the
  * ABI's resting state and what almost every one of them does -- so this is
@@ -2151,7 +2208,9 @@ RECOMP_TLS uint32_t g_ebp = 0;
  * `std; repne scasb`, and memmove goes backwards when its regions overlap the
  * wrong way. Thread-local, because `std` and the `cld` that undoes it can land
  * in different lifted bodies of the same guest routine. */
+#ifndef RECOMP_CPU_ALIASED
 RECOMP_TLS int g_df = 0;
+#endif
 
 /* ICALL trace ring buffer */
 volatile uint32_t g_icall_trace[16] = {0};

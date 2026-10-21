@@ -662,6 +662,69 @@ def _localize_registers(lines, summary=None, check=False):
     return out
 
 
+def _localize_mem_offset(lines):
+    """Shadow g_xbox_mem_offset with a const local.
+
+    Every guest memory access is XBOX_PTR(addr) = addr + g_xbox_mem_offset.
+    The global is set once at start-up, but nothing tells the compiler so,
+    and with -fno-strict-aliasing a store through any guest pointer may
+    alias it -- so it is reloaded after every store, one more load in the
+    address chain of nearly every access that follows one. A const local of
+    the same name, taken after the pre-emption point, makes XBOX_PTR (a
+    macro) use the local instead. RECOMP_MEMOFF_LOCAL=0 at regen turns it off.
+    """
+    import re
+    try:
+        at = next(i for i, l in enumerate(lines)
+                  if l.strip() == "RECOMP_PREEMPT();")
+    except StopIteration:
+        return lines
+    text = "\n".join(lines[at + 1:])
+    if not re.search(r"\b(?:S?MEM(?:8|16|32|64|F|D)|PUSH32|POP32|XBOX_PTR|"
+                     r"MMIO_RD|MMIO_WR)\b", text):
+        return lines
+    return (lines[:at + 1]
+            + ["    const ptrdiff_t g_xbox_mem_offset = recomp_mem_offset();"
+               " /* guest memory base in a local */"]
+            + lines[at + 1:])
+
+
+_CPU_SHADOW_RE = None
+
+
+def _shadow_cpu_struct(code):
+    """Keep register locals working when the registers are g_cpu fields.
+
+    Generated chunks build with RECOMP_CPU_STRUCT, under which recomp_types.h
+    makes g_eax .. g_fp_top macros for g_cpu fields. A function that keeps a
+    register in a local declares it under the same name (`uint32_t g_eax =
+    recomp_leaf_ld_eax();`), which the macro would turn into a field. So the
+    function points the macro at a local of its own name for its body and
+    puts it back after. The register accessors are inline functions defined
+    before any of this, so they still reach the field."""
+    import re
+    global _CPU_SHADOW_RE
+    if _CPU_SHADOW_RE is None:
+        _CPU_SHADOW_RE = re.compile(
+            r"\b(?:uint32_t|int) g_(eax|ecx|edx|ebx|esi|edi|esp|fp_top) = ")
+    names = []
+    for n in _CPU_SHADOW_RE.findall(code):
+        if n not in names:
+            names.append(n)
+    if not names:
+        return code
+    lines = code.split("\n")
+    at = next(i for i, l in enumerate(lines) if _CPU_SHADOW_RE.search(l))
+    pre = ["#ifdef RECOMP_CPU_IN_STRUCT"]
+    post = ["#ifdef RECOMP_CPU_IN_STRUCT"]
+    for n in names:
+        pre += [f"#undef g_{n}", f"#define g_{n} rl_{n}"]
+        post += [f"#undef g_{n}", f"#define g_{n} (g_cpu.r_{n})"]
+    pre.append("#endif")
+    post.append("#endif")
+    return "\n".join(lines[:at] + pre + lines[at:] + post)
+
+
 def _fixup_icall_esp_save(lines):
     """
     Post-process generated C lines to insert _icall_esp save points.
@@ -2998,6 +3061,8 @@ class FunctionTranslator:
             lines = _localize_registers(
                 lines, summary=getattr(self, "reg_summary", None),
                 check=os.environ.get("RECOMP_CS_CHECK", "0") == "1")
+        if os.environ.get("RECOMP_MEMOFF_LOCAL", "1") != "0":
+            lines = _localize_mem_offset(lines)
 
         # Validate: comment out goto targets that reference missing labels
         # (dead code after unconditional jumps may reference non-existent labels)
@@ -3398,6 +3463,11 @@ class BatchTranslator:
         self.translator.lifter.wrapped_functions = wrapped
         manual_decls = {}
 
+        # Guest registers as g_cpu fields in the generated chunks (see
+        # RecompCpu in recomp_types.h). RECOMP_CPU_STRUCT=0 at regen keeps
+        # the separate TLS variables.
+        cpu_struct = os.environ.get("RECOMP_CPU_STRUCT", "1") != "0"
+
         # Static x87 depths (x87_summary.py).
         self.translator.x87_summary = None
         if os.environ.get("RECOMP_X87_STATIC", "1") != "0":
@@ -3455,6 +3525,8 @@ class BatchTranslator:
                 code, spins = spin_hint(code)
                 if spins:
                     stats["spin_loops"] = stats.get("spin_loops", 0) + spins
+            if code and cpu_struct:
+                code = _shadow_cpu_struct(code)
             if code:
                 translations.append((addr, name, code))
                 stats["translated"] += 1
@@ -3624,6 +3696,7 @@ class BatchTranslator:
                 " */",
                 "",
                 "#define RECOMP_GENERATED_CODE",
+            ] + (["#define RECOMP_CPU_STRUCT"] if cpu_struct else []) + [
                 f'#include "{header_name}"',
                 '#include <math.h>',
                 "",
