@@ -286,6 +286,15 @@ static VkPhysicalDeviceMemoryProperties s_memprops;
 static VkDeviceSize     s_ubo_align = 256;
 static uint32_t         s_ubo_range = 16384;
 static VkFormat         s_depth_fmt = VK_FORMAT_D24_UNORM_S8_UINT;
+/* Experiments in memory bandwidth (docs/13 §22), both off by default:
+ * RECOMP_VK_RT16=1 stores colour surfaces as R5G6B5 (no destination alpha:
+ * it reads 1); RECOMP_VK_TEX16=1 stores decoded textures in 16 bits a texel
+ * (R5G6B5 when opaque, A1R5G5B5 when the alpha is 0/255 only, else R4G4B4A4). */
+static VkFormat         s_rt_fmt = VK_FORMAT_B8G8R8A8_UNORM;
+static int              s_tex16;
+/* Render passes begun this frame and the pixels they load and store. */
+static uint32_t s_st_pass, s_st_pass_d;
+static uint64_t s_st_pass_px;
 static int              s_have_bc, s_have_depth_clamp;
 /* Plain Vulkan 1.0 (see the top of the file); RECOMP_VK_COMPAT=1 forces it. */
 static int              s_vk10;
@@ -735,7 +744,7 @@ static int make_render_passes(void)
         VkRenderPassCreateInfo ci = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
         memset(ad, 0, sizeof ad);
         memset(&sd, 0, sizeof sd);
-        ad[0].format = VK_FORMAT_B8G8R8A8_UNORM;
+        ad[0].format = s_rt_fmt;
         ad[1].format = s_depth_fmt;
         ad[0].samples = ad[1].samples = VK_SAMPLE_COUNT_1_BIT;
         ad[0].loadOp = ad[1].loadOp = ad[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -819,6 +828,9 @@ static void begin_rendering(VkSurf *s, VkDepthBuf *d)
         bi.renderArea.extent.width = w;
         bi.renderArea.extent.height = h;
         vkCmdBeginRenderPass(s_cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
+        s_st_pass++;
+        s_st_pass_d += d != NULL;
+        s_st_pass_px += (uint64_t)w * h;
         s_in_render = 1;
         s_rt = s;
         s_rt_depth = d;
@@ -990,7 +1002,7 @@ static VkSurf *surf_get(uint32_t va, uint32_t w, uint32_t h, uint32_t aa_sx, uin
     s->va = va; s->w = w; s->h = h; s->used = s_frame;
     s->aa_sx = aa_sx; s->aa_sy = aa_sy;
     stored_size(w, h, &s->pw, &s->ph);
-    if (!make_image(s->pw, s->ph, VK_FORMAT_B8G8R8A8_UNORM,
+    if (!make_image(s->pw, s->ph, s_rt_fmt,
                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                     VK_IMAGE_ASPECT_COLOR_BIT, &s->image, &s->view, &s->mem)) {
@@ -1028,7 +1040,7 @@ static void rescale_surfaces(double k)
         stored_size(s->w, s->h, &pw, &ph);
         if (pw == s->pw && ph == s->ph)
             continue;
-        if (!make_image(pw, ph, VK_FORMAT_B8G8R8A8_UNORM,
+        if (!make_image(pw, ph, s_rt_fmt,
                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                         VK_IMAGE_ASPECT_COLOR_BIT, &img, &view, &mem)) {
@@ -1135,6 +1147,7 @@ typedef struct {
     uint32_t palette_va, palette_reg;   /* format 0x0B: the palette it was decoded with */
     VkImage image; VkImageView view; VkDeviceMemory mem;
     VkFormat fmt;
+    int f16;                    /* RECOMP_VK_TEX16: fmt is a 16-bit one, decoded as B8G8R8A8 */
     uint32_t used, checked;
 } VkTex;
 
@@ -1403,11 +1416,12 @@ static uint32_t cube_face_bytes(uint32_t color, uint32_t w, uint32_t h, uint32_t
 }
 
 /* One 2D image (layer 0) or cube face from guest memory at va. */
+static void tex_decode_argb(uint32_t va, uint32_t color, uint32_t w, uint32_t h, uint32_t pitch,
+                            uint32_t *px);
 static void tex_fill(VkTex *t, uint32_t va, uint32_t layer)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t color = t->color, w = t->w, h = t->h, pitch = t->pitch, *px;
-    Nv2aTexture nt;
     VkDeviceSize at;
     void *map;
 
@@ -1433,6 +1447,22 @@ static void tex_fill(VkTex *t, uint32_t va, uint32_t layer)
     px = (uint32_t *)map;
     if (!px)
         return;
+    tex_decode_argb(va, color, w, h, pitch, px);
+    tex_copy_from_ring(t, at, 0, layer, 0);
+}
+
+/* A non-DXT texture at va decoded to B8G8R8A8 (0xAARRGGBB words) into px. */
+static void tex_decode_argb(uint32_t va, uint32_t color, uint32_t w, uint32_t h, uint32_t pitch,
+                            uint32_t *px)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    Nv2aTexture nt;
+    if (color == 0x12 && pitch && !(pitch & 3) && pitch / 4 >= w) {
+        uint32_t y;
+        for (y = 0; y < h; y++)
+            memcpy(px + (size_t)y * w, mem + va + (size_t)y * pitch, (size_t)w * 4);
+        return;
+    }
     if (color == 0x06 || color == 0x07) {
         const uint32_t *src = (const uint32_t *)(mem + va);
         uint32_t x, y, fill = color == 0x07 ? 0xFF000000u : 0;
@@ -1458,7 +1488,60 @@ static void tex_fill(VkTex *t, uint32_t va, uint32_t layer)
                 LOGE("texture 0x%08X format 0x%02X not decodable\n", va, color);
         }
     }
-    tex_copy_from_ring(t, at, 0, layer, 0);
+}
+
+/* RECOMP_VK_TEX16: the texture decoded into s_t16_px; returns the 16-bit
+ * format its alpha needs. tex16_fill then packs and uploads it. */
+static uint32_t *s_t16_px;
+static size_t s_t16_cap;
+static VkFormat tex16_decode(uint32_t va, uint32_t color, uint32_t w, uint32_t h, uint32_t pitch)
+{
+    size_t n = (size_t)w * h, k;
+    int binary = 1;
+    uint32_t amin = 0xFF000000u;
+    if (n > s_t16_cap) {
+        free(s_t16_px);
+        s_t16_cap = n;
+        s_t16_px = (uint32_t *)malloc(n * 4);
+        if (!s_t16_px) { s_t16_cap = 0; return VK_FORMAT_UNDEFINED; }
+    }
+    tex_decode_argb(va, color, w, h, pitch, s_t16_px);
+    for (k = 0; k < n; k++) {
+        uint32_t a = s_t16_px[k] & 0xFF000000u;
+        if (a < amin) amin = a;
+        if (a && a != 0xFF000000u) { binary = 0; break; }
+    }
+    if (amin == 0xFF000000u && binary)
+        return VK_FORMAT_R5G6B5_UNORM_PACK16;
+    return binary ? VK_FORMAT_A1R5G5B5_UNORM_PACK16 : VK_FORMAT_R4G4B4A4_UNORM_PACK16;
+}
+
+static void tex16_fill(VkTex *t)
+{
+    size_t n = (size_t)t->w * t->h, k;
+    void *map;
+    VkDeviceSize at = ring_alloc(n * 2, 16, &map);
+    uint16_t *o = (uint16_t *)map;
+    const uint32_t *p = s_t16_px;
+    if (!o)
+        return;
+    switch (t->fmt) {
+    case VK_FORMAT_R5G6B5_UNORM_PACK16:
+        for (k = 0; k < n; k++)
+            o[k] = (uint16_t)(((p[k] >> 8) & 0xF800) | ((p[k] >> 5) & 0x07E0) | ((p[k] >> 3) & 0x001F));
+        break;
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
+        for (k = 0; k < n; k++)
+            o[k] = (uint16_t)(((p[k] >> 16) & 0x8000) | ((p[k] >> 9) & 0x7C00) | ((p[k] >> 6) & 0x03E0)
+                              | ((p[k] >> 3) & 0x001F));
+        break;
+    default:                                /* R4G4B4A4: R in the top nibble */
+        for (k = 0; k < n; k++)
+            o[k] = (uint16_t)(((p[k] >> 8) & 0xF000) | ((p[k] >> 4) & 0x0F00) | (p[k] & 0x00F0)
+                              | (p[k] >> 28));
+        break;
+    }
+    tex_copy_from_ring(t, at, 0, 0, 0);
 }
 
 /* face: bytes per cube face (cube_face_bytes), 0 for a 2D texture;
@@ -1468,7 +1551,7 @@ static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, 
 {
     VkTex *t = NULL, *victim = NULL;
     uint32_t i, hash;
-    VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;
+    VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM, f16;
     uint32_t layers = face ? 6 : 1, f, size;
 
     if (s_have_bc && color == 0x0C) fmt = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
@@ -1478,7 +1561,8 @@ static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, 
     for (i = s_tex_head[tex_bucket(va, color, w, h)]; i; i = s_tex_next[i - 1]) {
         VkTex *c = &s_tex[i - 1];
         if (c->image && c->va == va && c->color == color && c->w == w && c->h == h
-            && c->face == face && c->pitch == pitch && c->levels == levels && c->fmt == fmt
+            && c->face == face && c->pitch == pitch && c->levels == levels
+            && (c->fmt == fmt || (c->f16 && fmt == VK_FORMAT_B8G8R8A8_UNORM))
             && (color != 0x0B || (c->palette_va == s_palette_va && c->palette_reg == s_palette_reg))) {
             t = c;
             break;
@@ -1512,21 +1596,31 @@ static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, 
     if (t && s_tex_changes)
         fprintf(stderr, "[tex] frame %u: %08X format %02X %ux%u changed\n",
                 s_frame, va, color, w, h);
+    f16 = s_tex16 && !face && fmt == VK_FORMAT_B8G8R8A8_UNORM && color != 0x12
+        ? tex16_decode(va, color, w, h, pitch) : VK_FORMAT_UNDEFINED;
+    if (t && (f16 != VK_FORMAT_UNDEFINED ? t->fmt != f16 : t->f16)) {
+        tex_free(t);                        /* another storage format: a new image */
+        victim = t;
+        t = NULL;
+    }
     if (!t) {
-        for (i = 0; i < VK_MAX_TEX; i++) {
-            VkTex *c = &s_tex[i];
-            if (!c->image) { if (!victim || victim->image) victim = c; }
-            else if (!victim || (victim->image && c->used < victim->used)) victim = c;
-        }
+        if (!victim)
+            for (i = 0; i < VK_MAX_TEX; i++) {
+                VkTex *c = &s_tex[i];
+                if (!c->image) { if (!victim || victim->image) victim = c; }
+                else if (!victim || (victim->image && c->used < victim->used)) victim = c;
+            }
         t = victim;
         if (t->image)
             tex_free(t);
-        t->va = va; t->color = color; t->w = w; t->h = h; t->pitch = pitch; t->fmt = fmt;
+        t->va = va; t->color = color; t->w = w; t->h = h; t->pitch = pitch;
+        t->fmt = f16 != VK_FORMAT_UNDEFINED ? f16 : fmt;
+        t->f16 = f16 != VK_FORMAT_UNDEFINED;
         t->face = face; t->levels = levels;
         t->palette_va = s_palette_va; t->palette_reg = s_palette_reg;
         VT("texture %08X fmt %02X %ux%u pitch %u%s\n", va, color, w, h, pitch,
            face ? " cube" : "");
-        if (!make_image_ml(w, h, layers, levels, fmt,
+        if (!make_image_ml(w, h, layers, levels, t->fmt,
                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                            VK_IMAGE_ASPECT_COLOR_BIT, &t->image, &t->view, &t->mem)) {
@@ -1541,11 +1635,14 @@ static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, 
     t->hash = hash;
     t->used = t->checked = s_frame;
 
-    for (f = 0; f < layers; f++)
-        tex_fill(t, va + f * face, f);
+    if (t->f16)
+        tex16_fill(t);
+    else
+        for (f = 0; f < layers; f++)
+            tex_fill(t, va + f * face, f);
     if (fmt == VK_FORMAT_B8G8R8A8_UNORM && levels > 1)
         gen_mips(t->image, w, h, levels, layers);
-    size = fmt != VK_FORMAT_B8G8R8A8_UNORM ? tex_bytes(color, w, h, 0) : w * h * 4;
+    size = fmt != VK_FORMAT_B8G8R8A8_UNORM ? tex_bytes(color, w, h, 0) : w * h * (t->f16 ? 2 : 4);
     if (levels > 1)
         size += size / 3;                   /* the mip chain */
     tex_account(t, size * layers);
@@ -2384,7 +2481,7 @@ static VkPipeline pipe_get(const PipeKey *k)
     VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
     VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
     VkPipelineRenderingCreateInfo rci = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-    VkFormat cfmt = VK_FORMAT_B8G8R8A8_UNORM;
+    VkFormat cfmt = s_rt_fmt;
     VkVertexInputBindingDescription vbd[NV2A_RAW_ATTRS];
     VkVertexInputAttributeDescription vad[NV2A_RAW_ATTRS];
     static const VkDynamicState dyn10[] = {
@@ -2901,6 +2998,36 @@ static int ready(void)
             const char *e = getenv("RECOMP_GL_DXT");
             if (e && *e == '0')
                 s_have_bc = 0;
+        }
+        {
+            const char *e = getenv("RECOMP_VK_RT16");
+            const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT
+                | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
+                | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT
+                | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+            if (e && *e == '1') {
+                vkGetPhysicalDeviceFormatProperties(s_pd, VK_FORMAT_R5G6B5_UNORM_PACK16, &fp);
+                if ((fp.optimalTilingFeatures & need) == need)
+                    s_rt_fmt = VK_FORMAT_R5G6B5_UNORM_PACK16;
+                fprintf(stderr, "  [VK] colour surfaces: %s (RECOMP_VK_RT16)\n",
+                        s_rt_fmt == VK_FORMAT_R5G6B5_UNORM_PACK16 ? "R5G6B5" : "R5G6B5 not supported, B8G8R8A8");
+            }
+            e = getenv("RECOMP_VK_TEX16");
+            if (e && *e == '1') {
+                static const VkFormat f16[3] = { VK_FORMAT_R5G6B5_UNORM_PACK16, VK_FORMAT_A1R5G5B5_UNORM_PACK16,
+                                                 VK_FORMAT_R4G4B4A4_UNORM_PACK16 };
+                const VkFormatFeatureFlags tneed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
+                    | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT
+                    | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+                int k, ok = 1;
+                for (k = 0; k < 3; k++) {
+                    vkGetPhysicalDeviceFormatProperties(s_pd, f16[k], &fp);
+                    ok &= (fp.optimalTilingFeatures & tneed) == tneed;
+                }
+                s_tex16 = ok;
+                fprintf(stderr, "  [VK] decoded textures: %s (RECOMP_VK_TEX16)\n",
+                        ok ? "16 bits a texel" : "16-bit formats not supported, 32 bits");
+            }
         }
     }
 
@@ -4807,7 +4934,7 @@ static void dump_surface(VkSurf *s, const char *path)
     VkBufferImageCopy rg;
     void *ptr;
 
-    bci.size = (VkDeviceSize)s->pw * s->ph * 4;
+    bci.size = (VkDeviceSize)s->pw * s->ph * (s_rt_fmt == VK_FORMAT_R5G6B5_UNORM_PACK16 ? 2 : 4);
     bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     if (vkCreateBuffer(s_dev, &bci, NULL, &buf) != VK_SUCCESS)
         return;
@@ -4826,7 +4953,21 @@ static void dump_surface(VkSurf *s, const char *path)
     vkCmdCopyImageToBuffer(s_cb, s->image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &rg);
     flush_frame_wait();
     if (vkMapMemory(s_dev, mem, 0, bci.size, 0, &ptr) == VK_SUCCESS) {
-        dump_bmp(path, (const uint8_t *)ptr, s->pw, s->ph);
+        if (s_rt_fmt == VK_FORMAT_R5G6B5_UNORM_PACK16) {
+            size_t n = (size_t)s->pw * s->ph, k;
+            uint32_t *bgra = (uint32_t *)malloc(n * 4);
+            const uint16_t *q = (const uint16_t *)ptr;
+            if (bgra) {
+                for (k = 0; k < n; k++) {
+                    uint32_t r = (q[k] >> 11) & 31, g = (q[k] >> 5) & 63, b = q[k] & 31;
+                    bgra[k] = 0xFF000000u | ((r << 3 | r >> 2) << 16) | ((g << 2 | g >> 4) << 8) | (b << 3 | b >> 2);
+                }
+                dump_bmp(path, (const uint8_t *)bgra, s->pw, s->ph);
+                free(bgra);
+            }
+        } else {
+            dump_bmp(path, (const uint8_t *)ptr, s->pw, s->ph);
+        }
         vkUnmapMemory(s_dev, mem);
     }
     vkDestroyBuffer(s_dev, buf, NULL);
@@ -5264,6 +5405,11 @@ static void vk_flip(void)
                     s_st_bar_full / nf, s_st_bar_gfx / nf, s_st_bar_skip / nf,
                     s_st_uhit / nf, s_st_umiss / nf, s_st_chit / nf,
                     s_st_desc / nf, s_st_desc_saved / nf, s_st_sets / nf);
+            fprintf(stderr, "[vk] per frame: %u render passes (%u with depth), %.2f Mpx loaded and stored"
+                    " each (colour %s)\n", s_st_pass / nf, s_st_pass_d / nf,
+                    s_st_pass_px / 1e6 / nf, s_rt_fmt == VK_FORMAT_B8G8R8A8_UNORM ? "32 bpp" : "16 bpp");
+            s_st_pass = s_st_pass_d = 0;
+            s_st_pass_px = 0;
 #if !defined(__SWITCH__)
             if (s_kms.on)
                 fprintf(stderr, "[vk] KMS: %.2f flips, %.2f ms copy a frame\n",
