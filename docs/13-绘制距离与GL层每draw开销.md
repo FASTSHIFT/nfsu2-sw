@@ -714,3 +714,35 @@ for (i = 0; i < n; i++) IntegrateEuler(dt / n);
 - `TexturedHeadLightsON=0`：起跑线上没变化（这时候大概没有路面光斑），这项要在夜里开着车灯的路段再看。
 - 都没有改默认。要关光晕：`env.txt` 里 `RECOMP_POKE=0x399480:0`（启动脚本会把它接在默认的三项后面）。
 - 结论：这两项的 draw 都不多。现在每帧 ~700 draw 里，大头仍然是场景（§2 的 PX_PCT 已经在砍）和车（`CarRenderInfo::Render`）。
+
+## 24. 车辆 / 场景几何细节（knob `CAR_LOD`、`TIRE_LOD`、`CAR_LOD_PCT`）
+
+### 24.1 游戏里有的
+GC 符号里和几何细节有关的只有这些（`DebugCarLOD*`、`CarBodyMinLOD`、`CarTireMinLOD`、`DropTopSceneryLOD` 在 GC 里没人读）：
+
+| GC | 默认 | 作用 | Xbox |
+|---|---|---|---|
+| `CarBodyLodSwapSize` | {120, 45, 20} px | `CarRenderInfo::Render`（比赛车）按车在屏幕上的大小选车身 LOD 0..3：比几个阈值小就是几 | 0x35EBA4（读者 `sub_0020BC50`） |
+| `TrafficCarBodyLodSwapSize` | {80, 40, 20} px | 同上，`RenderFast`（交通车） | 0x35EBB4（读者 `sub_00204D60`） |
+| `ForceCarLOD` / `ForceTireLOD` | -1 | 不是 -1 时直接替换上面选出的车身 / 轮胎 LOD | **0x3CC644 / 0x3CC648**（读者正好是上面两个函数；从不被写） |
+| `ScenerySectionLODOffset` | 10 | 赛道分区流式加载用，不是几何细节 | — |
+| 场景 LOD | — | 没有单独的开关：`DrawAScenery` 用同一个像素大小既判断画不画、又选 LOD（§2，阈值 9.5 @ 0x35CC5C） | §2 的 `PX_PCT` 同时管两者 |
+
+路面属于场景，设备上 `PX_PCT=10` 已经让场景很早就换成低 LOD。
+
+### 24.2 knob（`src/recomp_manual.c`，`knobs_game_apply`，实时生效，去掉就恢复原值）
+- `CAR_LOD=0..3`（-1 原样）、`TIRE_LOD=0..3`：写 `ForceCarLOD` / `ForceTireLOD`。
+- `CAR_LOD_PCT`：两张阈值表按百分比放大，200 = 车在一半距离上就换低模。
+
+### 24.3 设备上（Vulkan，起跑线，一次启动 sweep；设备 74-77 ℃，中途降到 1008 MHz，噪声大）
+| 设置 | d_ms | d_draw |
+|---|---|---|
+| CAR_LOD=1 | +1.1 | **+298** |
+| CAR_LOD=2 | +9.2 / +0.4（两次） | +256 / -26 |
+| CAR_LOD=3 + TIRE_LOD=3 | -2.5 | **-82**（-10%） |
+| CAR_LOD_PCT=200 / 400 | -1.6 / -2.9 | -8 / -8 |
+
+- 强制 LOD 1/2 反而**多出 ~300 个 draw**：远处的车原本是 LOD 3（件少），被拉回了更细的模型。所以只有 3 有用。
+- LOD 3 每帧少 ~80 个 draw，帧时间的差在噪声里。代价明显：玩家自己的车也换成了最低模（PC 截图：车牌、轮毂、车灯细节都没了），近处很难看。`ForceCarLOD` 对所有车一样，没法只降别人的车。
+- `CAR_LOD_PCT` 几乎不改变 draw 数：车的 draw 主要是零件数（车身、轮子、玻璃、灯……），起跑线上的车都很近，阈值放大 4 倍也换不了几辆。
+- 都不改默认。要试：`/tmp/nfsu2.knobs` 写 `CAR_LOD=3`，或 env.txt `RECOMP_KNOB_CAR_LOD=3`。

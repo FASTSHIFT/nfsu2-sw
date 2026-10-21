@@ -44,6 +44,9 @@ volatile int g_knob[KN_COUNT] = {
     [KN_GL_MERGE]         = 0,        /* docs/13 §11, §12: off since two device hangs with it on */
     [KN_PHYS_PCT]         = 100,      /* docs/13 §18, §20 */
     [KN_MELLOW_PCT]       = 100,
+    [KN_CAR_LOD]          = -1,       /* docs/13 §24 */
+    [KN_TIRE_LOD]         = -1,
+    [KN_CAR_LOD_PCT]      = 100,
 };
 
 static const char *const s_count_name[KC_COUNT] = {
@@ -58,9 +61,10 @@ static const char *const s_knob_name[KN_COUNT] = {
     "EXP_DROPFRAG", "EXP_RD", "EXP_QUERY", "EXP_STATIC", "EXP_RDSEL",
     "GL_LEGACY", "DUMP_SEQ", "EXP_NOUNI", "CSCAN", "PX_PCT", "PX_BIG", "PX_STAT", "NATIVE_OFF", "EXP_MERGESTAT", "RAMP_EPS",
     "CLR_DEDUP", "TEX_MEMO", "GL_MERGE", "PHYS_PCT", "MELLOW_PCT",
+    "CAR_LOD", "TIRE_LOD", "CAR_LOD_PCT",
 };
 static const int s_knob_min[KN_COUNT] = { 1, 1, 0, 50, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                                          10, 10 };
+                                          10, 10, -1, -1, 10 };
 
 static int s_quiet;                  /* RECOMP_KNOBS_QUIET: no [wake] lines */
 

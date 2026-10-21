@@ -2766,9 +2766,51 @@ static void phys_step_apply(uint32_t va, float stock, int pct, int *last)
     *last = pct;
 }
 
+/* ── Car model LOD (knobs CAR_LOD, TIRE_LOD, CAR_LOD_PCT) ─────────────
+ *
+ * CarRenderInfo::Render (sub_0020BC50, racers) and ::RenderFast
+ * (sub_00204D60, traffic) pick a body LOD 0..3 by the car's size on screen:
+ * the number of entries of CarBodyLodSwapSize {120, 45, 20} (0x35EBA4) /
+ * TrafficCarBodyLodSwapSize {80, 40, 20} (0x35EBB4) above it. Then
+ * ForceCarLOD (0x3CC644) and ForceTireLOD (0x3CC648), -1 in the game and
+ * never written by it, replace the choice when they are not -1. GC names,
+ * same code. CAR_LOD_PCT scales both tables. docs/13 §24. */
+static void lod_force_apply(uint32_t va, int v, int *last)
+{
+    if (v == -1 && *last == -1)
+        return;
+    xbox_PokeRuntime(va, (uint32_t)v);
+    if (v != *last)
+        fprintf(stderr, "[lod] %08X = %d\n", va, v);
+    *last = v;
+}
+
+static void lod_table_apply(int pct, int *last)
+{
+    static const float body[3] = { 120.0f, 45.0f, 20.0f }, traffic[3] = { 80.0f, 40.0f, 20.0f };
+    int k;
+    if (pct == *last)
+        return;
+    for (k = 0; k < 3; k++) {
+        float b = body[k] * (float)pct / 100.0f, t = traffic[k] * (float)pct / 100.0f;
+        uint32_t bb, tb;
+        memcpy(&bb, &b, 4);
+        memcpy(&tb, &t, 4);
+        xbox_PokeRuntime(0x0035EBA4u + 4u * k, bb);
+        xbox_PokeRuntime(0x0035EBB4u + 4u * k, tb);
+    }
+    fprintf(stderr, "[lod] car LOD swap sizes x%d%%: %.0f %.0f %.0f / traffic %.0f %.0f %.0f px\n", pct,
+            body[0] * pct / 100.0, body[1] * pct / 100.0, body[2] * pct / 100.0,
+            traffic[0] * pct / 100.0, traffic[1] * pct / 100.0, traffic[2] * pct / 100.0);
+    *last = pct;
+}
+
 void knobs_game_apply(void)
 {
-    static int last_phys = 100, last_mellow = 100;
+    static int last_phys = 100, last_mellow = 100, last_car = -1, last_tire = -1, last_lodpct = 100;
     phys_step_apply(0x003A55B0u, 0.0044f, knob(KN_PHYS_PCT), &last_phys);
     phys_step_apply(0x003A5580u, (float)(1.0 / 70.0), knob(KN_MELLOW_PCT), &last_mellow);
+    lod_force_apply(0x003CC644u, knob(KN_CAR_LOD) > 3 ? 3 : knob(KN_CAR_LOD), &last_car);
+    lod_force_apply(0x003CC648u, knob(KN_TIRE_LOD) > 3 ? 3 : knob(KN_TIRE_LOD), &last_tire);
+    lod_table_apply(knob(KN_CAR_LOD_PCT), &last_lodpct);
 }

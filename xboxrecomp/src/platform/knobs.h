@@ -66,6 +66,9 @@ enum {
     KN_GL_MERGE,        /* 1: a triangle-list draw that needs no GL state change after the previous one joins its glDrawRangeElements (0: the R36S hung twice with it on, docs/13 §12) */
     KN_PHYS_PCT,        /* NFSU2: PhysicsMover's longest physics substep (MaximumTimeStep, 0.0044 s) in % of stock; 150 = a third fewer substeps (100) */
     KN_MELLOW_PCT,      /* NFSU2: the same for MellowMover (far/traffic cars, MaxiMellowTimeStep 1/70 s) (100) */
+    KN_CAR_LOD,         /* NFSU2: ForceCarLOD, every car body at this model LOD, 0 (most detail) .. 3; -1 = by size on screen (-1) */
+    KN_TIRE_LOD,        /* NFSU2: ForceTireLOD, the same for wheels (-1) */
+    KN_CAR_LOD_PCT,     /* NFSU2: the on-screen sizes at which car bodies switch LOD (Car/TrafficCarBodyLodSwapSize) in %; 200 = lower LODs twice as near (100) */
     KN_COUNT
 };
 
