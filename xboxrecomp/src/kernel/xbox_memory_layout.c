@@ -1558,6 +1558,27 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
 }
 #endif
 
+void recomp_cs_violation(uint32_t callee, uint32_t reg, uint32_t want,
+                         uint32_t got)
+{
+    static const char *const names[] = {
+        "eax", "ecx", "edx", "ebx", "esi", "edi", "esp", "?"};
+    enum { SLOTS = 256 };
+    static uint32_t seen[SLOTS];
+    static int count;
+    uint32_t key = (callee << 3) | (reg & 7);
+    int i;
+
+    for (i = 0; i < count; i++)
+        if (seen[i] == key)
+            return;
+    if (count < SLOTS)
+        seen[count++] = key;
+    fprintf(stderr, "[CS] sub_%08X changed %s: %08X -> %08X\n",
+            callee, names[reg < 7 ? reg : 7], want, got);
+    fflush(stderr);
+}
+
 /* SEH frame pointer bridge (see recomp_types.h for explanation) */
 RECOMP_TLS uint32_t g_seh_ebp = 0;
 RECOMP_TLS double g_fp_stack[8];

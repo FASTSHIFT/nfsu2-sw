@@ -1031,6 +1031,13 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * 2's static init, where the clobber demonstrably exists. It is the right tool
  * for vtable-dispatch-heavy code and the wrong one for early boot.
  */
+/* Call-site sync elision check (RECOMP_CS_CHECK=1 at regen): a register the
+ * caller neither stored nor reloaded around a direct call came back changed,
+ * i.e. the callee's register summary missed a write. reg is the index in
+ * eax, ecx, edx, ebx, esi, edi, esp. */
+void recomp_cs_violation(uint32_t callee, uint32_t reg, uint32_t want,
+                         uint32_t got);
+
 #ifdef RECOMP_ABI_CHECK
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
                               uint32_t edi0, uint32_t esp0);

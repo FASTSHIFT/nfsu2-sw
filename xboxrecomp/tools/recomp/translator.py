@@ -400,7 +400,61 @@ _REG_CALL_RE = None
 _REG_NAMES = ("eax", "ecx", "edx", "ebx", "esi", "edi", "esp")
 
 
-def _localize_registers(lines):
+_CS_ABI_RE = None
+_CS_SUB_RE = None
+# Call sites seen by the elision, and register stores/loads it dropped.
+CALLSYNC_STATS = {"direct_sites": 0, "full_sites": 0,
+                  "spills_dropped": 0, "reloads_dropped": 0,
+                  "spills_kept": 0, "reloads_kept": 0}
+
+
+def _callsync_target(line, pos):
+    """Address of the translated function a call hit at `pos` reaches
+    directly, or None for anything else (indirect, kernel, wrapper bodies)."""
+    import re
+    global _CS_ABI_RE, _CS_SUB_RE
+    if _CS_ABI_RE is None:
+        _CS_ABI_RE = re.compile(r"RECOMP_ABI_CALL\(0x([0-9A-Fa-f]{8})u,")
+        _CS_SUB_RE = re.compile(r"sub_([0-9A-Fa-f]{8})\s*\(\s*\)")
+    m = _CS_ABI_RE.match(line, pos)
+    if m:
+        return int(m.group(1), 16)
+    m = _CS_SUB_RE.match(line, pos)
+    if m:
+        return int(m.group(1), 16)
+    return None
+
+
+def _wrap_calls_sync(line, call_re, ret_spill, sync_for):
+    """_wrap_calls with a spill/reload chosen per call: sync_for(line, pos)
+    returns (spill, reload) for the call starting at pos. Returns still
+    spill `ret_spill`."""
+    import re
+    if ret_spill:
+        line = re.sub(r"\breturn;", f"{{ {ret_spill} return; }}", line)
+    hits = list(call_re.finditer(line))
+    for m in reversed(hits):
+        start = m.start()
+        i = line.find("(", start)
+        depth, j = 0, i
+        while j < len(line):
+            if line[j] == "(":
+                depth += 1
+            elif line[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        k = line.find(";", j)
+        if i < 0 or k < 0:
+            continue
+        spill, reload = sync_for(line, start)
+        line = line[:k + 1] + f" {reload}" + line[k + 1:]
+        line = line[:start] + f"{spill} " + line[start:]
+    return line
+
+
+def _localize_registers(lines, summary=None, check=False):
     """Keep a function's integer registers in C locals.
 
     The guest registers are thread-local globals (RECOMP_TLS): on the Switch
@@ -446,8 +500,44 @@ def _localize_registers(lines):
     out = lines[:at + 1]
     out.append("    " + " ".join(f"uint32_t g_{r} = recomp_leaf_ld_{r}();" for r in used)
                + " /* registers in locals */")
+
+    # Call-site elision (see reg_summary.py): a direct call to a translated
+    # function stores only the registers it may read and reloads only the
+    # ones it may change. esp always goes both ways. Under check, every
+    # register not stored is poisoned first, and every one not reloaded is
+    # compared after the call against what the caller still assumes.
+    def sync_for(line, pos):
+        t = _callsync_target(line, pos) if summary is not None else None
+        sets = summary.call_sets(t) if t is not None else None
+        if sets is None:
+            if summary is not None:
+                CALLSYNC_STATS["full_sites"] += 1
+            return spill, reload
+        cin, cout = sets
+        sp = [r for r in used if r == "esp" or r in cin]
+        rl = [r for r in used if r == "esp" or r in cout]
+        CALLSYNC_STATS["direct_sites"] += 1
+        CALLSYNC_STATS["spills_dropped"] += len(used) - len(sp)
+        CALLSYNC_STATS["reloads_dropped"] += len(used) - len(rl)
+        CALLSYNC_STATS["spills_kept"] += len(sp)
+        CALLSYNC_STATS["reloads_kept"] += len(rl)
+        s = " ".join(f"recomp_leaf_st_{r}(g_{r});" for r in sp)
+        l = " ".join(f"g_{r} = recomp_leaf_ld_{r}();" for r in rl)
+        if check:
+            poison = [r for r in used if r not in sp]
+            s += "".join(f" recomp_leaf_st_{r}(0xDEAD0000u | {_REG_NAMES.index(r)}u);"
+                         for r in poison)
+            for r in used:
+                if r in rl:
+                    continue
+                want = f"g_{r}" if r in sp else f"(0xDEAD0000u | {_REG_NAMES.index(r)}u)"
+                l += (f" if (recomp_leaf_ld_{r}() != {want})"
+                      f" recomp_cs_violation(0x{t:08X}u, {_REG_NAMES.index(r)}u,"
+                      f" {want}, recomp_leaf_ld_{r}());")
+        return s, l
+
     for l in body:
-        out.append(_wrap_calls(l, _REG_CALL_RE, spill, reload))
+        out.append(_wrap_calls_sync(l, _REG_CALL_RE, spill, sync_for))
     out.append(f"    {spill} /* registers back at the end */")
     return out
 
@@ -2783,7 +2873,9 @@ class FunctionTranslator:
         if os.environ.get("RECOMP_X87_LOCALS", "1") != "0":
             lines = _localize_x87_stack(lines)
         if os.environ.get("RECOMP_REG_LOCALS", "1") != "0":
-            lines = _localize_registers(lines)
+            lines = _localize_registers(
+                lines, summary=getattr(self, "reg_summary", None),
+                check=os.environ.get("RECOMP_CS_CHECK", "0") == "1")
 
         # Validate: comment out goto targets that reference missing labels
         # (dead code after unconditional jumps may reference non-existent labels)
@@ -3184,6 +3276,18 @@ class BatchTranslator:
         self.translator.lifter.wrapped_functions = wrapped
         manual_decls = {}
 
+        # Register summaries for call-site sync elision (reg_summary.py).
+        # RECOMP_REG_CALLSYNC=0 at regen keeps the full sync at every call.
+        self.translator.reg_summary = None
+        if (os.environ.get("RECOMP_REG_LOCALS", "1") != "0"
+                and os.environ.get("RECOMP_REG_CALLSYNC", "1") != "0"):
+            from .reg_summary import compute as reg_summary_compute
+            self.translator.reg_summary = reg_summary_compute(
+                self.translator, func_list, unknown=manual | wrapped,
+                verbose=True)
+            if os.environ.get("RECOMP_REGSUM_ONLY") == "1":
+                raise SystemExit(0)
+
         # Translate all functions first, collecting results
         translations = []
         stats = {
@@ -3222,6 +3326,10 @@ class BatchTranslator:
                 stub += f"void {name}(void) {{ /* translation failed */ }}\n"
                 translations.append((addr, name, stub))
                 stats["failed"] += 1
+
+        if self.translator.reg_summary is not None:
+            stats["callsync"] = dict(CALLSYNC_STATS)
+            print(f"  [regsum] call sites: {CALLSYNC_STATS}", file=sys.stderr)
 
         # Any address called but never defined needs a stub, or the link fails.
         # These are almost all mid-function entry points the function detector
