@@ -589,7 +589,9 @@ def do_trace(specs, pid, timeout=600):
             log(f"{name}: no trace file")
             continue
         dst = f"{TRACE_DIR}/{name}.pftrace"
-        sh(f"mv '{TRACE_FILE}' '{dst}'")
+        # sync: the Vulkan build has hung the device at exit (docs/13 §21) and
+        # /roms is exFAT -- unsynced files come back empty after the reset.
+        sh(f"mv '{TRACE_FILE}' '{dst}' && sync")
         fr = frames_after_hud()[n1:n2]
         row = {"name": name, "spec": ",".join(pairs), "file": dst, "frames": len(fr),
                "temp_c": read_temp(), "cpu_mhz": read_freq(), "gpu_mhz": read_gpu_mhz()}

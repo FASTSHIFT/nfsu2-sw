@@ -64,6 +64,9 @@
 #include "../nv2a_gl/gl_psh.h"
 #include "../nv2a_gl/gl_vsh.h"
 #include "../kernel/nv2a_backend.h"
+#include "../platform/xtrace.h"
+/* Trace-clock timestamp for XTRACE_SPAN, 0 when not recording. */
+#define XT_NOW() (XTRACE_ON ? xtrace_now() : 0)
 
 #if defined(__SWITCH__)
 #include <switch.h>
@@ -441,6 +444,7 @@ static void frame_begin(void)
 {
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     uint64_t w0 = hz_now();
+    XTRACE_BEGIN_TAG("frame fence");
     kms_wait_slot(s_fi);
     s_f = &s_fr[s_fi];
     if (s_f->submitted) {
@@ -448,6 +452,7 @@ static void frame_begin(void)
         vkResetFences(s_dev, 1, &s_f->fence);
         s_f->submitted = 0;
     }
+    XTRACE_END_TAG("frame fence");
     s_pf_wait_ns += hz_now() - w0;
     garbage_free(s_f);
     desc_reset(s_f);
@@ -1771,10 +1776,12 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], VkDescriptor
                 dyn_cube = 1;
             } else {
                 uint32_t texs = s_hz_texs;
-                uint64_t t0 = hz_now();
+                uint64_t t0 = hz_now(), x0 = XT_NOW();
                 out->imageView = tex_get(va, color, w, h, 0, face, levels);
-                if (s_hz_texs != texs)
+                if (s_hz_texs != texs) {
                     s_hz_tex_ns += hz_now() - t0;
+                    XTRACE_SPAN("tex upload", x0, XT_NOW());
+                }
             }
         }
     } else if (rt) {
@@ -1783,10 +1790,12 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], VkDescriptor
         rt_scale(w, h, rt->w, rt->h, rt->aa_sx, rt->aa_sy, scale);
     } else {
         uint32_t texs = s_hz_texs;
-        uint64_t t0 = hz_now();
+        uint64_t t0 = hz_now(), x0 = XT_NOW();
         out->imageView = tex_get(va, color, w, h, pitch, 0, levels);
-        if (s_hz_texs != texs)
+        if (s_hz_texs != texs) {
             s_hz_tex_ns += hz_now() - t0;
+            XTRACE_SPAN("tex upload", x0, XT_NOW());
+        }
     }
     addr = regs[base + 2];
     filter = regs[base + 5];
@@ -3086,6 +3095,7 @@ static void flush_frame_wait(void)
 {
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    XTRACE_INSTANT("ring full: mid-frame flush");
     present_drain();
     end_rendering();
     s_rt = NULL;
@@ -4128,6 +4138,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
         return;
     s_regs = r;
     s_batch = b;
+    XTRACE_DRAW_START;                          /* per-draw phases, 1 draw in RECOMP_TRACE_DRAW */
     if (s_inst_on < 0) {
         const char *e = getenv("RECOMP_VK_INSTANCE");
         s_inst_on = !(e && *e == '0') && s_ubo_range >= VK_CONST_SIZE
@@ -4146,10 +4157,14 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
     s_pf_draws_frame++;
     {
         int changed = regs_changed(r);
-        if (pend_append(b, changed))
+        if (pend_append(b, changed)) {
+            XTRACE_DRAW_MARK("d:instance append");
             return;
+        }
     }
-    pend_flush();
+    XTRACE_DRAW_MARK("d:regs");
+    pend_flush();                               /* a held run: its vkCmdDrawIndexed */
+    XTRACE_DRAW_MARK("d:held draw");
     if (!prim_indices(b, &idx, &n, &topo, &cls) || !n)
         return;
     VT("draw: prim %u idx %u verts %u attrs %04X direct %04X xform %u surf %08X zeta %08X\n", b->prim, n,
@@ -4158,19 +4173,22 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
     if (!s)
         return;
     s_drew_any = 1;
+    XTRACE_DRAW_MARK("d:prim+target");
     psh_key(r, &pk);
     {
         uint32_t made = s_prog_made;
-        uint64_t t0 = hz_now();
+        uint64_t t0 = hz_now(), x0 = XT_NOW();
         p = prog_get(b, &pk);
         if (s_prog_made != made) {
             s_hz_progs += s_prog_made - made;
             s_hz_prog_ns += hz_now() - t0;
+            XTRACE_SPAN("prog compile", x0, XT_NOW());
         }
     }
     if (!p)
         return;
     s_hz_draws++;
+    XTRACE_DRAW_MARK("d:prog_get");
 
     /* Textures first: uploads end the rendering pass. */
     for (i = 0; i < 4; i++)
@@ -4181,6 +4199,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
             s_read_pending = 1;
             break;
         }
+    XTRACE_DRAW_MARK("d:textures");
 
     memset(&key, 0, sizeof key);
     key.prog = (int)(p - s_prog);
@@ -4213,6 +4232,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
     pipe = pipe_get(&key);
     if (!pipe)
         return;
+    XTRACE_DRAW_MARK("d:pipeline");
 
     {
         /* Everything this draw puts in the ring, reserved now: a flush
@@ -4245,6 +4265,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
     }
     apply_dynamic(r, d != NULL, topo);
     set_surface_scissor(r, s);
+    XTRACE_DRAW_MARK("d:pass+dynamic");
 
     /* Uniforms. */
     {
@@ -4293,8 +4314,10 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
             ub[1].range = sizeof(FsBlock);
         }
     }
+    XTRACE_DRAW_MARK("d:uniforms");
     if (!upload_vertices(b))
         return;
+    XTRACE_DRAW_MARK("d:vertices");
     {
         VkDeviceSize iat;
         if (b->vertex_count <= 65536) {
@@ -4312,6 +4335,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
             vkCmdBindIndexBuffer(s_cb, s_f->ring, iat, VK_INDEX_TYPE_UINT32);
         }
     }
+    XTRACE_DRAW_MARK("d:indices");
     {
         /* Constants last: repeats append theirs right behind (pend_append). */
         VkDeviceSize cat, range;
@@ -4342,6 +4366,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
         ub[2].offset = cat;
         ub[2].range = range;
     }
+    XTRACE_DRAW_MARK("d:constants");
     memset(wr, 0, sizeof wr);
     for (i = 0; i < 7; i++) {
         wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -4361,16 +4386,21 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
     } else {
         push_draw_descriptors(wr);
     }
+    XTRACE_DRAW_MARK("d:descriptors");
 
     VT("  vkCmdDrawIndexed %u\n", n);
     /* The constants were the ring's last allocation, so a repeat's set
      * lands right behind them (pend_append). */
     if (pend_eligible(b) && inst_room > 1) {
         pend_hold(b, n, ub[2].offset, inst_room);
+        XTRACE_DRAW_MARK("d:hold");
     } else {
         vkCmdDrawIndexed(s_cb, n, 1, 0, 0, 0);
         s_st_calls++;
+        XTRACE_DRAW_MARK("d:vkCmdDrawIndexed");
     }
+    XTRACE_DRAW_COUNTER("draw verts", b->vertex_count);
+    XTRACE_DRAW_COUNTER("draw indices", n);
     if (s_vtrace > 0)
         s_vtrace--;
 }
@@ -4542,6 +4572,7 @@ static void kms_wait_flip(void)
 static void *kms_thread(void *arg)
 {
     (void)arg;
+    xtrace_thread_name("KMS");
     pthread_mutex_lock(&s_kms.m);
     for (;;) {
         int i, slot = -1;
@@ -4549,7 +4580,9 @@ static void *kms_thread(void *arg)
             if (s_kms.queued[i])
                 slot = i;
         if (slot < 0) {
+            XTRACE_BEGIN_TAG("idle");
             pthread_cond_wait(&s_kms.c, &s_kms.m);
+            XTRACE_END_TAG("idle");
             continue;
         }
         pthread_mutex_unlock(&s_kms.m);
@@ -4559,7 +4592,9 @@ static void *kms_thread(void *arg)
             uint8_t *dst;
             /* The slot's fence: frame_begin waits for this thread
              * (kms_wait_slot) before it waits on and resets it. */
+            XTRACE_BEGIN_TAG("frame fence");     /* the GPU finishing this frame */
             vkWaitForFences(s_dev, 1, &s_fr[slot].fence, VK_TRUE, UINT64_MAX);
+            XTRACE_END_TAG("frame fence");
             t0 = hz_now();
             if (s_kms.rb[slot].cached) {
                 VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
@@ -4567,10 +4602,15 @@ static void *kms_thread(void *arg)
                 r.size = VK_WHOLE_SIZE;
                 vkInvalidateMappedMemoryRanges(s_dev, 1, &r);
             }
+            XTRACE_BEGIN_TAG("page flip");       /* the previous flip completing */
             kms_wait_flip();
+            XTRACE_END_TAG("page flip");
+            XTRACE_BEGIN_TAG("KMS copy");
             dst = s_kms.map[s_kms.back];
             for (y = 0; y < s_kms.h; y++)
                 memcpy(dst + (size_t)y * s_kms.pitch, s_kms.rb[slot].ptr + (size_t)y * row, row);
+            XTRACE_END_TAG("KMS copy");
+            XTRACE_INSTANT("page flip queued");
             if (kms_PageFlip(s_kms.fd, s_kms.crtc, s_kms.fb[s_kms.back], 1 /* event */, NULL) == 0) {
                 s_kms.flip_pending = 1;
                 s_kms.back ^= 1;
@@ -5309,7 +5349,9 @@ static void vk_flip(void)
                                           || (s_inst_alt && s_frame % (uint32_t)dump_every == 1))) {
         char path[320];
         snprintf(path, sizeof path, "%s%05u.bmp", dump_prefix, s_frame);
+        XTRACE_BEGIN_TAG("dump BMP (RECOMP_GL_DUMP)");
         dump_surface(s, path);
+        XTRACE_END_TAG("dump BMP (RECOMP_GL_DUMP)");
         if (getenv("RECOMP_VK_DUMP_ALL")) {     /* every surface, as <prefix><frame>_<va>.bmp */
             int si;
             for (si = 0; si < VK_MAX_SURF; si++)
@@ -5418,8 +5460,10 @@ static void vk_flip(void)
     }
     {
         uint64_t s0 = hz_now();
+        XTRACE_BEGIN_TAG("vkQueueSubmit");
         if (vkQueueSubmit(s_queue, 1, &si, s_f->fence) != VK_SUCCESS)
             LOGE("vkQueueSubmit failed\n");
+        XTRACE_END_TAG("vkQueueSubmit");
         s_pf_submit_ns += hz_now() - s0;
     }
     s_f->submitted = 1;
@@ -5585,12 +5629,14 @@ static uint8_t *tq_reserve(size_t size)
         need += TQ_BYTES - off;                 /* the wrap filler */
     if (TQ_BYTES - tq_used() < need) {
         uint64_t t0 = hz_now();
+        XTRACE_BEGIN_TAG("wait VK (queue full)");
         pthread_mutex_lock(&s_tq_lock);
         __atomic_store_n(&s_tq_producer_waits, 1, __ATOMIC_SEQ_CST);
         while (TQ_BYTES - tq_used() < need)
             tq_timed_wait();
         __atomic_store_n(&s_tq_producer_waits, 0, __ATOMIC_SEQ_CST);
         pthread_mutex_unlock(&s_tq_lock);
+        XTRACE_END_TAG("wait VK (queue full)");
         __atomic_add_fetch(&s_tq_exec_wait_ns, hz_now() - t0, __ATOMIC_RELAXED);
     }
     if (off + size > TQ_BYTES) {
@@ -5788,12 +5834,14 @@ static void tq_flip(void)
     /* No more than two frames behind the executor. */
     if (__atomic_load_n(&s_tq_flips, __ATOMIC_ACQUIRE) >= 2) {
         uint64_t t0 = hz_now();
+        XTRACE_BEGIN_TAG("wait VK (2 frames queued)");
         pthread_mutex_lock(&s_tq_lock);
         __atomic_store_n(&s_tq_producer_waits, 1, __ATOMIC_SEQ_CST);
         while (__atomic_load_n(&s_tq_flips, __ATOMIC_ACQUIRE) >= 2)
             tq_timed_wait();
         __atomic_store_n(&s_tq_producer_waits, 0, __ATOMIC_SEQ_CST);
         pthread_mutex_unlock(&s_tq_lock);
+        XTRACE_END_TAG("wait VK (2 frames queued)");
         __atomic_add_fetch(&s_tq_exec_wait_ns, hz_now() - t0, __ATOMIC_RELAXED);
     }
     nreg = tq_reg_collect();
@@ -5803,6 +5851,7 @@ static void tq_flip(void)
     ((TqHdr *)rec)->size = (uint32_t)size;
     __atomic_add_fetch(&s_tq_flips, 1, __ATOMIC_ACQ_REL);
     tq_publish(size);
+    XTRACE_INSTANT("flip queued");
 }
 
 static void *tq_thread(void *arg)
@@ -5816,6 +5865,7 @@ static void *tq_thread(void *arg)
         prctl(15 /* PR_SET_NAME */, "vkrec", 0, 0, 0);
     }
 #endif
+    xtrace_thread_name("Vulkan");
     for (;;) {
         size_t avail = __atomic_load_n(&s_tq_head, __ATOMIC_SEQ_CST) - s_tq_tail;
         uint8_t *rec;
@@ -5825,12 +5875,14 @@ static void *tq_thread(void *arg)
 
         if (!avail) {
             uint64_t t0 = hz_now();
+            XTRACE_BEGIN_TAG("queue empty");
             pthread_mutex_lock(&s_tq_lock);
             __atomic_store_n(&s_tq_consumer_waits, 1, __ATOMIC_SEQ_CST);
             while (__atomic_load_n(&s_tq_head, __ATOMIC_SEQ_CST) == s_tq_tail)
                 tq_timed_wait();
             __atomic_store_n(&s_tq_consumer_waits, 0, __ATOMIC_SEQ_CST);
             pthread_mutex_unlock(&s_tq_lock);
+            XTRACE_END_TAG("queue empty");
             __atomic_add_fetch(&s_tq_idle_ns, hz_now() - t0, __ATOMIC_RELAXED);
             continue;
         }
@@ -5865,14 +5917,21 @@ static void *tq_thread(void *arg)
                 bb.attrs = (const float *)(rec + (uintptr_t)bb.attrs);
                 bb.indices = (const uint32_t *)(rec + (uintptr_t)bb.indices);
                 s_dkey = keys->key;
+                XTRACE_BEGIN_TAG("draw");
                 vk_draw_raw_timed(&bb);
+                XTRACE_END_TAG("draw");
                 s_dkey = NULL;
             } else if (h->type == TQ_CLEAR) {
                 const TqClear *c = (const TqClear *)(rec + at);
+                XTRACE_BEGIN_TAG("clear");
                 vk_clear_timed(&c->s, c->pad ? &c->rs : NULL, c->flags, c->argb, c->zs);
+                XTRACE_END_TAG("clear");
             } else if (h->type == TQ_FLIP) {
+                XTRACE_BEGIN_TAG("flip");
                 vk_flip_timed();
+                XTRACE_END_TAG("flip");
                 __atomic_sub_fetch(&s_tq_flips, 1, __ATOMIC_ACQ_REL);
+                XTRACE_COUNTER("VK frames queued", __atomic_load_n(&s_tq_flips, __ATOMIC_RELAXED));
                 {
                     static uint64_t last;
                     uint64_t now = hz_now();

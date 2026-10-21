@@ -12,7 +12,7 @@ Uses perfetto's trace processor (pip package `perfetto`, downloads its shell onc
 import sys
 from perfetto.trace_processor import TraceProcessor
 
-WAIT_PREFIX = ("idle", "queue empty", "wait GL", "GIL wait", "BlockOnFence", "frame fence",
+WAIT_PREFIX = ("idle", "queue empty", "wait GL", "wait VK", "GIL wait", "BlockOnFence", "frame fence",
                "blit fence", "vblank", "page flip", "k:NtWait", "k:KeWait", "k:KeDelay", "apu idle")
 
 

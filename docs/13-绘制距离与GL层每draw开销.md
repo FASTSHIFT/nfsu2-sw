@@ -595,3 +595,49 @@ for (i = 0; i < n; i++) IntegrateEuler(dt / n);
   1. 减少 draw call（Mali 每次 ~22 µs，无法绕开）；
   2. 我们这边每个 draw 的准备工作：索引 u32→u16 的逐个转换是标量循环、写的是 GPU 内存，FsBlock 的 16 个颜色做了 64 次除法；
   3. 把能挪的挪到执行器（它只用了 ~32% 一个核）：索引转换、属性转换；或者让队列本身就是 GPU 可见内存，省掉第二次拷贝（改动大）。
+
+## 21. xtrace：Vulkan 版一帧的时间线（Perfetto）
+
+### 21.1 埋点和工具
+- `nv2a_vk.c` 现在写 xtrace（原来只有 GL 后端有）。轨道：
+  - `Vulkan`（录制线程）：`draw` / `clear` / `flip` / `queue empty`；`flip` 里有 `vkQueueSubmit`、`frame fence`（等帧槽）、`dump BMP (RECOMP_GL_DUMP)`；`tex upload`、`prog compile`；计数器 `VK frames queued`。
+  - 每 `RECOMP_TRACE_DRAW`（默认 16）个 draw 抽一个拆阶段（`d:regs`、`d:held draw`、`d:prim+target`、`d:prog_get`、`d:textures`、`d:pipeline`、`d:pass+dynamic`、`d:uniforms`、`d:vertices`、`d:indices`、`d:constants`、`d:descriptors`、`d:hold` / `d:vkCmdDrawIndexed`、`d:instance append`），每个阶段是从上一个标记到这里的时间。
+  - `executor`：`pb exec`、`idle`，被队列挡住时 `wait VK (queue full)` / `wait VK (2 frames queued)`，`flip queued`。
+  - `KMS`：`frame fence`（从这一帧提交到 GPU 画完）、`page flip`、`KMS copy`。
+- 抓法：`r36s/autotest.py --trace --env NFSU2_VULKAN=1 --set <名字>:<KNOB=V>`，同一次比赛里录基线、各设置、结尾基线各 6 s。
+- `tools/trace_vk_frames.py`：以录制线程的 `flip` 分帧，打印每帧各线程的忙/等中位数、谁是瓶颈的比例、抽样 draw 的阶段。`trace_summary.py` 把 `wait VK` 算作等待。
+- 设备上的 trace 在 `tmp/perfetto/`（拖进 ui.perfetto.dev）：`r36s_vk_race_base`、`_PHYS_PCT300`、`_gpu520locked`、`_scale0.5`。
+- `autotest_driver.py` 存 trace 后 `sync`：这几轮里设备两次在结束时挂死重启，exFAT 上没落盘的 trace 都成了 0 字节。
+
+### 21.2 比赛中一帧（中位数 ms，~750 draw / ~620 draw call）
+| | 基线 | PHYS_PCT=300 | GPU 锁 520 MHz | 渲染 0.5 倍 |
+|---|---|---|---|---|
+| 帧间隔 | 54.6 | 54.7 | 55.1 | 48.2 |
+| 录制线程 `draw` | 44.9 | 46.8 | 47.8 | 40.3 |
+| 录制线程 `queue empty`（等执行器） | 0.0 | 0.0 | 0.0 | 1.5 |
+| 执行器 `pb exec` / `idle` | 39.8 / 18.4 | 45.9 / 0.0 | 26.7 / 26.8 | 20.8 / 25.6 |
+| **GPU：提交到画完（KMS `frame fence`）** | **43.8** | 43.6 | 44.4 | **18.7** |
+| 瓶颈是录制线程的帧 | 84% | 97% | 87% | 70% |
+
+- 录制线程是关键路径，但 GPU 只差一点：一帧提交后 GPU 要 ~44 ms 才画完，下一次提交前 GPU 只空闲 ~10 ms（16% 的帧是排在上一帧后面的）。比赛中 GPU 本来就在 520 MHz（devfreq 最高档），锁频没有变化。
+- 渲染 0.5 倍时 GPU 时间 44 → 19 ms：**GPU 的大半是填充 / 带宽**，不是顶点或 draw 数。
+- 执行器和主线程都不是瓶颈：执行器经常空闲（在等游戏写推送缓冲），从来没被队列挡住（`wait VK` = 0）。
+- 所以录制线程最多能省 ~10 ms（55 → ~45 ms，到 GPU 的上限），再往下要减 GPU 的填充。
+
+### 21.3 一个 draw 在录制线程上的时间（抽样 ~4300 个 draw，µs，含每个标记 ~1 µs 的打点开销）
+| 阶段 | µs | 占 | 内容 |
+|---|---|---|---|
+| `d:held draw` | 20 | 26% | 上一个攒着的 draw 的 `vkCmdDrawIndexed`：Mali 每个 draw call 的固定开销 |
+| `d:descriptors` | 12-15 | 17-20% | Vulkan 1.0 的描述符集：按 4 张纹理查本帧的缓存，没命中就 `vkAllocateDescriptorSets` + 7 项 `vkUpdateDescriptorSets`；`vkCmdBindDescriptorSets` |
+| `d:textures` | 8-10 | 11-12% | `bind_stage` ×4（纹理查找、哈希、采样器） |
+| `d:vertices` | 6-7 | 8-9% | 顶点区间拷进环形缓冲 + 绑定 |
+| `d:uniforms` / `d:pass+dynamic` / `d:constants` / `d:pipeline` / `d:regs` / `d:prog_get` / 其他 | 2-5 各 | ~35% 合计 | |
+
+### 21.4 下一步（按预计收益）
+1. 描述符集跨帧复用：现在每帧清空缓存和池（`desc_reset`），而一帧里用到的纹理组合几乎不变。按帧槽保留缓存（纹理/采样器销毁时作废），大部分 draw 只剩 `vkCmdBindDescriptorSets`。估计省 ~5-8 ms/帧。
+2. `bind_stage`：上一 draw 同一 stage 的纹理状态没变就跳过（GL 后端的 `TEX_MEMO` 同理）。
+3. 减 draw call（每个 ~20 µs 的 Mali 开销）：实例化合并已经在做，同 mesh 不同 draw 的批量还有空间。
+4. GPU 侧（录制省下来以后才会显出来）：填充占大半，可以从后处理 pass、半透明叠加、渲染目标的 load/store（Mali 是分块渲染，每次切换渲染目标都要读写整张图）入手。
+
+### 21.5 设备挂死
+目前 Vulkan 版共 3 次整机挂死（08:05、11:27、11:43），都在 sweep / trace 跑完、游戏退出前后；看门狗都在约 1 分钟内重启了设备。ramoops 里只有 r36s-guard 的心跳，没有内核报错。GL 版这几轮没有发生。原因未查，怀疑退出时 Mali 还有未完成的工作或 KMS 状态。

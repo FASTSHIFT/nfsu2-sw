@@ -13,6 +13,9 @@ add_library(xbox_nv2a_vk STATIC
     ../nv2a_gl/gl_psh.c
 )
 target_include_directories(xbox_nv2a_vk PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+if(TARGET platform)
+    target_link_libraries(xbox_nv2a_vk PUBLIC platform)    # platform/xtrace.h
+endif()
 # XBOXRECOMP_VK_DLOPEN: libvulkan.so.1 and libshaderc.so.1 are opened at run
 # time; the build needs only the Vulkan headers (XBOXRECOMP_VK_HEADERS: a
 # directory holding vulkan/vulkan.h, when the toolchain has none) -- the
